@@ -2,6 +2,7 @@
 import re
 import uuid
 from typing import List, Dict, Any, Optional, Set, Tuple
+from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from app.rag.prompt_builder import SourceEvidence
@@ -24,6 +25,41 @@ class Citation(BaseModel):
             "chunk_id": str(self.chunk_id),
             "page_start": self.page_start,
             "page_end": self.page_end,
+            "snippet": self.snippet,
+        }
+
+
+class WebCitation(BaseModel):
+    """Web source citation emitted when the system falls back to Google Search grounding."""
+
+    source_type: str = "web"
+    title: str
+    url: str
+    domain: str  # Derived from URL for compact UI display
+    snippet: Optional[str] = None
+
+    @classmethod
+    def from_raw(cls, raw: Dict[str, Any]) -> "WebCitation":
+        """Constructs a WebCitation from a raw {title, url, snippet} dict."""
+        url = raw.get("url", "")
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.removeprefix("www.") or url[:40]
+        except Exception:
+            domain = url[:40]
+        return cls(
+            title=raw.get("title", "") or domain,
+            url=url,
+            domain=domain,
+            snippet=(raw.get("snippet") or "")[:300],
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_type": self.source_type,
+            "title": self.title,
+            "url": self.url,
+            "domain": self.domain,
             "snippet": self.snippet,
         }
 

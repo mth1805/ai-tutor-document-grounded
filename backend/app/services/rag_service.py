@@ -20,13 +20,21 @@ from app.services.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService, _IN_MEMORY_DOCUMENTS
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
 from app.rag.prompt_builder import PromptBuilder, ChatMode, SourceEvidence
-from app.rag.citation_service import CitationService, Citation
+from app.rag.citation_service import CitationService, Citation, WebCitation
 
 logger = logging.getLogger(__name__)
 
 INSUFFICIENT_EVIDENCE_MESSAGE = (
-    "I couldn't find enough information in the uploaded documents to answer that confidently. "
-    "Please ensure the relevant course materials or notes are uploaded and indexed."
+    "I couldn't find enough information in the uploaded documents or web sources to answer that question confidently. "
+    "Please ensure the relevant course materials or notes are uploaded and indexed, or try rephrasing your query."
+)
+
+WEB_GROUNDING_SYSTEM_INSTRUCTION = (
+    "You are AI Tutor Assistant, an expert learning assistant. "
+    "The user's question could not be answered from their uploaded documents. "
+    "Use your knowledge and real-time web search to answer the question accurately and clearly. "
+    "Clearly structure your response with headings and bullet points where helpful. "
+    "Do NOT fabricate citations or URLs. Rely only on information you can verify."
 )
 
 
@@ -164,20 +172,109 @@ class RAGService:
             retrieval_response.has_sufficient_evidence,
         )
 
-        # 6. Strict Evidence Gating
+        # 6. Strict Evidence Gating — Phase 9 Web Search Fallback
         if not retrieval_response.has_sufficient_evidence or not retrieval_response.results:
             logger.info(
-                "Insufficient document evidence for query in conv %s. Yielding deterministic fallback.",
+                "Insufficient document evidence for query in conv %s (route=%s). "
+                "Checking web fallback (enabled=%s).",
                 conversation_id,
+                retrieval_response.routing_path,
+                settings.WEB_SEARCH_FALLBACK_ENABLED,
             )
-            # Emit status indicating lack of evidence
+
+            # --- Phase 9: Web Search Fallback ---
+            provider = llm_provider or get_llm_provider()
+            if settings.WEB_SEARCH_FALLBACK_ENABLED and hasattr(provider, "generate_stream_with_grounding"):
+                yield f"event: status\ndata: {json.dumps({'status': 'insufficient_evidence', 'message': 'Not enough information in your documents. Searching the web...'})}\n\n"
+                yield f"event: status\ndata: {json.dumps({'status': 'web_search', 'message': 'Searching web...'})}\n\n"
+                yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating answer...'})}\n\n"
+
+                # Build a minimal grounded prompt — no document evidence
+                web_prompt = (
+                    f"<CONVERSATION_HISTORY>\n"
+                    + "\n".join(
+                        f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
+                        for m in history_list
+                    )
+                    + f"\n</CONVERSATION_HISTORY>\n\n"
+                    f"<USER_QUERY>\n{query.strip()}\n</USER_QUERY>\n\n"
+                    "Answer the user's question clearly and thoroughly based on web search results."
+                )
+
+                accumulated_tokens: List[str] = []
+                final_web_sources: List[dict] = []
+
+                try:
+                    async for token_chunk, sources in provider.generate_stream_with_grounding(
+                        prompt=web_prompt,
+                        system_instruction=WEB_GROUNDING_SYSTEM_INSTRUCTION,
+                    ):
+                        if token_chunk:
+                            accumulated_tokens.append(token_chunk)
+                            yield f"event: token\ndata: {json.dumps({'token': token_chunk})}\n\n"
+                        if sources:
+                            final_web_sources = sources
+
+                except LLMError as le:
+                    logger.error("Web-grounded LLM failed: %s", le.message)
+                    yield f"event: error\ndata: {json.dumps({'error': le.message})}\n\n"
+                    return
+                except Exception as e:
+                    logger.error("Unexpected error in web-grounded streaming: %s", e, exc_info=True)
+                    yield f"event: error\ndata: {json.dumps({'error': 'An error occurred during web-grounded response generation.'})}\n\n"
+                    return
+
+                full_raw_text = "".join(accumulated_tokens).strip()
+                if not full_raw_text:
+                    full_raw_text = INSUFFICIENT_EVIDENCE_MESSAGE
+
+                # Build structured WebCitation list (capped at WEB_SEARCH_MAX_SOURCES)
+                web_citations: List[WebCitation] = [
+                    WebCitation.from_raw(s)
+                    for s in final_web_sources[: settings.WEB_SEARCH_MAX_SOURCES]
+                    if s.get("url")
+                ]
+                web_citations_payload = [wc.to_dict() for wc in web_citations]
+
+                # Persist assistant message — use citations=[] for doc citations, web in separate key
+                asst_msg = await ConversationService.create_message(
+                    db=db,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    data=MessageCreate(
+                        role="assistant",
+                        content=full_raw_text,
+                        citations=[],
+                    ),
+                )
+
+                total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
+                logger.info(
+                    "Web-grounded generation completed in %.2fms: %d web sources, msg=%s",
+                    total_elapsed_ms,
+                    len(web_citations),
+                    asst_msg.id,
+                )
+
+                done_payload = {
+                    "message_id": str(asst_msg.id),
+                    "content": full_raw_text,
+                    "citations": [],
+                    "web_sources": web_citations_payload,
+                    "has_sufficient_evidence": False,
+                    "used_web_fallback": True,
+                    "routing_path": retrieval_response.routing_path,
+                    "total_elapsed_ms": total_elapsed_ms,
+                }
+                yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+                return
+
+            # --- No web fallback available: emit deterministic message ---
             yield f"event: status\ndata: {json.dumps({'status': 'insufficient_evidence', 'message': 'No sufficient evidence found in documents.'})}\n\n"
 
-            # Stream deterministic answer token by token (or chunked)
             fallback_text = INSUFFICIENT_EVIDENCE_MESSAGE
             yield f"event: token\ndata: {json.dumps({'token': fallback_text})}\n\n"
 
-            # Persist assistant message with empty citations
             asst_msg = await ConversationService.create_message(
                 db=db,
                 conversation_id=conversation_id,
@@ -189,6 +286,7 @@ class RAGService:
                 "message_id": str(asst_msg.id),
                 "content": fallback_text,
                 "citations": [],
+                "web_sources": [],
                 "has_sufficient_evidence": False,
                 "routing_path": retrieval_response.routing_path,
                 "total_elapsed_ms": round((time.perf_counter() - t_start) * 1000, 2),

@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
+from app.core.config import settings
 
 from app.main import app
 from app.models.chunk import DocumentChunk
@@ -110,8 +111,9 @@ def test_chat_mismatched_workspace():
     assert "workspace does not match" in res.text
 
 
-def test_chat_insufficient_evidence_deterministic_fallback():
+def test_chat_insufficient_evidence_deterministic_fallback(monkeypatch):
     """Verify when workspace has no documents, Gemini is NOT called and fallback is returned."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", False)
     mock_llm = MockLLMProvider()
     set_llm_provider(mock_llm)
 

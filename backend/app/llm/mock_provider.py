@@ -14,6 +14,11 @@ class MockLLMProvider(BaseLLMProvider):
         tokens: Optional[List[str]] = None,
         simulate_error: Optional[Exception] = None,
         token_delay: float = 0.0,
+        # Phase 9: web grounding support
+        web_grounding_response: str = "Web-grounded answer about the topic.",
+        web_grounding_tokens: Optional[List[str]] = None,
+        web_grounding_sources: Optional[List[dict]] = None,
+        simulate_web_grounding_error: Optional[Exception] = None,
     ):
         self.default_response = default_response
         self.tokens = (
@@ -37,10 +42,29 @@ class MockLLMProvider(BaseLLMProvider):
         self.simulate_error = simulate_error
         self.token_delay = token_delay
 
+        # Phase 9: web grounding defaults
+        self.web_grounding_response = web_grounding_response
+        self.web_grounding_tokens = web_grounding_tokens or [
+            "Web-grounded ",
+            "answer ",
+            "about ",
+            "the ",
+            "topic.",
+        ]
+        self.web_grounding_sources = web_grounding_sources or [
+            {
+                "title": "Example Web Source",
+                "url": "https://example.com/article",
+                "snippet": "Relevant snippet about the topic.",
+            }
+        ]
+        self.simulate_web_grounding_error = simulate_web_grounding_error
+
         # Spy attributes for test inspection
         self.last_prompt: Optional[str] = None
         self.last_system_instruction: Optional[str] = None
         self.call_count: int = 0
+        self.web_grounding_call_count: int = 0
 
     async def generate(
         self,
@@ -74,3 +98,31 @@ class MockLLMProvider(BaseLLMProvider):
             if self.token_delay > 0:
                 await asyncio.sleep(self.token_delay)
             yield token
+
+    async def generate_stream_with_grounding(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> AsyncIterator[tuple[str, list[dict]]]:
+        """Phase 9: Simulates streaming generation with Google Search grounding.
+
+        Yields (token_chunk, web_sources) tuples:
+        - Intermediate yields: (token, [])
+        - Final yield: ("", web_sources)
+        """
+        self.last_prompt = prompt
+        self.last_system_instruction = system_instruction
+        self.web_grounding_call_count += 1
+
+        if self.simulate_web_grounding_error:
+            raise self.simulate_web_grounding_error
+
+        for token in self.web_grounding_tokens:
+            if self.token_delay > 0:
+                await asyncio.sleep(self.token_delay)
+            yield token, []
+
+        # Signal end-of-stream with sources
+        if self.web_grounding_sources:
+            yield "", self.web_grounding_sources

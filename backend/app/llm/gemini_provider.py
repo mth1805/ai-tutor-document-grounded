@@ -126,3 +126,123 @@ class GeminiProvider(BaseLLMProvider):
         except Exception as e:
             logger.error("Gemini streaming generation failed: %s", type(e).__name__)
             raise self._map_error(e) from e
+
+    async def generate_with_grounding(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> tuple[str, list[dict]]:
+        """Non-streaming generation with Google Search grounding enabled.
+
+        Returns:
+            Tuple of (full_text, web_sources_list).
+            web_sources_list is a list of dicts with keys: title, url, snippet.
+        """
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
+        # Inject google_search tool for grounding
+        config = types.GenerateContentConfig(
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+            top_p=config.top_p,
+            system_instruction=system_instruction,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=config,
+            )
+            full_text = response.text or ""
+            web_sources = self._extract_grounding_sources(response)
+            return full_text, web_sources
+        except Exception as e:
+            logger.error("Gemini grounded generation failed: %s", type(e).__name__)
+            raise self._map_error(e) from e
+
+    async def generate_stream_with_grounding(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> AsyncIterator[tuple[str, list[dict]]]:
+        """Streams text tokens with Google Search grounding enabled.
+
+        Yields tuples of (token_chunk, web_sources).
+        web_sources is populated on the final chunk once grounding metadata is available;
+        intermediate chunks yield an empty list.
+        """
+        config = types.GenerateContentConfig(
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
+            top_p=self.top_p,
+            system_instruction=system_instruction,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        try:
+            stream = await self._client.aio.models.generate_content_stream(
+                model=self.model_name,
+                contents=prompt,
+                config=config,
+            )
+            last_chunk = None
+            async for chunk in stream:
+                last_chunk = chunk
+                text_chunk = chunk.text
+                if text_chunk:
+                    yield text_chunk, []
+            # After streaming completes, extract grounding from the final chunk
+            if last_chunk is not None:
+                web_sources = self._extract_grounding_sources(last_chunk)
+                if web_sources:
+                    # Signal end-of-stream with sources via empty token + sources
+                    yield "", web_sources
+        except Exception as e:
+            logger.error("Gemini streaming grounded generation failed: %s", type(e).__name__)
+            raise self._map_error(e) from e
+
+    @staticmethod
+    def _extract_grounding_sources(response_or_chunk) -> list[dict]:
+        """Extracts web source metadata from Gemini grounding metadata.
+
+        Supports both full GenerateContentResponse and streaming GenerateContentResponse chunks.
+        Returns a deduplicated list of {title, url, snippet} dicts.
+        """
+        sources: list[dict] = []
+        seen_urls: set[str] = set()
+
+        try:
+            candidates = getattr(response_or_chunk, "candidates", None) or []
+            for candidate in candidates:
+                grounding_meta = getattr(candidate, "grounding_metadata", None)
+                if grounding_meta is None:
+                    continue
+
+                # grounding_chunks contains web search results
+                grounding_chunks = getattr(grounding_meta, "grounding_chunks", None) or []
+                for gc in grounding_chunks:
+                    web = getattr(gc, "web", None)
+                    if web is None:
+                        continue
+                    url = getattr(web, "uri", None) or getattr(web, "url", None) or ""
+                    title = getattr(web, "title", "") or ""
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    sources.append({"title": title, "url": url, "snippet": ""})
+
+                # grounding_supports may have richer snippet text per support
+                supports = getattr(grounding_meta, "grounding_supports", None) or []
+                for support in supports:
+                    text_seg = getattr(support, "segment", None)
+                    snippet_text = getattr(text_seg, "text", "") if text_seg else ""
+                    chunk_indices = getattr(support, "grounding_chunk_indices", []) or []
+                    for ci in chunk_indices:
+                        if 0 <= ci < len(sources):
+                            if not sources[ci]["snippet"]:
+                                sources[ci]["snippet"] = (snippet_text or "")[:300]
+        except Exception as exc:
+            logger.debug("Could not extract grounding sources: %s", exc)
+
+        return sources

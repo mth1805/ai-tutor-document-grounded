@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     LLM_TOP_P: float = 0.95
     LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
 
+    # Phase 9: Web Search Fallback via Gemini Google Search grounding
+    WEB_SEARCH_FALLBACK_ENABLED: bool = True
+    # Maximum number of web sources to surface in citation metadata
+    WEB_SEARCH_MAX_SOURCES: int = 5
+
 
 
     model_config = SettingsConfigDict(
