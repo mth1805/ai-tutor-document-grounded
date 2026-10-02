@@ -49,12 +49,21 @@ export interface Citation {
   snippet?: string;
 }
 
+export interface WebCitation {
+  source_type: "web";
+  title: string;
+  url: string;
+  domain: string;
+  snippet?: string;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;
   role: "user" | "assistant" | "system";
   content: string;
   citations?: Citation[];
+  web_sources?: WebCitation[];
   created_at: string;
 }
 
@@ -65,7 +74,9 @@ export interface ChatStreamCallbacks {
     message_id: string;
     content: string;
     citations: Citation[];
+    web_sources?: WebCitation[];
     has_sufficient_evidence: boolean;
+    used_web_fallback?: boolean;
   }) => void;
   onError?: (error: string) => void;
 }

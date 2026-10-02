@@ -20,7 +20,7 @@ import {
   CheckCircle2,
   ExternalLink,
 } from "lucide-react";
-import { apiClient, Message, Citation } from "@/lib/api";
+import { apiClient, Message, Citation, WebCitation } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDocument } from "@/lib/document-context";
 import { MarkdownRenderer } from "@/components/MarkdownRenderer";
@@ -164,6 +164,7 @@ export function ChatArea() {
                       id: payload.message_id || m.id,
                       content: payload.content || accumulatedContent,
                       citations: payload.citations || [],
+                      web_sources: payload.web_sources || [],
                     }
                   : m
               )
@@ -278,7 +279,7 @@ export function ChatArea() {
 
           <span className="text-[11px] text-brand-600 dark:text-brand-400 font-medium hidden sm:inline flex items-center space-x-1">
             <Sparkles className="w-3 h-3 inline mr-1" />
-            Phase 8: Document-Grounded AI Tutor Active
+            Phase 9: Document-Grounded AI Tutor + Web Fallback Active
           </span>
         </div>
       )}
@@ -370,7 +371,7 @@ export function ChatArea() {
                         />
                       )}
 
-                      {/* Citations & Evidence Section */}
+                      {/* Citations & Document Evidence Section */}
                       {!isUser && (() => {
                         const { inlineCitationKeys } = preprocessMarkdownWithCitations(
                           msg.content,
@@ -380,46 +381,91 @@ export function ChatArea() {
                         const bottomCitations = deduplicated.filter(
                           (c) => !inlineCitationKeys.has(getCitationKey(c))
                         );
+                        const webSources: WebCitation[] = msg.web_sources || [];
 
-                        if (bottomCitations.length === 0) return null;
+                        if (bottomCitations.length === 0 && webSources.length === 0) return null;
 
                         return (
-                          <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800/80 space-y-1.5">
-                            <div className="flex items-center space-x-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
-                              <BookOpen className="w-3 h-3 text-brand-600 dark:text-brand-400" />
-                              <span>Document Evidence ({bottomCitations.length})</span>
-                            </div>
-                            <div className="flex flex-wrap gap-1.5">
-                              {bottomCitations.map((c, idx) => (
-                                <span
-                                  key={c.chunk_id || `${c.document_id}-${c.page_start}-${idx}`}
-                                  className="relative inline-flex group"
-                                >
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenCitation(c)}
-                                    aria-label={`${c.document_name}, ${c.page_start === c.page_end ? `Page ${c.page_start}` : `Pages ${c.page_start}–${c.page_end}`}`}
-                                    className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-brand-50/80 hover:bg-brand-100 dark:bg-brand-950/40 dark:hover:bg-brand-900/60 border border-brand-200/80 dark:border-brand-800/60 text-[11px] font-medium text-brand-800 dark:text-brand-300 transition-all focus:outline-none focus-visible:ring-1 focus-visible:ring-brand-500"
-                                  >
-                                    <span aria-hidden="true">{"\u{1F4C4}"}</span>
-                                    <span className="font-mono">
-                                      {formatCitationPages(c.page_start, c.page_end)}
-                                    </span>
-                                  </button>
-                                  <span
-                                    role="tooltip"
-                                    className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:flex group-focus-within:flex flex-col items-center z-30"
-                                  >
-                                    <span className="bg-slate-900/95 dark:bg-slate-950/95 text-slate-100 border border-slate-700/80 rounded-md px-2.5 py-1.5 shadow-lg text-[10px] whitespace-nowrap leading-tight">
-                                      <span className="block font-semibold text-white max-w-[220px] truncate">{c.document_name}</span>
-                                      <span className="block text-slate-400 text-[9px] mt-0.5">
-                                        {c.page_start === c.page_end ? `Page ${c.page_start}` : `Pages ${c.page_start}–${c.page_end}`}
+                          <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800/80 space-y-2">
+                            {/* Document Evidence */}
+                            {bottomCitations.length > 0 && (
+                              <div className="space-y-1.5">
+                                <div className="flex items-center space-x-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                                  <BookOpen className="w-3 h-3 text-brand-600 dark:text-brand-400" />
+                                  <span>Document Evidence ({bottomCitations.length})</span>
+                                </div>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {bottomCitations.map((c, idx) => (
+                                    <span
+                                      key={c.chunk_id || `${c.document_id}-${c.page_start}-${idx}`}
+                                      className="relative inline-flex group"
+                                    >
+                                      <button
+                                        type="button"
+                                        onClick={() => handleOpenCitation(c)}
+                                        aria-label={`${c.document_name}, ${c.page_start === c.page_end ? `Page ${c.page_start}` : `Pages ${c.page_start}–${c.page_end}`}`}
+                                        className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-brand-50/80 hover:bg-brand-100 dark:bg-brand-950/40 dark:hover:bg-brand-900/60 border border-brand-200/80 dark:border-brand-800/60 text-[11px] font-medium text-brand-800 dark:text-brand-300 transition-all focus:outline-none focus-visible:ring-1 focus-visible:ring-brand-500"
+                                      >
+                                        <span aria-hidden="true">{"\u{1F4C4}"}</span>
+                                        <span className="font-mono">
+                                          {formatCitationPages(c.page_start, c.page_end)}
+                                        </span>
+                                      </button>
+                                      <span
+                                        role="tooltip"
+                                        className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:flex group-focus-within:flex flex-col items-center z-30"
+                                      >
+                                        <span className="bg-slate-900/95 dark:bg-slate-950/95 text-slate-100 border border-slate-700/80 rounded-md px-2.5 py-1.5 shadow-lg text-[10px] whitespace-nowrap leading-tight">
+                                          <span className="block font-semibold text-white max-w-[220px] truncate">{c.document_name}</span>
+                                          <span className="block text-slate-400 text-[9px] mt-0.5">
+                                            {c.page_start === c.page_end ? `Page ${c.page_start}` : `Pages ${c.page_start}–${c.page_end}`}
+                                          </span>
+                                        </span>
                                       </span>
                                     </span>
-                                  </span>
-                                </span>
-                              ))}
-                            </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Web Sources Panel */}
+                            {webSources.length > 0 && (
+                              <div className="space-y-1.5">
+                                <div className="flex items-center space-x-1.5 text-[10px] font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+                                  <ExternalLink className="w-3 h-3" />
+                                  <span>Web Sources ({webSources.length})</span>
+                                </div>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {webSources.map((ws, idx) => (
+                                    <span
+                                      key={`web-${ws.url}-${idx}`}
+                                      className="relative inline-flex group"
+                                    >
+                                      <a
+                                        href={ws.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        aria-label={`${ws.title} — ${ws.domain}`}
+                                        className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-amber-50/80 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-900/50 border border-amber-200/80 dark:border-amber-800/50 text-[11px] font-medium text-amber-800 dark:text-amber-300 transition-all focus:outline-none focus-visible:ring-1 focus-visible:ring-amber-500"
+                                      >
+                                        <span aria-hidden="true">🌐</span>
+                                        <span className="font-mono max-w-[120px] truncate">{ws.domain}</span>
+                                      </a>
+                                      <span
+                                        role="tooltip"
+                                        className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:flex group-focus-within:flex flex-col items-center z-30"
+                                      >
+                                        <span className="bg-slate-900/95 dark:bg-slate-950/95 text-slate-100 border border-slate-700/80 rounded-md px-2.5 py-1.5 shadow-lg text-[10px] whitespace-nowrap leading-tight">
+                                          <span className="block font-semibold text-white max-w-[260px] truncate">{ws.title || ws.domain}</span>
+                                          <span className="block text-amber-400 text-[9px] mt-0.5 font-medium">{ws.domain}</span>
+                                        </span>
+                                        <span className="w-1.5 h-1.5 -mt-0.5 bg-slate-900/95 border-r border-b border-slate-700/80 rotate-45" />
+                                      </span>
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         );
                       })()}
