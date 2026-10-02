@@ -66,6 +66,34 @@ class Settings(BaseSettings):
     AUTO_EMBED_AFTER_INGESTION: bool = True
     PREWARM_MODELS: bool = False
 
+    # Phase 7: Hybrid Retrieval + Cross-Encoder Reranking configuration
+    DENSE_TOP_K: int = 25
+    LEXICAL_TOP_K: int = 25
+    RRF_K: int = 60
+    CANDIDATE_POOL_SIZE: int = 30
+    RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
+    RERANKER_BATCH_SIZE: int = 16
+    RERANKER_DEVICE: str = "auto"  # auto | cpu | cuda
+    RERANKER_MODEL_CACHE_DIR: Path | None = None
+    RERANK_TOP_K: int = 5
+    RELEVANCE_THRESHOLD: float = 0.35
+    USE_MOCK_RERANKER: bool = False
+
+    # Fast / Quality Path V1 retrieval routing
+    RETRIEVAL_ROUTING_MODE: str = "adaptive"  # always_fast | always_quality | adaptive
+    ROUTER_RRF_SCORE_THRESHOLD: float = 0.0327  # Calibrated for RRF (k=60) dual-consensus top-1
+    ROUTER_SCORE_GAP_THRESHOLD: float = 0.0005  # Calibrated for RRF rank 1 vs rank 2 margin
+
+    # Phase 8: LLM Provider and Grounded Generation
+    LLM_PROVIDER: str = "gemini"  # gemini | mock
+    GEMINI_API_KEY: str | None = None
+    GEMINI_MODEL: str = "gemini-1.5-flash"
+    LLM_TEMPERATURE: float = 0.2
+    LLM_MAX_OUTPUT_TOKENS: int = 2048
+    LLM_TOP_P: float = 0.95
+    LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
+
+
 
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,

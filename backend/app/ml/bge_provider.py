@@ -97,7 +97,7 @@ class BGEEmbeddingProvider(BaseEmbeddingProvider):
 
         with torch.no_grad():
             embeddings = self._model.encode(
-                sentences=texts,
+                inputs=texts,
                 batch_size=bs,
                 normalize_embeddings=normalize,
                 show_progress_bar=False,

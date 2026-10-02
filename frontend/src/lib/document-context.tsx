@@ -116,7 +116,15 @@ export function DocumentProvider({ children }: { children: React.ReactNode }) {
 export function useDocument() {
   const context = useContext(DocumentContext);
   if (!context) {
-    throw new Error("useDocument must be used within a DocumentProvider");
+    return {
+      selectedDocument: null,
+      setSelectedDocument: () => {},
+      isViewerCollapsed: false,
+      setIsViewerCollapsed: () => {},
+      splitRatio: 45,
+      setSplitRatio: () => {},
+    };
   }
   return context;
 }
+

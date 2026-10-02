@@ -201,11 +201,13 @@ class ConversationService:
             return None
 
         now = datetime.now(timezone.utc)
+        citations = getattr(data, "citations", []) or []
         message = Message(
             id=uuid.uuid4(),
             conversation_id=conversation_id,
             role=data.role,
             content=data.content.strip(),
+            citations=citations,
             created_at=now,
         )
 

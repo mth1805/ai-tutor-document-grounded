@@ -350,3 +350,146 @@ Migration file: `supabase/migrations/20261001060000_bge_m3_pgvector_embeddings.s
   ```bash
   RUN_REAL_BGE_M3_TEST=1 python -m pytest backend/tests/test_embedding_ml.py -k test_real_bge_m3_smoke
   ```
+
+---
+
+## 8. Phase 7: Hybrid Retrieval + Cross-Encoder Reranking
+
+Phase 7 implements hybrid semantic and lexical retrieval combined via Reciprocal Rank Fusion (RRF) and scored with a multilingual Cross-Encoder reranker. The output is a ranked list of authorized, relevance-gated document chunks with verified page provenance.
+
+### End-to-End Retrieval Pipeline
+
+```
+User Query
+    │
+    ▼
+[BGE-M3 Query Embedding] (1024-dim, L2-normalized)
+    │
+    ├─────────────────────────────────────────────┐
+    ▼                                             ▼
+[Dense Retrieval (pgvector)]            [BM25 Lexical Retrieval (PostgreSQL FTS)]
+  - Cosine distance: embedding <=> query  - Cover density ranking: ts_rank_cd(tsv, query)
+  - HNSW index scan (vector_cosine_ops)   - GIN index scan on document_chunks.tsv
+  - Top-K dense candidates (DENSE_TOP_K)  - Top-K lexical candidates (LEXICAL_TOP_K)
+  - Scoped to workspace & user            - Scoped to workspace & user
+    │                                             │
+    └──────────────────────┬──────────────────────┘
+                           │
+                           ▼
+             [Reciprocal Rank Fusion (RRF)]
+               - Merges dense + lexical candidates by chunk_id
+               - Score formula: RRF(d) = Σ 1 / (k + rank_m(d)) (default k=60)
+               - Deduplicates chunks and preserves source channels
+               - Retains candidate pool (default pool size: 30)
+                           │
+                           ▼
+             [Cross-Encoder Reranker]
+               - Model: BAAI/bge-reranker-base (multilingual: English + Vietnamese)
+               - Evaluates (query, chunk_text) pairs in micro-batches
+               - Offloaded to threadpool (asyncio event loop never blocked)
+               - Sigmoid normalization maps logits to [0.0, 1.0]
+               - Sorts candidates descending by rerank score; selects Top-N
+                           │
+                           ▼
+             [Relevance Gate]
+               - Deterministic threshold check: score >= RELEVANCE_THRESHOLD (0.35)
+               - Flags context sufficiency: has_sufficient_evidence
+               - Returns ranked chunks with exact page provenance
+```
+
+### Cross-Encoder Model Lifecycle & Singleton
+
+- **Zero In-Request Instantiation:** Cross-Encoder models are loaded once per backend process as a thread-safe singleton (`get_reranker_provider()`).
+- **Persistent Local Cache:** Weights are stored in `RERANKER_MODEL_CACHE_DIR` or `EMBEDDING_MODEL_CACHE_DIR`. Server restarts reuse cached weights without re-downloading.
+- **Multilingual Support:** Defaults to `BAAI/bge-reranker-base`, providing high-accuracy ranking across English and Vietnamese educational materials.
+- **Device Fallback:** Automatically selects CUDA if available, falling back cleanly to CPU with memory-safe `torch.no_grad()` and `.eval()` mode.
+- **Non-Blocking Inference:** CPU/GPU-bound tokenization and model inference are offloaded via `run_in_threadpool`.
+
+### Database Schema & Migration (BM25 FTS)
+
+Migration file: `supabase/migrations/20261001070000_document_chunks_fts_bm25.sql`
+
+- **Generated tsvector Column:**
+  ```sql
+  ALTER TABLE public.document_chunks
+      ADD COLUMN IF NOT EXISTS tsv tsvector
+      GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED;
+  ```
+- **GIN Lexical Index:**
+  ```sql
+  CREATE INDEX IF NOT EXISTS idx_chunks_tsv ON public.document_chunks USING gin(tsv);
+  ```
+
+### Configuration Parameters & Defaults
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `DENSE_TOP_K` | Integer | `25` | Candidates retrieved via dense pgvector cosine search. |
+| `LEXICAL_TOP_K` | Integer | `25` | Candidates retrieved via PostgreSQL FTS lexical search. |
+| `RRF_K` | Integer | `60` | Reciprocal Rank Fusion smoothing constant. |
+| `CANDIDATE_POOL_SIZE` | Integer | `30` | Number of candidate chunks preserved after RRF before reranking. |
+| `RERANKER_MODEL_NAME` | String | `BAAI/bge-reranker-base` | Multilingual Cross-Encoder model. |
+| `RERANKER_BATCH_SIZE` | Integer | `16` | Micro-batch size for Cross-Encoder inference. |
+| `RERANKER_DEVICE` | String | `auto` | Compute device (`auto`, `cpu`, `cuda`). |
+| `RERANK_TOP_K` | Integer | `5` | Final top-K ranked evidence chunks returned. |
+| `RELEVANCE_THRESHOLD` | Float | `0.35` | Minimum reranker score required to pass relevance gate. |
+| `USE_MOCK_RERANKER` | Boolean | `False` | Forces deterministic MockRerankerProvider in tests. |
+
+### Retrieval API Endpoint
+
+| Method | Endpoint | Description | Status |
+|---|---|---|---|
+| `POST` | `/api/v1/workspaces/{workspace_id}/retrieval/search` | Performs hybrid retrieval and reranking for authorized workspace owner. | `200 OK` |
+
+#### Request Payload
+```json
+{
+  "query": "What is Newton's second law of motion?",
+  "dense_top_k": 25,
+  "lexical_top_k": 25,
+  "rrf_k": 60,
+  "candidate_pool_size": 30,
+  "rerank_top_k": 5,
+  "relevance_threshold": 0.35
+}
+```
+
+#### Response Structure
+```json
+{
+  "workspace_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "query": "What is Newton's second law of motion?",
+  "results": [
+    {
+      "chunk_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+      "document_id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a",
+      "content": "Newton's second law states that F = ma...",
+      "page_number_start": 3,
+      "page_number_end": 4,
+      "chunk_index": 2,
+      "dense_score": 0.9124,
+      "lexical_score": 0.7651,
+      "rrf_score": 0.032787,
+      "rerank_score": 0.8845,
+      "final_rank": 1,
+      "passed_relevance_gate": true,
+      "retrieval_sources": ["dense", "lexical"]
+    }
+  ],
+  "total_results": 1,
+  "has_sufficient_evidence": true,
+  "relevance_threshold": 0.35,
+  "timings": {
+    "query_embedding_ms": 12.4,
+    "dense_retrieval_ms": 18.2,
+    "lexical_retrieval_ms": 8.1,
+    "rrf_ms": 0.3,
+    "rerank_ms": 42.6,
+    "total_retrieval_ms": 81.6
+  }
+}
+```
+
+### Developer Inspection UI
+
+The frontend includes a developer-focused **Retrieval Inspector** modal within `DocumentManager` allowing developers to test queries, adjust hyperparameters, inspect timing breakdowns, and verify page provenance in real time. Raw vectors and backend secrets are never exposed.

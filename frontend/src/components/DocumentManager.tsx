@@ -17,9 +17,11 @@ import {
   Eye,
   RotateCw,
   Cpu,
+  Search,
 } from "lucide-react";
 import { apiClient, DocumentItem } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
+import { RetrievalInspectorModal } from "@/components/RetrievalInspectorModal";
 
 interface DocumentManagerProps {
   workspaceId: string;
@@ -49,6 +51,7 @@ export function DocumentManager({
   const [reprocessingId, setReprocessingId] = useState<string | null>(null);
   const [embeddingDocId, setEmbeddingDocId] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isInspectorOpen, setIsInspectorOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -396,24 +399,35 @@ export function DocumentManager({
             </div>
           </div>
 
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isUploading}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-medium text-xs shadow-md shadow-brand-600/20 transition-all active:scale-95 disabled:opacity-50"
-            title="Upload Document"
-          >
-            {isUploading ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span>Uploading...</span>
-              </>
-            ) : (
-              <>
-                <UploadCloud className="w-3.5 h-3.5" />
-                <span>Upload</span>
-              </>
-            )}
-          </button>
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setIsInspectorOpen(true)}
+              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium text-xs border border-slate-200 dark:border-slate-800 shadow-sm transition-all active:scale-95"
+              title="Inspect Hybrid Retrieval & Cross-Encoder Reranking"
+            >
+              <Search className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400" />
+              <span>Inspect</span>
+            </button>
+
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-medium text-xs shadow-md shadow-brand-600/20 transition-all active:scale-95 disabled:opacity-50"
+              title="Upload Document"
+            >
+              {isUploading ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Uploading...</span>
+                </>
+              ) : (
+                <>
+                  <UploadCloud className="w-3.5 h-3.5" />
+                  <span>Upload</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
 
         {isUploading && (
@@ -623,6 +637,13 @@ export function DocumentManager({
           })
         )}
       </div>
+
+      {/* Phase 7 Retrieval Inspector Modal */}
+      <RetrievalInspectorModal
+        workspaceId={workspaceId}
+        isOpen={isInspectorOpen}
+        onClose={() => setIsInspectorOpen(false)}
+      />
     </div>
   );
 }

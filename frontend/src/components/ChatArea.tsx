@@ -12,11 +12,27 @@ import {
   GraduationCap,
   Loader2,
   Plus,
-  Bot,
   FileText,
+  Square,
+  BookOpen,
+  Compass,
+  Lightbulb,
+  CheckCircle2,
+  ExternalLink,
 } from "lucide-react";
-import { apiClient, Message } from "@/lib/api";
+import { apiClient, Message, Citation } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
+import { useDocument } from "@/lib/document-context";
+import { MarkdownRenderer } from "@/components/MarkdownRenderer";
+import {
+  deduplicateCitations,
+  preprocessMarkdownWithCitations,
+  getCitationKey,
+  formatCitationPages,
+  ParsedCitationLink,
+} from "@/lib/citation-utils";
+
+type ChatMode = "Light Guidance" | "Detailed Guidance" | "Full Solution";
 
 export function ChatArea() {
   const router = useRouter();
@@ -25,19 +41,22 @@ export function ChatArea() {
   const conversationId = (params?.conversationId as string) || null;
 
   const { user, token } = useAuth();
+  const { setSelectedDocument, setIsViewerCollapsed } = useDocument();
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [inputValue, setInputValue] = useState("");
-  const [isSending, setIsSending] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generationStatus, setGenerationStatus] = useState<string | null>(null);
   const [isCreatingConv, setIsCreatingConv] = useState(false);
 
-  // Toggle for testing assistant message persistence
-  const [sendAsRole, setSendAsRole] = useState<"user" | "assistant">("user");
+  // Pedagogical Chat Mode
+  const [chatMode, setChatMode] = useState<ChatMode>("Detailed Guidance");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -72,30 +91,143 @@ export function ChatArea() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, isGenerating, generationStatus]);
 
-  // Handle message sending (Phase 3 persistence)
+  // Handle grounded streaming chat response (Phase 8)
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     const content = inputValue.trim();
-    if (!content || !conversationId || !token || isSending) return;
+    if (!content || !conversationId || !token || isGenerating) return;
 
-    setIsSending(true);
+    setInputValue("");
     setError(null);
+    setIsGenerating(true);
+    setGenerationStatus("Searching uploaded documents...");
+
+    // 1. Optimistic User Message
+    const tempUserMsgId = `temp-user-${Date.now()}`;
+    const userMsg: Message = {
+      id: tempUserMsgId,
+      conversation_id: conversationId,
+      role: "user",
+      content,
+      created_at: new Date().toISOString(),
+    };
+
+    // 2. Optimistic Assistant Message placeholder
+    const tempAsstMsgId = `temp-asst-${Date.now()}`;
+    const asstMsg: Message = {
+      id: tempAsstMsgId,
+      conversation_id: conversationId,
+      role: "assistant",
+      content: "",
+      citations: [],
+      created_at: new Date().toISOString(),
+    };
+
+    setMessages((prev) => [...prev, userMsg, asstMsg]);
+
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     try {
-      const newMsg = await apiClient.createMessage(
+      let accumulatedContent = "";
+
+      await apiClient.streamChat(
         conversationId,
-        { role: sendAsRole, content },
-        token
+        {
+          content,
+          chat_mode: chatMode,
+          workspace_id: workspaceId || undefined,
+        },
+        token,
+        {
+          onStatus: (_status, message) => {
+            setGenerationStatus(message || "Analyzing documents...");
+          },
+          onToken: (tokenChunk) => {
+            accumulatedContent += tokenChunk;
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === tempAsstMsgId
+                  ? { ...m, content: accumulatedContent }
+                  : m
+              )
+            );
+          },
+          onDone: (payload) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === tempAsstMsgId
+                  ? {
+                      ...m,
+                      id: payload.message_id || m.id,
+                      content: payload.content || accumulatedContent,
+                      citations: payload.citations || [],
+                    }
+                  : m
+              )
+            );
+            setGenerationStatus(null);
+          },
+          onError: (errMsg) => {
+            setError(errMsg);
+            setGenerationStatus(null);
+          },
+        },
+        abortController.signal
       );
-      setMessages((prev) => [...prev, newMsg]);
-      setInputValue("");
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Failed to send message";
-      setError(msg);
+      if (!abortController.signal.aborted) {
+        const msg = err instanceof Error ? err.message : "Failed to generate response";
+        setError(msg);
+      }
     } finally {
-      setIsSending(false);
+      setIsGenerating(false);
+      setGenerationStatus(null);
+      abortControllerRef.current = null;
+    }
+  };
+
+  // Stop Generation handler
+  const handleStopGenerating = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      setIsGenerating(false);
+      setGenerationStatus(null);
+      abortControllerRef.current = null;
+    }
+  };
+
+  // Open cited document in the document viewer
+  const handleOpenCitation = async (citation: Citation | ParsedCitationLink) => {
+    if (!token) return;
+    try {
+      setIsViewerCollapsed(false);
+      let docId = citation.document_id;
+      if (!docId && citation.document_name && workspaceId) {
+        // Resolve document ID by filename from workspace documents
+        try {
+          const docs = await apiClient.listDocuments(workspaceId, token);
+          const targetName = citation.document_name.toLowerCase().trim();
+          const match = docs.find(
+            (d) =>
+              d.original_filename.toLowerCase().trim() === targetName ||
+              targetName.includes(d.original_filename.toLowerCase().trim()) ||
+              d.original_filename.toLowerCase().trim().includes(targetName)
+          );
+          if (match) docId = match.id;
+        } catch (fetchErr) {
+          console.warn("Could not resolve document list for citation name lookup", fetchErr);
+        }
+      }
+
+      if (docId) {
+        const doc = await apiClient.getDocument(docId, token);
+        setSelectedDocument(doc);
+      }
+    } catch (err) {
+      console.error("Failed to open cited document in viewer", err);
     }
   };
 
@@ -144,8 +276,9 @@ export function ChatArea() {
             )}
           </div>
 
-          <span className="text-[11px] text-slate-500 dark:text-slate-400 hidden sm:inline">
-            Phase 4: Document Storage & Multi-Thread Active
+          <span className="text-[11px] text-brand-600 dark:text-brand-400 font-medium hidden sm:inline flex items-center space-x-1">
+            <Sparkles className="w-3 h-3 inline mr-1" />
+            Phase 8: Document-Grounded AI Tutor Active
           </span>
         </div>
       )}
@@ -162,20 +295,21 @@ export function ChatArea() {
           ) : messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-3">
               <div className="w-10 h-10 rounded-xl bg-brand-500/10 border border-brand-500/20 text-brand-600 dark:text-brand-400 flex items-center justify-center">
-                <MessageSquare className="w-5 h-5" />
+                <Sparkles className="w-5 h-5" />
               </div>
               <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-200">
-                Conversation Thread Ready
+                AI Tutor Ready
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                Send your first message below. All messages persist in PostgreSQL
-                across page reloads. Real AI generation activates in Phase 8.
+                Ask any question grounded in your uploaded documents. Choose your guidance mode below (Light, Detailed, or Full Solution).
               </p>
             </div>
           ) : (
             <div className="max-w-3xl mx-auto space-y-4">
               {messages.map((msg) => {
                 const isUser = msg.role === "user";
+                const isStreamingThis = isGenerating && msg.role === "assistant" && !msg.content;
+
                 return (
                   <div
                     key={msg.id}
@@ -200,7 +334,7 @@ export function ChatArea() {
 
                     {/* Message Bubble */}
                     <div
-                      className={`max-w-[80%] sm:max-w-[70%] rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-sm ${
+                      className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-sm ${
                         isUser
                           ? "bg-brand-50 dark:bg-brand-600/20 text-brand-950 dark:text-slate-100 border border-brand-200 dark:border-brand-500/30 rounded-tr-none"
                           : "bg-white dark:bg-slate-950/80 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-800 rounded-tl-none"
@@ -208,7 +342,7 @@ export function ChatArea() {
                     >
                       <div className="flex items-center justify-between space-x-3 mb-1 text-[10px] text-slate-500 dark:text-slate-400">
                         <span className="font-semibold uppercase tracking-wider">
-                          {isUser ? "You" : "AI Tutor (Test Record)"}
+                          {isUser ? "You" : "AI Tutor"}
                         </span>
                         <span>
                           {new Date(msg.created_at).toLocaleTimeString([], {
@@ -217,11 +351,91 @@ export function ChatArea() {
                           })}
                         </span>
                       </div>
-                      <p className="whitespace-pre-wrap">{msg.content}</p>
+
+                      {/* Content */}
+                      {isStreamingThis ? (
+                        <div className="flex items-center space-x-2 py-1 text-slate-500 text-xs">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-600 dark:text-brand-400" />
+                          <span className="italic">{generationStatus || "Formulating grounded answer..."}</span>
+                        </div>
+                      ) : isUser ? (
+                        <div className="whitespace-pre-wrap leading-relaxed">
+                          {msg.content}
+                        </div>
+                      ) : (
+                        <MarkdownRenderer
+                          content={msg.content}
+                          citations={msg.citations}
+                          onOpenCitation={handleOpenCitation}
+                        />
+                      )}
+
+                      {/* Citations & Evidence Section */}
+                      {!isUser && (() => {
+                        const { inlineCitationKeys } = preprocessMarkdownWithCitations(
+                          msg.content,
+                          msg.citations || []
+                        );
+                        const deduplicated = deduplicateCitations(msg.citations || []);
+                        const bottomCitations = deduplicated.filter(
+                          (c) => !inlineCitationKeys.has(getCitationKey(c))
+                        );
+
+                        if (bottomCitations.length === 0) return null;
+
+                        return (
+                          <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800/80 space-y-1.5">
+                            <div className="flex items-center space-x-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                              <BookOpen className="w-3 h-3 text-brand-600 dark:text-brand-400" />
+                              <span>Document Evidence ({bottomCitations.length})</span>
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {bottomCitations.map((c, idx) => (
+                                <span
+                                  key={c.chunk_id || `${c.document_id}-${c.page_start}-${idx}`}
+                                  className="relative inline-flex group"
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenCitation(c)}
+                                    aria-label={`${c.document_name}, ${c.page_start === c.page_end ? `Page ${c.page_start}` : `Pages ${c.page_start}–${c.page_end}`}`}
+                                    className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-brand-50/80 hover:bg-brand-100 dark:bg-brand-950/40 dark:hover:bg-brand-900/60 border border-brand-200/80 dark:border-brand-800/60 text-[11px] font-medium text-brand-800 dark:text-brand-300 transition-all focus:outline-none focus-visible:ring-1 focus-visible:ring-brand-500"
+                                  >
+                                    <span aria-hidden="true">{"\u{1F4C4}"}</span>
+                                    <span className="font-mono">
+                                      {formatCitationPages(c.page_start, c.page_end)}
+                                    </span>
+                                  </button>
+                                  <span
+                                    role="tooltip"
+                                    className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:flex group-focus-within:flex flex-col items-center z-30"
+                                  >
+                                    <span className="bg-slate-900/95 dark:bg-slate-950/95 text-slate-100 border border-slate-700/80 rounded-md px-2.5 py-1.5 shadow-lg text-[10px] whitespace-nowrap leading-tight">
+                                      <span className="block font-semibold text-white max-w-[220px] truncate">{c.document_name}</span>
+                                      <span className="block text-slate-400 text-[9px] mt-0.5">
+                                        {c.page_start === c.page_end ? `Page ${c.page_start}` : `Pages ${c.page_start}–${c.page_end}`}
+                                      </span>
+                                    </span>
+                                  </span>
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 );
               })}
+
+              {/* Streaming in progress indicator bar */}
+              {isGenerating && generationStatus && (
+                <div className="flex items-center justify-center space-x-2 py-1 text-xs text-brand-600 dark:text-brand-400">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span className="font-medium">{generationStatus}</span>
+                </div>
+              )}
+
               <div ref={messagesEndRef} />
             </div>
           )}
@@ -247,10 +461,10 @@ export function ChatArea() {
                       <span>Workspace Learning Center</span>
                     </div>
                     <h1 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100">
-                      Document Storage & Study Threads
+                      Document-Grounded AI Learning
                     </h1>
                     <p className="text-xs text-slate-600 dark:text-slate-400 max-w-lg leading-relaxed">
-                      Upload your PDF/DOCX course materials and study notes below. All documents persist securely in private storage and anchor future AI learning.
+                      Upload your PDF/DOCX course materials and start study threads. All answers are strictly grounded in your documents with verifiable citations.
                     </p>
                   </div>
 
@@ -276,9 +490,9 @@ export function ChatArea() {
                 </div>
 
                 <div className="flex items-center space-x-2 pt-2 border-t border-slate-200 dark:border-slate-800/80 text-[11px] text-slate-500 dark:text-slate-400">
-                  <AlertCircle className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400 shrink-0" />
+                  <Sparkles className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400 shrink-0" />
                   <span>
-                    Phase 4 Active: Original file uploads persist in private storage with workspace-level isolation.
+                    Phase 8 Active: Grounded LLM generation with streaming tokens, citation attribution, and relevance gating.
                   </span>
                 </div>
               </div>
@@ -286,20 +500,35 @@ export function ChatArea() {
               {/* Split-View Guidance Card */}
               <div className="p-6 rounded-2xl bg-white dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800/80 shadow-sm dark:shadow-lg space-y-4">
                 <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-200 flex items-center space-x-2">
-                  <Sparkles className="w-4 h-4 text-brand-600 dark:text-brand-400" />
-                  <span>Split-View Document & Chat Workspace</span>
+                  <Compass className="w-4 h-4 text-brand-600 dark:text-brand-400" />
+                  <span>How AI Tutor Works</span>
                 </h3>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs text-slate-600 dark:text-slate-400">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs text-slate-600 dark:text-slate-400">
                   <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 space-y-1">
-                    <span className="font-semibold text-slate-800 dark:text-slate-300">Left Pane: Document Viewer</span>
+                    <div className="flex items-center space-x-1.5 font-semibold text-slate-800 dark:text-slate-300">
+                      <Lightbulb className="w-3.5 h-3.5 text-amber-500" />
+                      <span>1. Light Guidance</span>
+                    </div>
                     <p className="text-[11px] leading-relaxed">
-                      Select any uploaded document (PDF, Word, TXT, Images) from the left panel to preview it side-by-side. Drag the divider to resize.
+                      Concise hints and guided next steps. Ideal for active problem solving.
                     </p>
                   </div>
                   <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 space-y-1">
-                    <span className="font-semibold text-slate-800 dark:text-slate-300">Right Pane: Persistent Chat</span>
+                    <div className="flex items-center space-x-1.5 font-semibold text-slate-800 dark:text-slate-300">
+                      <Compass className="w-3.5 h-3.5 text-brand-500" />
+                      <span>2. Detailed Guidance</span>
+                    </div>
                     <p className="text-[11px] leading-relaxed">
-                      Start or switch conversations to chat with the AI Tutor while keeping your study notes open.
+                      Step-by-step conceptual walkthroughs with deep educational explanation.
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 space-y-1">
+                    <div className="flex items-center space-x-1.5 font-semibold text-slate-800 dark:text-slate-300">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                      <span>3. Full Solution</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed">
+                      Complete answers and solutions grounded in the uploaded course documents.
                     </p>
                   </div>
                 </div>
@@ -321,9 +550,9 @@ export function ChatArea() {
               </div>
 
               <div className="inline-flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
-                <AlertCircle className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400 shrink-0" />
+                <Sparkles className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400 shrink-0" />
                 <span>
-                  Phase 4 Active: Workspace document storage and multi-thread persistence enabled.
+                  Phase 8 Active: Grounded RAG token streaming with verifiable document citations.
                 </span>
               </div>
             </div>
@@ -333,62 +562,82 @@ export function ChatArea() {
 
       {/* Input Area (Active when inside a conversation) */}
       <div className="p-4 border-t border-slate-200 dark:border-slate-800/80 bg-white/80 dark:bg-slate-950/80 backdrop-blur-sm shrink-0">
-        <div className="max-w-3xl mx-auto">
-          {/* Phase 3 Test Role Switcher Banner */}
+        <div className="max-w-3xl mx-auto space-y-2.5">
+          {/* Pedagogical Guidance Mode Selector */}
           {conversationId && (
-            <div className="flex items-center justify-between mb-2 px-1 text-[11px] text-slate-500 dark:text-slate-400">
+            <div className="flex items-center justify-between px-1 text-xs">
               <div className="flex items-center space-x-2">
-                <span>Post message as:</span>
-                <button
-                  type="button"
-                  onClick={() => setSendAsRole("user")}
-                  className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
-                    sendAsRole === "user"
-                      ? "bg-brand-600 text-white"
-                      : "bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 border border-slate-200 dark:border-transparent"
-                  }`}
-                >
-                  User
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSendAsRole("assistant")}
-                  className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
-                    sendAsRole === "assistant"
-                      ? "bg-indigo-600 text-white"
-                      : "bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 border border-slate-200 dark:border-transparent"
-                  }`}
-                  title="Phase 3 test helper: verify assistant message persistence without real AI"
-                >
-                  <Bot className="w-3 h-3 inline mr-1" />
-                  Assistant (Test Note)
-                </button>
+                <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                  Mode:
+                </span>
+                <div className="inline-flex p-0.5 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                  {(["Light Guidance", "Detailed Guidance", "Full Solution"] as ChatMode[]).map(
+                    (mode) => {
+                      const isActive = chatMode === mode;
+                      return (
+                        <button
+                          key={mode}
+                          type="button"
+                          disabled={isGenerating}
+                          onClick={() => setChatMode(mode)}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-all ${
+                            isActive
+                              ? "bg-white dark:bg-slate-800 text-brand-600 dark:text-brand-300 shadow-sm"
+                              : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+                          } disabled:opacity-50`}
+                        >
+                          {mode === "Light Guidance" && (
+                            <Lightbulb className="w-3 h-3 inline mr-1 text-amber-500" />
+                          )}
+                          {mode === "Detailed Guidance" && (
+                            <Compass className="w-3 h-3 inline mr-1 text-brand-500" />
+                          )}
+                          {mode === "Full Solution" && (
+                            <CheckCircle2 className="w-3 h-3 inline mr-1 text-emerald-500" />
+                          )}
+                          <span>{mode}</span>
+                        </button>
+                      );
+                    }
+                  )}
+                </div>
               </div>
-              <span className="text-slate-400 dark:text-slate-500 hidden sm:inline">
-                Real AI generation activates in Phase 8
-              </span>
+
+              {isGenerating && (
+                <button
+                  type="button"
+                  onClick={handleStopGenerating}
+                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 border border-rose-200 dark:border-rose-800/60 text-[11px] font-medium text-rose-600 dark:text-rose-400 transition-all active:scale-95"
+                >
+                  <Square className="w-2.5 h-2.5 fill-current" />
+                  <span>Stop Generating</span>
+                </button>
+              )}
             </div>
           )}
 
+          {/* Prompt Form */}
           <form onSubmit={handleSendMessage} className="relative flex items-center">
             <input
               type="text"
               value={inputValue}
-              disabled={!conversationId}
+              disabled={!conversationId || isGenerating}
               onChange={(e) => setInputValue(e.target.value)}
               placeholder={
                 conversationId
-                  ? `Type a ${sendAsRole} message to test persistence...`
-                  : "Select or start a conversation to send messages..."
+                  ? isGenerating
+                    ? "AI Tutor is streaming response..."
+                    : `Ask a question in ${chatMode} mode...`
+                  : "Select or start a conversation to ask questions..."
               }
               className="w-full pl-4 pr-12 py-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-800 text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-500 text-sm focus:outline-none focus:ring-1 focus:ring-brand-500 focus:border-brand-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             />
             <button
               type="submit"
-              disabled={!inputValue.trim() || !conversationId || isSending}
+              disabled={!inputValue.trim() || !conversationId || isGenerating}
               className="absolute right-2 p-2 rounded-lg bg-brand-600 text-white disabled:opacity-40 disabled:cursor-not-allowed hover:bg-brand-500 active:scale-95 transition-all"
             >
-              {isSending ? (
+              {isGenerating ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
               ) : (
                 <Send className="w-4 h-4" />
@@ -396,9 +645,9 @@ export function ChatArea() {
             </button>
           </form>
 
-          <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400 mt-2 px-1">
-            <span>AI Tutor Assistant • Conversation Persistence</span>
-            <span>URL-Driven • PostgreSQL Backed</span>
+          <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400 mt-1 px-1">
+            <span>AI Tutor Assistant • Grounded RAG Generation</span>
+            <span>Document-First • Verifiable Citations</span>
           </div>
         </div>
       </div>

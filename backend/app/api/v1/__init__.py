@@ -5,6 +5,8 @@ from app.api.v1.workspaces import router as workspaces_router
 from app.api.v1.conversations import router as conversations_router
 from app.api.v1.messages import router as messages_router
 from app.api.v1.documents import router as documents_router
+from app.api.v1.retrieval import router as retrieval_router
+from app.api.v1.chat import router as chat_router
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="", tags=["health"])
@@ -12,3 +14,5 @@ api_v1_router.include_router(workspaces_router, prefix="", tags=["workspaces"])
 api_v1_router.include_router(conversations_router, prefix="", tags=["conversations"])
 api_v1_router.include_router(messages_router, prefix="", tags=["messages"])
 api_v1_router.include_router(documents_router, prefix="", tags=["documents"])
+api_v1_router.include_router(retrieval_router, prefix="", tags=["retrieval"])
+api_v1_router.include_router(chat_router, prefix="", tags=["chat"])

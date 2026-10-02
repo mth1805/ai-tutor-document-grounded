@@ -13,10 +13,21 @@ from app.schemas.conversation import (
 from app.schemas.message import (
     MessageCreate,
     MessageResponse,
+    CitationItem,
 )
 from app.schemas.document import (
     DocumentResponse,
     DocumentDownloadResponse,
+)
+from app.schemas.retrieval import (
+    RetrievalRequest,
+    RetrievedChunk,
+    RetrievalResponse,
+    RetrievalTimingMetrics,
+)
+from app.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
 )
 
 __all__ = [
@@ -29,6 +40,14 @@ __all__ = [
     "ConversationResponse",
     "MessageCreate",
     "MessageResponse",
+    "CitationItem",
     "DocumentResponse",
     "DocumentDownloadResponse",
+    "RetrievalRequest",
+    "RetrievedChunk",
+    "RetrievalResponse",
+    "RetrievalTimingMetrics",
+    "ChatRequest",
+    "ChatResponse",
 ]
+
