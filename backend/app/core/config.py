@@ -87,16 +87,29 @@ class Settings(BaseSettings):
     # Phase 8: LLM Provider and Grounded Generation
     LLM_PROVIDER: str = "gemini"  # gemini | mock
     GEMINI_API_KEY: str | None = None
-    GEMINI_MODEL: str = "gemini-1.5-flash"
-    LLM_TEMPERATURE: float = 0.2
+    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_THINKING_LEVEL: str = "medium"
     LLM_MAX_OUTPUT_TOKENS: int = 2048
-    LLM_TOP_P: float = 0.95
     LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
 
-    # Phase 9: Web Search Fallback via Gemini Google Search grounding
+    # Phase 9: Web Search Fallback via Tavily Search API
     WEB_SEARCH_FALLBACK_ENABLED: bool = True
-    # Maximum number of web sources to surface in citation metadata
+    # Maximum number of web sources to surface in citation metadata and pass to Gemini context
     WEB_SEARCH_MAX_SOURCES: int = 5
+    # Minimum rerank score that the top-1 retrieved chunk must achieve for the evidence
+    # to be considered "answerable" (not just topically adjacent). Chunks that pass
+    # RELEVANCE_THRESHOLD (0.35) but fall below this bar indicate the corpus has
+    # related material but cannot actually answer the query — triggering web fallback.
+    # Cross-Encoder scores for truly answerable chunks are typically ≥ 0.6;
+    # for topically adjacent but non-answerable chunks they cluster 0.35–0.55.
+    MIN_ANSWERABLE_RERANK_SCORE: float = 0.55
+
+    # Tavily Search API (server-side — NEVER expose to frontend)
+    TAVILY_API_KEY: str | None = None
+    # Maximum number of results fetched from Tavily per query (capped by WEB_SEARCH_MAX_SOURCES)
+    TAVILY_MAX_RESULTS: int = 5
+    # Timeout in seconds for a single Tavily HTTP request
+    WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
 
 
 

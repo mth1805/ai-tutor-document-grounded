@@ -21,6 +21,9 @@ from app.services.document_service import DocumentService, _IN_MEMORY_DOCUMENTS
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
 from app.rag.prompt_builder import PromptBuilder, ChatMode, SourceEvidence
 from app.rag.citation_service import CitationService, Citation, WebCitation
+from app.web_search import get_web_search_provider, WebSearchProvider
+from app.web_search.base import WebSearchResult
+from app.web_search.exceptions import WebSearchError
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +32,15 @@ INSUFFICIENT_EVIDENCE_MESSAGE = (
     "Please ensure the relevant course materials or notes are uploaded and indexed, or try rephrasing your query."
 )
 
-WEB_GROUNDING_SYSTEM_INSTRUCTION = (
+# System instruction used when answering from Tavily web evidence (no document context).
+WEB_FALLBACK_SYSTEM_INSTRUCTION = (
     "You are AI Tutor Assistant, an expert learning assistant. "
     "The user's question could not be answered from their uploaded documents. "
-    "Use your knowledge and real-time web search to answer the question accurately and clearly. "
-    "Clearly structure your response with headings and bullet points where helpful. "
-    "Do NOT fabricate citations or URLs. Rely only on information you can verify."
+    "You have been provided with web search results as <WEB_EVIDENCE> context. "
+    "Answer the question clearly and thoroughly using ONLY the information inside <WEB_EVIDENCE>. "
+    "Do NOT fabricate facts, URLs, or source titles that are not present in <WEB_EVIDENCE>. "
+    "Do NOT include [Web Source X] markers in your final answer — write natural prose only. "
+    "Structure your response with headings and bullet points where helpful."
 )
 
 
@@ -173,70 +179,163 @@ class RAGService:
         )
 
         # 6. Strict Evidence Gating — Phase 9 Web Search Fallback
-        if not retrieval_response.has_sufficient_evidence or not retrieval_response.results:
+        #
+        # Two-tier gate (both must pass to use the document path):
+        #   Tier 1: has_sufficient_evidence — at least one chunk scored ≥ RELEVANCE_THRESHOLD (0.35).
+        #           Indicates the corpus has topically adjacent material.
+        #   Tier 2: top-1 Cross-Encoder score ≥ MIN_ANSWERABLE_RERANK_SCORE (0.55).
+        #           Indicates the best retrieved chunk can actually answer the query,
+        #           not merely share vocabulary with it.
+        #           NOTE: Tier 2 only applies on the QUALITY path where rerank_score comes
+        #           from the Cross-Encoder. On the FAST path, `rerank_score` is set to
+        #           `rrf_score` (≈0.016–0.033), which is not comparable. FAST-path
+        #           dual-consensus selection is already a strong answerability signal.
+        # Chunks passing Tier 1 but failing Tier 2 (QUALITY path only) are "related but
+        # not answerable" — web fallback is the correct route. This decision is made from
+        # retrieval scores alone, before any LLM call.
+        is_quality_path = retrieval_response.routing_path == "QUALITY"
+        top_rerank_score: float = max(
+            (c.rerank_score for c in retrieval_response.results if c.rerank_score is not None),
+            default=0.0,
+        )
+        tier2_passes: bool = (
+            # FAST path: dual-consensus passing already implies answerability
+            not is_quality_path
+            # QUALITY path: require cross-encoder top-1 ≥ MIN_ANSWERABLE_RERANK_SCORE
+            or top_rerank_score >= settings.MIN_ANSWERABLE_RERANK_SCORE
+        )
+        evidence_is_answerable: bool = (
+            retrieval_response.has_sufficient_evidence
+            and bool(retrieval_response.results)
+            and tier2_passes
+        )
+
+        if not evidence_is_answerable:
             logger.info(
-                "Insufficient document evidence for query in conv %s (route=%s). "
-                "Checking web fallback (enabled=%s).",
+                "Insufficient/non-answerable document evidence for query in conv %s "
+                "(route=%s, has_evidence=%s, top_rerank=%.4f, answerable_threshold=%.4f, "
+                "tier2_passes=%s). Checking web fallback (enabled=%s).",
                 conversation_id,
                 retrieval_response.routing_path,
+                retrieval_response.has_sufficient_evidence,
+                top_rerank_score,
+                settings.MIN_ANSWERABLE_RERANK_SCORE,
+                tier2_passes,
                 settings.WEB_SEARCH_FALLBACK_ENABLED,
             )
 
-            # --- Phase 9: Web Search Fallback ---
-            provider = llm_provider or get_llm_provider()
-            if settings.WEB_SEARCH_FALLBACK_ENABLED and hasattr(provider, "generate_stream_with_grounding"):
+
+
+            # --- Phase 9: Web Search Fallback (Tavily) ---
+            if settings.WEB_SEARCH_FALLBACK_ENABLED:
+                logger.info("[Phase 9] Web fallback ENABLED — entering Tavily path.")
                 yield f"event: status\ndata: {json.dumps({'status': 'insufficient_evidence', 'message': 'Not enough information in your documents. Searching the web...'})}\n\n"
                 yield f"event: status\ndata: {json.dumps({'status': 'web_search', 'message': 'Searching web...'})}\n\n"
-                yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating answer...'})}\n\n"
 
-                # Build a minimal grounded prompt — no document evidence
-                web_prompt = (
-                    f"<CONVERSATION_HISTORY>\n"
-                    + "\n".join(
-                        f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
-                        for m in history_list
-                    )
-                    + f"\n</CONVERSATION_HISTORY>\n\n"
-                    f"<USER_QUERY>\n{query.strip()}\n</USER_QUERY>\n\n"
-                    "Answer the user's question clearly and thoroughly based on web search results."
-                )
-
-                accumulated_tokens: List[str] = []
-                final_web_sources: List[dict] = []
-
+                # 1. Fetch web results from Tavily
                 try:
-                    async for token_chunk, sources in provider.generate_stream_with_grounding(
-                        prompt=web_prompt,
-                        system_instruction=WEB_GROUNDING_SYSTEM_INSTRUCTION,
-                    ):
-                        if token_chunk:
-                            accumulated_tokens.append(token_chunk)
-                            yield f"event: token\ndata: {json.dumps({'token': token_chunk})}\n\n"
-                        if sources:
-                            final_web_sources = sources
-
-                except LLMError as le:
-                    logger.error("Web-grounded LLM failed: %s", le.message)
-                    yield f"event: error\ndata: {json.dumps({'error': le.message})}\n\n"
+                    web_search_provider = get_web_search_provider()
+                    tavily_results: List[WebSearchResult] = await web_search_provider.search(
+                        query=query,
+                        max_results=settings.TAVILY_MAX_RESULTS,
+                    )
+                    logger.info(
+                        "[Phase 9] Tavily returned %d results for conv=%s",
+                        len(tavily_results),
+                        conversation_id,
+                    )
+                except WebSearchError as wse:
+                    logger.error(
+                        "[Phase 9] Tavily search FAILED (%s): %s",
+                        type(wse).__name__,
+                        wse.message,
+                    )
+                    yield f"event: error\ndata: {json.dumps({'error': f'Web search failed: {wse.message}'})}\n\n"
                     return
                 except Exception as e:
-                    logger.error("Unexpected error in web-grounded streaming: %s", e, exc_info=True)
-                    yield f"event: error\ndata: {json.dumps({'error': 'An error occurred during web-grounded response generation.'})}\n\n"
+                    logger.error("[Phase 9] Unexpected Tavily error: %s", e, exc_info=True)
+                    yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web search.'})}\n\n"
+                    return
+
+                if not tavily_results:
+                    logger.warning("[Phase 9] Tavily returned zero results — cannot answer from web.")
+                    yield f"event: error\ndata: {json.dumps({'error': INSUFFICIENT_EVIDENCE_MESSAGE})}\n\n"
+                    return
+
+                # 2. Build bounded web context for Gemini (capped at WEB_SEARCH_MAX_SOURCES)
+                capped_results = tavily_results[: settings.WEB_SEARCH_MAX_SOURCES]
+                web_context_sections: List[str] = []
+                for i, result in enumerate(capped_results, start=1):
+                    web_context_sections.append(
+                        f"[Web Source {i}]\n"
+                        f"Title: {result.title}\n"
+                        f"URL: {result.url}\n"
+                        f"Content:\n{result.content}"
+                    )
+                web_context_str = "\n\n".join(web_context_sections)
+
+                # 3. Assemble prompt that grounds Gemini on the Tavily evidence
+                history_str = "\n".join(
+                    f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
+                    for m in history_list
+                ) or "None"
+                web_prompt = (
+                    "<WEB_EVIDENCE>\n"
+                    f"{web_context_str}\n"
+                    "</WEB_EVIDENCE>\n\n"
+                    "<CONVERSATION_HISTORY>\n"
+                    f"{history_str}\n"
+                    "</CONVERSATION_HISTORY>\n\n"
+                    "<USER_QUERY>\n"
+                    f"{query.strip()}\n"
+                    "</USER_QUERY>\n\n"
+                    "Answer the user's question using ONLY the information provided in <WEB_EVIDENCE> above."
+                )
+
+                yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating answer...'})}\n\n"
+
+                # 4. Stream tokens from existing generate_stream() — NO native grounding
+                provider = llm_provider or get_llm_provider()
+                accumulated_tokens: List[str] = []
+                try:
+                    async for token in provider.generate_stream(
+                        prompt=web_prompt,
+                        system_instruction=WEB_FALLBACK_SYSTEM_INSTRUCTION,
+                    ):
+                        if token:
+                            accumulated_tokens.append(token)
+                            yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                    logger.info(
+                        "[Phase 9] Tavily-grounded stream completed. tokens=%d",
+                        len(accumulated_tokens),
+                    )
+                except LLMError as le:
+                    logger.error(
+                        "[Phase 9] LLM generation FAILED after Tavily search (LLMError=%s): %s",
+                        type(le).__name__,
+                        le.message,
+                    )
+                    yield f"event: error\ndata: {json.dumps({'error': f'Web search failed: {le.message}'})}\n\n"
+                    return
+                except Exception as e:
+                    logger.error("[Phase 9] Unexpected error in web-grounded LLM streaming: %s", e, exc_info=True)
+                    yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web-grounded response generation.'})}\n\n"
                     return
 
                 full_raw_text = "".join(accumulated_tokens).strip()
                 if not full_raw_text:
                     full_raw_text = INSUFFICIENT_EVIDENCE_MESSAGE
 
-                # Build structured WebCitation list (capped at WEB_SEARCH_MAX_SOURCES)
-                web_citations: List[WebCitation] = [
-                    WebCitation.from_raw(s)
-                    for s in final_web_sources[: settings.WEB_SEARCH_MAX_SOURCES]
-                    if s.get("url")
-                ]
+                # 5. Build structured WebCitation list from Tavily results
+                seen_web_urls: set = set()
+                web_citations: List[WebCitation] = []
+                for result in capped_results:
+                    if result.url and result.url not in seen_web_urls:
+                        seen_web_urls.add(result.url)
+                        web_citations.append(WebCitation.from_raw(result.to_dict()))
                 web_citations_payload = [wc.to_dict() for wc in web_citations]
 
-                # Persist assistant message — use citations=[] for doc citations, web in separate key
+                # 6. Persist assistant message
                 asst_msg = await ConversationService.create_message(
                     db=db,
                     conversation_id=conversation_id,
@@ -250,7 +349,7 @@ class RAGService:
 
                 total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
                 logger.info(
-                    "Web-grounded generation completed in %.2fms: %d web sources, msg=%s",
+                    "[Phase 9] Tavily-grounded generation completed in %.2fms: %d web sources, msg=%s",
                     total_elapsed_ms,
                     len(web_citations),
                     asst_msg.id,
@@ -269,7 +368,7 @@ class RAGService:
                 yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
                 return
 
-            # --- No web fallback available: emit deterministic message ---
+            # --- No web fallback (disabled): emit deterministic message ---
             yield f"event: status\ndata: {json.dumps({'status': 'insufficient_evidence', 'message': 'No sufficient evidence found in documents.'})}\n\n"
 
             fallback_text = INSUFFICIENT_EVIDENCE_MESSAGE

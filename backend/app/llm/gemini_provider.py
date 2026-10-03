@@ -25,9 +25,7 @@ class GeminiProvider(BaseLLMProvider):
         self,
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
-        temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
     ):
         resolved_key = api_key or settings.GEMINI_API_KEY
         if not resolved_key or not resolved_key.strip():
@@ -36,15 +34,12 @@ class GeminiProvider(BaseLLMProvider):
             )
         self.api_key = resolved_key.strip()
         self.model_name = model_name or settings.GEMINI_MODEL
-        self.temperature = (
-            temperature if temperature is not None else settings.LLM_TEMPERATURE
-        )
         self.max_output_tokens = (
             max_output_tokens
             if max_output_tokens is not None
             else settings.LLM_MAX_OUTPUT_TOKENS
         )
-        self.top_p = top_p if top_p is not None else settings.LLM_TOP_P
+        self.thinking_level = settings.GEMINI_THINKING_LEVEL
 
         # Reuse single client across requests (avoids recreating heavyweight client per request)
         self._client = genai.Client(api_key=self.api_key)
@@ -55,14 +50,11 @@ class GeminiProvider(BaseLLMProvider):
         **kwargs,
     ) -> types.GenerateContentConfig:
         """Assembles types.GenerateContentConfig from instance settings and overrides."""
-        temperature = kwargs.get("temperature", self.temperature)
         max_output_tokens = kwargs.get("max_output_tokens", self.max_output_tokens)
-        top_p = kwargs.get("top_p", self.top_p)
 
         return types.GenerateContentConfig(
-            temperature=temperature,
             max_output_tokens=max_output_tokens,
-            top_p=top_p,
+            thinking_config=types.ThinkingConfig(thinking_level=self.thinking_level),
             system_instruction=system_instruction,
         )
 
@@ -141,12 +133,8 @@ class GeminiProvider(BaseLLMProvider):
         """
         config = self._build_config(system_instruction=system_instruction, **kwargs)
         # Inject google_search tool for grounding
-        config = types.GenerateContentConfig(
-            temperature=config.temperature,
-            max_output_tokens=config.max_output_tokens,
-            top_p=config.top_p,
-            system_instruction=system_instruction,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+        config = config.model_copy(
+            update={"tools": [types.Tool(google_search=types.GoogleSearch())]}
         )
         try:
             response = await self._client.aio.models.generate_content(
@@ -173,12 +161,11 @@ class GeminiProvider(BaseLLMProvider):
         web_sources is populated on the final chunk once grounding metadata is available;
         intermediate chunks yield an empty list.
         """
-        config = types.GenerateContentConfig(
-            temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens,
-            top_p=self.top_p,
+        config = self._build_config(
             system_instruction=system_instruction,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+            **kwargs,
+        ).model_copy(
+            update={"tools": [types.Tool(google_search=types.GoogleSearch())]}
         )
         try:
             stream = await self._client.aio.models.generate_content_stream(

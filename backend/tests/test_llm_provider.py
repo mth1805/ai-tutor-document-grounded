@@ -85,6 +85,21 @@ def test_gemini_provider_error_mapping():
     assert "500" in str(mapped_500)
 
 
+def test_gemini_provider_uses_gemini_3_thinking_config(monkeypatch):
+    monkeypatch.setattr(settings, "GEMINI_THINKING_LEVEL", "medium")
+    monkeypatch.setattr(settings, "LLM_MAX_OUTPUT_TOKENS", 2048)
+    provider = GeminiProvider(api_key="test-dummy-key")
+
+    standard_config = provider._build_config(system_instruction="Be helpful")
+
+    assert provider.model_name == "gemini-3.8-flash"
+    assert standard_config.max_output_tokens == 2048
+    assert standard_config.thinking_config.thinking_level == "medium"
+    assert standard_config.system_instruction == "Be helpful"
+    assert "temperature" not in standard_config.model_fields_set
+    assert "top_p" not in standard_config.model_fields_set
+
+
 def test_llm_factory_and_injection(monkeypatch):
     reset_llm_provider()
 

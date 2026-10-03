@@ -18,3 +18,4 @@ tiktoken>=0.6.0
 pgvector>=0.2.5
 sentence-transformers>=2.5.0
 google-genai>=2.0.0
+tavily-python>=0.3.0

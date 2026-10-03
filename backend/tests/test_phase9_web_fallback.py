@@ -1,16 +1,21 @@
 """Phase 9: Web Search Fallback — focused unit and integration tests.
 
-Covers:
-1. Sufficient document evidence → Gemini called WITHOUT web grounding
-2. Insufficient document evidence → web fallback path selected
-3. Web citation extraction — URL/title/domain from grounding metadata
-4. Mixed citations — doc + web can coexist
-5. Citation deduplication — repeated web citations
-6. Raw citation leakage — [Source X] must not reach the user
-7. Web failure — graceful fallback response
-8. Streaming — fallback still works through SSE
-9. Persistence — assistant message + citations saved correctly
-10. Regression — existing retrieval/chat tests still pass
+Architecture change: Web fallback now uses Tavily (via WebSearchProvider abstraction)
+instead of Gemini native Google Search grounding.
+
+Test mapping to requirements:
+ 1. sufficient document evidence  → Tavily NOT called
+ 2. insufficient document evidence → Tavily called exactly once
+ 3. Tavily result parsing → title/url/content/domain preserved in WebCitation
+ 4. Gemini receives bounded web context (prompt contains [Web Source X])
+ 5. web citations persisted correctly in done payload
+ 6. duplicate web URLs deduplicated in WebCitation list
+ 7. raw [Source X] / [Web Source X] must never reach final visible answer
+ 8. web-search SSE status event emitted because Tavily path entered
+ 9. Tavily failure produces SSE error event
+10. empty Tavily results produce graceful error event
+11. existing document-only path unchanged
+12. existing evidence-gate behavior unchanged
 """
 import json
 import uuid
@@ -32,6 +37,9 @@ from app.ml.mock_provider import MockEmbeddingProvider
 from app.ml.reranker_mock import MockRerankerProvider
 from app.llm import set_llm_provider, reset_llm_provider, MockLLMProvider, LLMProviderError
 from app.rag.citation_service import WebCitation
+from app.web_search import set_web_search_provider, reset_web_search_provider
+from app.web_search.mock_provider import MockWebSearchProvider
+from app.web_search.exceptions import WebSearchAuthError, WebSearchTimeoutError, WebSearchRateLimitError
 
 client = TestClient(app)
 
@@ -52,6 +60,8 @@ def setup_clean_state():
         default_response="Document-grounded answer [Source 1].",
         tokens=["Document-grounded ", "answer ", "[Source 1]."],
     ))
+    # Default: no-op web search provider (won't be hit when docs are sufficient)
+    set_web_search_provider(MockWebSearchProvider())
     _IN_MEMORY_CHUNKS.clear()
     _IN_MEMORY_DOCUMENTS.clear()
     _IN_MEMORY_WORKSPACES.clear()
@@ -61,6 +71,7 @@ def setup_clean_state():
     set_embedding_provider(None)
     set_reranker_provider(None)
     reset_llm_provider()
+    reset_web_search_provider()
     _IN_MEMORY_CHUNKS.clear()
     _IN_MEMORY_DOCUMENTS.clear()
     _IN_MEMORY_WORKSPACES.clear()
@@ -122,12 +133,11 @@ def _register_document_and_chunk(ws_id: str, content: str, page_start: int = 1, 
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Sufficient document evidence → web grounding NOT triggered
+# Test 1: Sufficient document evidence → Tavily NOT called
 # ---------------------------------------------------------------------------
 
 def test_sufficient_document_evidence_does_not_trigger_web_fallback(monkeypatch):
-    """When document chunks pass the relevance gate, Gemini should be called
-    WITHOUT web grounding — i.e., generate_stream not generate_stream_with_grounding."""
+    """When document chunks pass the relevance gate, Tavily must NOT be called."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
 
     ws_id, conv_id = _create_workspace_and_conversation()
@@ -140,6 +150,9 @@ def test_sufficient_document_evidence_does_not_trigger_web_fallback(monkeypatch)
     )
     set_llm_provider(mock_llm)
 
+    mock_web = MockWebSearchProvider()
+    set_web_search_provider(mock_web)
+
     res = client.post(
         f"/api/v1/conversations/{conv_id}/chat/sync",
         headers=HEADERS_A,
@@ -148,30 +161,32 @@ def test_sufficient_document_evidence_does_not_trigger_web_fallback(monkeypatch)
     assert res.status_code == 200
     data = res.json()
 
-    # Document evidence is sufficient — normal LLM path taken
+    # Document evidence is sufficient — Gemini document path taken
     assert data["has_sufficient_evidence"] is True
-    assert mock_llm.call_count == 1            # generate_stream was called
-    assert mock_llm.web_grounding_call_count == 0  # web grounding was NOT called
+    assert mock_llm.call_count == 1        # generate_stream was called (doc path)
+    assert mock_web.call_count == 0        # Tavily was NOT called
     assert len(data["citations"]) >= 1
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Insufficient document evidence → web fallback selected
+# Test 2: Insufficient document evidence → Tavily called exactly once
 # ---------------------------------------------------------------------------
 
-def test_insufficient_evidence_triggers_web_fallback(monkeypatch):
-    """Empty workspace should trigger web grounding when fallback is enabled."""
+def test_insufficient_evidence_triggers_tavily_web_fallback(monkeypatch):
+    """Empty workspace should trigger Tavily when fallback is enabled."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
 
     ws_id, conv_id = _create_workspace_and_conversation()
     # No documents registered — workspace is empty
 
-    web_sources = [
-        {"title": "NASA Space FAQ", "url": "https://nasa.gov/space-faq", "snippet": "Space is vast."},
-    ]
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "NASA Space FAQ", "url": "https://nasa.gov/space-faq",
+         "content": "Space is vast.", "domain": "nasa.gov"},
+    ])
+    set_web_search_provider(mock_web)
+
     mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Space ", "is ", "vast ", "and ", "infinite."],
-        web_grounding_sources=web_sources,
+        tokens=["Space ", "is ", "vast ", "and ", "infinite."],
     )
     set_llm_provider(mock_llm)
 
@@ -184,36 +199,37 @@ def test_insufficient_evidence_triggers_web_fallback(monkeypatch):
     data = res.json()
 
     assert data["has_sufficient_evidence"] is False
-    assert mock_llm.call_count == 0                    # doc-grounded path NOT taken
-    assert mock_llm.web_grounding_call_count == 1       # web grounding WAS called
+    assert mock_web.call_count == 1         # Tavily WAS called exactly once
+    assert mock_llm.call_count == 1         # generate_stream (doc-free, Tavily-grounded)
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Web citation extraction — URL/title/domain parsed correctly
+# Test 3: Tavily result parsing — title/url/content/domain preserved
 # ---------------------------------------------------------------------------
 
-def test_web_citation_extraction_from_grounding_metadata(monkeypatch):
-    """Web sources should be parsed into WebCitation objects with url, title, domain."""
+def test_tavily_result_parsing_preserved_in_web_citations(monkeypatch):
+    """Web sources from Tavily should be parsed into WebCitation objects with correct fields."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
 
     ws_id, conv_id = _create_workspace_and_conversation()
 
-    web_sources = [
+    mock_web = MockWebSearchProvider(results=[
         {
             "title": "Wikipedia: Black Hole",
             "url": "https://en.wikipedia.org/wiki/Black_hole",
-            "snippet": "A black hole is a region of spacetime.",
+            "content": "A black hole is a region of spacetime.",
+            "domain": "en.wikipedia.org",
         },
         {
             "title": "NASA Black Holes",
             "url": "https://www.nasa.gov/black-holes",
-            "snippet": "NASA's overview of black holes.",
+            "content": "NASA's overview of black holes.",
+            "domain": "nasa.gov",
         },
-    ]
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Black ", "holes ", "are ", "fascinating."],
-        web_grounding_sources=web_sources,
-    )
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Black ", "holes ", "are ", "fascinating."])
     set_llm_provider(mock_llm)
 
     res = client.post(
@@ -247,52 +263,323 @@ def test_web_citation_extraction_from_grounding_metadata(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Malformed / missing citation metadata handled safely
+# Test 4: Gemini receives bounded web context with [Web Source X] labels
 # ---------------------------------------------------------------------------
 
-def test_web_citation_extraction_handles_malformed_sources(monkeypatch):
-    """WebCitation.from_raw must handle missing/empty fields without crashing."""
+def test_gemini_receives_bounded_web_context(monkeypatch):
+    """The prompt sent to Gemini must contain [Web Source X] context sections from Tavily results."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
 
     ws_id, conv_id = _create_workspace_and_conversation()
 
-    # Malformed: no URL in one source, missing title in another
-    web_sources = [
-        {"title": "Valid Source", "url": "https://valid.com/page", "snippet": "Valid."},
-        {"title": "No URL Source", "url": "", "snippet": "Should be excluded."},
-        {"title": "", "url": "https://notitle.com/", "snippet": "No title."},
-    ]
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Answer."],
-        web_grounding_sources=web_sources,
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "Source Alpha", "url": "https://alpha.com/page",
+         "content": "Alpha content.", "domain": "alpha.com"},
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Alpha ", "answer."])
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "Tell me about Alpha."},
     )
+    assert res.status_code == 200
+
+    # The LLM's last prompt must contain the web context label
+    assert mock_llm.last_prompt is not None
+    assert "[Web Source 1]" in mock_llm.last_prompt
+    assert "https://alpha.com/page" in mock_llm.last_prompt
+    assert "Alpha content." in mock_llm.last_prompt
+    # Must use WEB_EVIDENCE tag (not DOCUMENT_EVIDENCE)
+    assert "<WEB_EVIDENCE>" in mock_llm.last_prompt
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Web citations persisted correctly in done payload
+# ---------------------------------------------------------------------------
+
+def test_web_citations_persisted_correctly(monkeypatch):
+    """After Tavily-grounded response, done payload must carry correct web_sources structure."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+
+    web_src_raw = [{"title": "PW Source", "url": "https://pw.com", "content": "Info.", "domain": "pw.com"}]
+    mock_web = MockWebSearchProvider(results=web_src_raw)
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Persisted ", "web ", "answer."])
     set_llm_provider(mock_llm)
 
     res = client.post(
         f"/api/v1/conversations/{conv_id}/chat",
         headers=HEADERS_A,
-        json={"content": "Some question"},
+        json={"content": "Question requiring web"},
     )
     assert res.status_code == 200
     body = res.text
+    done_idx = body.find("event: done")
+    data_idx = body.find("data: ", done_idx)
+    data_end = body.find("\n\n", data_idx)
+    done_data = json.loads(body[data_idx + 6:data_end])
 
+    assert done_data["used_web_fallback"] is True
+    assert done_data["has_sufficient_evidence"] is False
+    assert "citations" in done_data       # doc citations key present (empty)
+    assert done_data["citations"] == []
+    assert len(done_data["web_sources"]) == 1
+
+    ws = done_data["web_sources"][0]
+    assert ws["source_type"] == "web"
+    assert ws["url"] == "https://pw.com"
+    assert ws["title"] == "PW Source"
+    assert ws["domain"] == "pw.com"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Duplicate web URLs deduplicated in WebCitation list
+# ---------------------------------------------------------------------------
+
+def test_duplicate_web_urls_deduplicated(monkeypatch):
+    """Duplicate URLs from Tavily must appear only once in web_sources."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(settings, "WEB_SEARCH_MAX_SOURCES", 10)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+
+    # Tavily mock returns two entries with the same URL
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "Dup Source", "url": "https://dup.com/page", "content": "Dup.", "domain": "dup.com"},
+        {"title": "Dup Source 2", "url": "https://dup.com/page", "content": "Dup again.", "domain": "dup.com"},
+        {"title": "Unique", "url": "https://unique.com", "content": "Unique.", "domain": "unique.com"},
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Answer."])
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat",
+        headers=HEADERS_A,
+        json={"content": "Broad question"},
+    )
+    assert res.status_code == 200
+    body = res.text
     done_idx = body.find("event: done")
     data_idx = body.find("data: ", done_idx)
     data_end = body.find("\n\n", data_idx)
     done_data = json.loads(body[data_idx + 6:data_end])
 
     web_src = done_data.get("web_sources", [])
-    # Empty URL source excluded; valid sources kept
-    for s in web_src:
-        assert s["url"]  # All returned sources must have a URL
-    # No crash, no fabricated URLs
-    urls = {s["url"] for s in web_src}
-    assert "https://valid.com/page" in urls
-    assert "" not in urls
+    urls = [s["url"] for s in web_src]
+    # Duplicate URL appears only once
+    assert urls.count("https://dup.com/page") == 1
+    assert "https://unique.com" in urls
 
 
 # ---------------------------------------------------------------------------
-# Test 5: WebCitation model unit tests
+# Test 7: Raw [Source X] must NOT reach final answer text
+# ---------------------------------------------------------------------------
+
+def test_no_raw_source_tokens_in_web_fallback_response(monkeypatch):
+    """[Source X] raw tokens must not appear in the final streamed content (web path)."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "T", "url": "https://t.com", "content": "Content.", "domain": "t.com"},
+    ])
+    set_web_search_provider(mock_web)
+
+    # LLM returns clean prose — no Source markers expected
+    mock_llm = MockLLMProvider(tokens=["The ", "answer ", "is ", "clear."])
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "What happened?"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    content = data["content"]
+    assert "[Source " not in content
+    assert "Source 1" not in content
+
+
+# ---------------------------------------------------------------------------
+# Test 8: web-search SSE status event emitted when Tavily path is entered
+# ---------------------------------------------------------------------------
+
+def test_web_search_sse_status_emitted_on_tavily_path(monkeypatch):
+    """The SSE stream must emit status=web_search because the backend actually entered Tavily."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+    # Empty workspace → web fallback
+
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "T", "url": "https://t.com", "content": "Info.", "domain": "t.com"},
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Web ", "answer."])
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat",
+        headers=HEADERS_A,
+        json={"content": "Obscure question not in any doc"},
+    )
+    assert res.status_code == 200
+    body = res.text
+
+    # Must contain status=web_search (emitted because Tavily was actually entered)
+    assert "event: status" in body
+    assert "web_search" in body
+    assert mock_web.call_count == 1       # confirms the real Tavily path was taken
+
+    # Token events
+    assert "event: token" in body
+
+    # Done event with correct flags
+    assert "event: done" in body
+    done_idx = body.find("event: done")
+    data_idx = body.find("data: ", done_idx)
+    data_end = body.find("\n\n", data_idx)
+    done_data = json.loads(body[data_idx + 6:data_end])
+
+    assert done_data["used_web_fallback"] is True
+    assert done_data["has_sufficient_evidence"] is False
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Tavily failure produces SSE error event
+# ---------------------------------------------------------------------------
+
+def test_tavily_failure_yields_sse_error(monkeypatch):
+    """When Tavily raises WebSearchError, an SSE error event must be emitted."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+    # No documents → will trigger Tavily fallback
+
+    mock_web = MockWebSearchProvider(
+        simulate_error=WebSearchAuthError("Tavily API key is invalid.")
+    )
+    set_web_search_provider(mock_web)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat",
+        headers=HEADERS_A,
+        json={"content": "Some question that needs web"},
+    )
+    assert res.status_code == 200
+    body = res.text
+    assert "event: error" in body
+    assert "Tavily API key is invalid" in body
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Empty Tavily results produce graceful error event
+# ---------------------------------------------------------------------------
+
+def test_empty_tavily_results_produce_graceful_error(monkeypatch):
+    """When Tavily returns zero results, an SSE error (not exception) must be emitted."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+
+    # Provider returns empty list (valid call, no results)
+    mock_web = MockWebSearchProvider(results=[])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider()
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat",
+        headers=HEADERS_A,
+        json={"content": "Absolutely obscure query with no web results"},
+    )
+    assert res.status_code == 200
+    body = res.text
+    # Must emit an error event — not generate an uncited Gemini answer
+    assert "event: error" in body
+    # LLM generate_stream must NOT be called (no content to ground it on)
+    assert mock_llm.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Existing document-only path remains unchanged
+# ---------------------------------------------------------------------------
+
+def test_document_only_path_unchanged_when_fallback_disabled(monkeypatch):
+    """WEB_SEARCH_FALLBACK_ENABLED=False must not trigger Tavily."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", False)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+    doc_content = "Mitochondria are the powerhouses of the cell."
+    _register_document_and_chunk(ws_id, doc_content)
+
+    mock_web = MockWebSearchProvider()
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(
+        default_response="Mitochondria are powerhouses [Source 1].",
+        tokens=["Mitochondria ", "are ", "powerhouses ", "[Source 1]."],
+    )
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "mitochondria powerhouses cell"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["has_sufficient_evidence"] is True
+    assert mock_llm.call_count == 1      # doc-grounded path taken
+    assert mock_web.call_count == 0      # Tavily NOT called
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Existing evidence-gate behavior unchanged
+# ---------------------------------------------------------------------------
+
+def test_empty_workspace_with_fallback_disabled_returns_deterministic_fallback(monkeypatch):
+    """When web fallback is disabled and docs are absent, deterministic message is returned."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", False)
+
+    mock_llm = MockLLMProvider()
+    set_llm_provider(mock_llm)
+    mock_web = MockWebSearchProvider()
+    set_web_search_provider(mock_web)
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "What is quantum entanglement?"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["has_sufficient_evidence"] is False
+    assert "couldn't find enough information" in data["content"]
+    assert mock_llm.call_count == 0        # LLM not called at all
+    assert mock_web.call_count == 0        # Tavily not called
+
+
+# ---------------------------------------------------------------------------
+# WebCitation unit tests (these test the existing citation_service, unchanged)
 # ---------------------------------------------------------------------------
 
 def test_web_citation_from_raw_valid():
@@ -333,10 +620,6 @@ def test_web_citation_to_dict_structure():
     assert d["source_type"] == "web"
 
 
-# ---------------------------------------------------------------------------
-# Test 6: Web citation deduplication via WEB_SEARCH_MAX_SOURCES cap
-# ---------------------------------------------------------------------------
-
 def test_web_sources_capped_at_max_sources(monkeypatch):
     """Web sources must be capped at settings.WEB_SEARCH_MAX_SOURCES."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
@@ -345,14 +628,14 @@ def test_web_sources_capped_at_max_sources(monkeypatch):
     ws_id, conv_id = _create_workspace_and_conversation()
 
     # Provide 5 sources — only 2 should appear
-    web_sources = [
-        {"title": f"Source {i}", "url": f"https://example.com/{i}", "snippet": f"Snippet {i}."}
+    mock_web = MockWebSearchProvider(results=[
+        {"title": f"Source {i}", "url": f"https://example.com/{i}",
+         "content": f"Snippet {i}.", "domain": "example.com"}
         for i in range(5)
-    ]
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Answer."],
-        web_grounding_sources=web_sources,
-    )
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Answer."])
     set_llm_provider(mock_llm)
 
     res = client.post(
@@ -370,123 +653,18 @@ def test_web_sources_capped_at_max_sources(monkeypatch):
     assert len(done_data.get("web_sources", [])) == 2
 
 
-# ---------------------------------------------------------------------------
-# Test 7: Raw citation tokens must NOT reach user
-# ---------------------------------------------------------------------------
-
-def test_no_raw_source_tokens_in_web_fallback_response(monkeypatch):
-    """[Source X] raw tokens must not appear in the final streamed content."""
-    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
-
-    ws_id, conv_id = _create_workspace_and_conversation()
-
-    # The model emits raw [Source 1] in web grounding response — it should NOT appear in content
-    # (web responses don't go through CitationService, so raw tokens from the model
-    # should not be present — the web path does not inject source markers)
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["The ", "answer ", "is ", "clear."],  # clean response
-        web_grounding_sources=[{"title": "T", "url": "https://t.com", "snippet": ""}],
-    )
-    set_llm_provider(mock_llm)
-
-    res = client.post(
-        f"/api/v1/conversations/{conv_id}/chat/sync",
-        headers=HEADERS_A,
-        json={"content": "What happened?"},
-    )
-    assert res.status_code == 200
-    data = res.json()
-
-    content = data["content"]
-    # Must not contain raw source tokens
-    assert "[Source " not in content
-    assert "Source 1" not in content
-
-
-# ---------------------------------------------------------------------------
-# Test 8: Web failure → graceful error response
-# ---------------------------------------------------------------------------
-
-def test_web_grounding_failure_yields_sse_error(monkeypatch):
-    """When web grounding raises LLMProviderError, an SSE error event must be emitted."""
-    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
-
-    ws_id, conv_id = _create_workspace_and_conversation()
-    # No documents → will trigger web fallback
-
-    mock_llm = MockLLMProvider(
-        simulate_web_grounding_error=LLMProviderError("Google Search quota exceeded."),
-    )
-    set_llm_provider(mock_llm)
-
-    res = client.post(
-        f"/api/v1/conversations/{conv_id}/chat",
-        headers=HEADERS_A,
-        json={"content": "Some question that needs web"},
-    )
-    assert res.status_code == 200
-    body = res.text
-    assert "event: error" in body
-    assert "Google Search quota exceeded" in body
-
-
-# ---------------------------------------------------------------------------
-# Test 9: Web fallback SSE — status events include web_search status
-# ---------------------------------------------------------------------------
-
-def test_web_fallback_sse_includes_web_search_status_event(monkeypatch):
-    """The SSE stream must emit a status event with status=web_search before tokens."""
-    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
-
-    ws_id, conv_id = _create_workspace_and_conversation()
-    # Empty workspace → web fallback
-
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Web ", "answer."],
-        web_grounding_sources=[{"title": "T", "url": "https://t.com", "snippet": ""}],
-    )
-    set_llm_provider(mock_llm)
-
-    res = client.post(
-        f"/api/v1/conversations/{conv_id}/chat",
-        headers=HEADERS_A,
-        json={"content": "Obscure question not in any doc"},
-    )
-    assert res.status_code == 200
-    body = res.text
-
-    # Must contain status=web_search event
-    assert "event: status" in body
-    assert "web_search" in body
-
-    # Token events
-    assert "event: token" in body
-
-    # Done event
-    assert "event: done" in body
-    done_idx = body.find("event: done")
-    data_idx = body.find("data: ", done_idx)
-    data_end = body.find("\n\n", data_idx)
-    done_data = json.loads(body[data_idx + 6:data_end])
-
-    assert done_data["used_web_fallback"] is True
-    assert done_data["has_sufficient_evidence"] is False
-
-
-# ---------------------------------------------------------------------------
-# Test 10: Persistence — web grounding result saved to DB
-# ---------------------------------------------------------------------------
-
 def test_web_fallback_response_persisted_as_assistant_message(monkeypatch):
-    """After web-grounded response, the assistant message must be persisted."""
+    """After Tavily-grounded response, the assistant message must be persisted."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
 
     ws_id, conv_id = _create_workspace_and_conversation()
 
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Persisted ", "web ", "answer."],
-        web_grounding_sources=[{"title": "PW Source", "url": "https://pw.com", "snippet": ""}],
-    )
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "PW Source", "url": "https://pw.com", "content": "Info.", "domain": "pw.com"},
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Persisted ", "web ", "answer."])
     set_llm_provider(mock_llm)
 
     client.post(
@@ -509,97 +687,146 @@ def test_web_fallback_response_persisted_as_assistant_message(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 11: Mixed evidence not applicable for current in-memory flow
-# (document citations + web_sources in the same done payload)
-# Web sources are in done payload alongside doc citations (empty for web path)
+# Two-Tier Evidence Gate Regression Tests (MIN_ANSWERABLE_RERANK_SCORE)
+# These tests verify that the routing decision uses BOTH tiers, and that
+# Tavily is invoked on the right paths. Pattern identical to previous tests
+# but using MockWebSearchProvider instead of generate_stream_with_grounding.
 # ---------------------------------------------------------------------------
 
-def test_done_payload_structure_for_web_fallback(monkeypatch):
-    """Done payload must contain citations=[], web_sources=[...], used_web_fallback=True."""
+
+class FixedScoreRerankerProvider:
+    """Test-only reranker that returns a constant score for all pairs."""
+
+    def __init__(self, score: float):
+        self._score = score
+
+    def predict(self, pairs, batch_size=None):
+        return [round(self._score, 4)] * len(pairs)
+
+
+def test_tier1_pass_tier2_fail_triggers_tavily(monkeypatch):
+    """Chunks passing Tier 1 (≥0.35) but failing Tier 2 (<0.55) must trigger Tavily."""
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(settings, "MIN_ANSWERABLE_RERANK_SCORE", 0.55)
+    monkeypatch.setattr(settings, "RETRIEVAL_ROUTING_MODE", "always_quality")
+    set_reranker_provider(FixedScoreRerankerProvider(score=0.45))
 
     ws_id, conv_id = _create_workspace_and_conversation()
+    _register_document_and_chunk(ws_id, "This document covers general API concepts.")
 
-    web_src = [{"title": "T", "url": "https://t.com", "snippet": "S"}]
-    mock_llm = MockLLMProvider(
-        web_grounding_tokens=["Answer."],
-        web_grounding_sources=web_src,
-    )
-    set_llm_provider(mock_llm)
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "Gemini News", "url": "https://news.example.com/gemini",
+         "content": "Latest.", "domain": "news.example.com"},
+    ])
+    set_web_search_provider(mock_web)
 
-    res = client.post(
-        f"/api/v1/conversations/{conv_id}/chat",
-        headers=HEADERS_A,
-        json={"content": "Any question"},
-    )
-    body = res.text
-    done_idx = body.find("event: done")
-    data_idx = body.find("data: ", done_idx)
-    data_end = body.find("\n\n", data_idx)
-    done_data = json.loads(body[data_idx + 6:data_end])
-
-    assert "citations" in done_data          # doc citations key present
-    assert "web_sources" in done_data        # web sources key present
-    assert "has_sufficient_evidence" in done_data
-    assert "used_web_fallback" in done_data
-    assert done_data["used_web_fallback"] is True
-    assert isinstance(done_data["web_sources"], list)
-    assert len(done_data["web_sources"]) >= 1
-
-
-# ---------------------------------------------------------------------------
-# Test 12: Regression — document-grounded path unchanged when fallback disabled
-# ---------------------------------------------------------------------------
-
-def test_document_grounded_path_unaffected_when_fallback_disabled(monkeypatch):
-    """WEB_SEARCH_FALLBACK_ENABLED=False must not trigger web fallback."""
-    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", False)
-
-    ws_id, conv_id = _create_workspace_and_conversation()
-    doc_content = "Mitochondria are the powerhouses of the cell."
-    _register_document_and_chunk(ws_id, doc_content)
-
-    mock_llm = MockLLMProvider(
-        default_response="Mitochondria are powerhouses [Source 1].",
-        tokens=["Mitochondria ", "are ", "powerhouses ", "[Source 1]."],
-    )
+    mock_llm = MockLLMProvider(tokens=["Latest ", "Gemini ", "API ", "news."])
     set_llm_provider(mock_llm)
 
     res = client.post(
         f"/api/v1/conversations/{conv_id}/chat/sync",
         headers=HEADERS_A,
-        json={"content": "mitochondria powerhouses cell"},
-    )
-    assert res.status_code == 200
-    data = res.json()
-
-    assert data["has_sufficient_evidence"] is True
-    assert mock_llm.call_count == 1
-    assert mock_llm.web_grounding_call_count == 0
-
-
-# ---------------------------------------------------------------------------
-# Test 13: Regression — empty workspace with fallback DISABLED returns graceful message
-# ---------------------------------------------------------------------------
-
-def test_empty_workspace_with_fallback_disabled_returns_deterministic_fallback(monkeypatch):
-    """When web fallback is disabled and docs are absent, the deterministic message is returned."""
-    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", False)
-
-    mock_llm = MockLLMProvider()
-    set_llm_provider(mock_llm)
-
-    ws_id, conv_id = _create_workspace_and_conversation()
-
-    res = client.post(
-        f"/api/v1/conversations/{conv_id}/chat/sync",
-        headers=HEADERS_A,
-        json={"content": "What is quantum entanglement?"},
+        json={"content": "What is the latest Gemini API news?"},
     )
     assert res.status_code == 200
     data = res.json()
 
     assert data["has_sufficient_evidence"] is False
-    assert "couldn't find enough information" in data["content"]
-    assert mock_llm.call_count == 0           # LLM not called at all
-    assert mock_llm.web_grounding_call_count == 0  # no web fallback
+    assert mock_web.call_count == 1     # Tavily WAS called (web fallback)
+    assert mock_llm.call_count == 1     # generate_stream called (Tavily-grounded)
+
+
+def test_tier1_pass_tier2_pass_uses_document_path(monkeypatch):
+    """Chunks passing both tiers (≥0.55) must use the doc path — Tavily NOT called."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(settings, "MIN_ANSWERABLE_RERANK_SCORE", 0.55)
+    monkeypatch.setattr(settings, "RETRIEVAL_ROUTING_MODE", "always_quality")
+    set_reranker_provider(FixedScoreRerankerProvider(score=0.80))
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+    _register_document_and_chunk(ws_id, "Photosynthesis occurs in chloroplasts using chlorophyll and sunlight.")
+
+    mock_web = MockWebSearchProvider()
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(
+        default_response="Photosynthesis [Source 1].",
+        tokens=["Photosynthesis ", "[Source 1]."],
+    )
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "Explain photosynthesis and chloroplasts."},
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["has_sufficient_evidence"] is True
+    assert mock_llm.call_count == 1      # doc-grounded LLM called
+    assert mock_web.call_count == 0      # Tavily NOT called
+
+
+def test_weak_evidence_at_boundary_triggers_tavily(monkeypatch):
+    """Score exactly at Tier 1 (0.35) but below Tier 2 (0.55) → Tavily fallback."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(settings, "MIN_ANSWERABLE_RERANK_SCORE", 0.55)
+    monkeypatch.setattr(settings, "RETRIEVAL_ROUTING_MODE", "always_quality")
+    set_reranker_provider(FixedScoreRerankerProvider(score=0.35))
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+    _register_document_and_chunk(ws_id, "Some tangentially related course content.")
+
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "Web Source", "url": "https://web.example.com",
+         "content": "Info.", "domain": "web.example.com"},
+    ])
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(tokens=["Web ", "answer."])
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "Explain the latest research on quantum computing."},
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["has_sufficient_evidence"] is False
+    assert mock_web.call_count == 1     # Tavily called
+
+
+def test_min_answerable_threshold_is_the_routing_control(monkeypatch):
+    """Lowering MIN_ANSWERABLE_RERANK_SCORE to 0.40 makes a 0.45-scoring chunk sufficient."""
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(settings, "MIN_ANSWERABLE_RERANK_SCORE", 0.40)
+    monkeypatch.setattr(settings, "RETRIEVAL_ROUTING_MODE", "always_quality")
+    set_reranker_provider(FixedScoreRerankerProvider(score=0.45))
+
+    ws_id, conv_id = _create_workspace_and_conversation()
+    _register_document_and_chunk(ws_id, "Lecture notes on algorithms and complexity.")
+
+    mock_web = MockWebSearchProvider()
+    set_web_search_provider(mock_web)
+
+    mock_llm = MockLLMProvider(
+        default_response="Algorithm answer [Source 1].",
+        tokens=["Algorithm ", "answer ", "[Source 1]."],
+    )
+    set_llm_provider(mock_llm)
+
+    res = client.post(
+        f"/api/v1/conversations/{conv_id}/chat/sync",
+        headers=HEADERS_A,
+        json={"content": "Explain algorithmic complexity."},
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    # With threshold at 0.40, score 0.45 passes → doc path used
+    assert data["has_sufficient_evidence"] is True
+    assert mock_llm.call_count == 1
+    assert mock_web.call_count == 0   # Tavily NOT called
