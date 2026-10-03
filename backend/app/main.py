@@ -10,10 +10,13 @@ from app.api.v1 import api_v1_router
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan context manager for startup and shutdown events."""
-    # Startup: Pre-warm embedding model if configured
+    # Startup: Pre-warm embedding and reranker models if configured
     if settings.PREWARM_MODELS:
-        from app.ml.loader import warmup_embedding_model
-        warmup_embedding_model()
+        from fastapi.concurrency import run_in_threadpool
+        from app.ml.loader import warmup_embedding_model, warmup_reranker_model
+
+        await run_in_threadpool(warmup_embedding_model)
+        await run_in_threadpool(warmup_reranker_model)
     yield
     # Shutdown: Clean up connections / resources
 

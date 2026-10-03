@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional, List
-from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, func, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from typing import TYPE_CHECKING, Optional, List, Any
+from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, func, UniqueConstraint, Computed
+from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from app.models.workspace import Base
@@ -45,6 +45,13 @@ class DocumentChunk(Base):
     embedding_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     embedded_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # Phase 7: Multilingual full-text search tsvector (Vietnamese + English via simple + english)
+    tsv: Mapped[Optional[Any]] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('simple', coalesce(content, '')) || to_tsvector('english', coalesce(content, ''))"),
+        nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(

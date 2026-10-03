@@ -325,6 +325,7 @@ def test_tesseract_provider_available_and_uses_configured_languages(monkeypatch)
 def test_tesseract_provider_unavailable_has_diagnostic(monkeypatch):
     monkeypatch.setitem(sys.modules, "pytesseract", SimpleNamespace())
     monkeypatch.setattr("app.services.ingestion.ocr.tesseract.shutil.which", lambda _: None)
+    monkeypatch.setattr("app.services.ingestion.ocr.tesseract.settings.TESSERACT_CMD", "")
     provider = TesseractOCRProvider()
     assert not provider.is_available()
     with pytest.raises(OCRUnavailableError, match="Tesseract executable is unavailable"):

@@ -40,17 +40,51 @@ export interface ConversationUpdate {
   title: string;
 }
 
+export interface Citation {
+  document_id: string;
+  document_name: string;
+  chunk_id: string;
+  page_start: number;
+  page_end: number;
+  snippet?: string;
+}
+
+export interface WebCitation {
+  source_type: "web";
+  title: string;
+  url: string;
+  domain: string;
+  snippet?: string;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  citations?: Citation[];
+  web_sources?: WebCitation[];
   created_at: string;
+}
+
+export interface ChatStreamCallbacks {
+  onStatus?: (status: string, message?: string) => void;
+  onToken?: (token: string) => void;
+  onDone?: (payload: {
+    message_id: string;
+    content: string;
+    citations: Citation[];
+    web_sources?: WebCitation[];
+    has_sufficient_evidence: boolean;
+    used_web_fallback?: boolean;
+  }) => void;
+  onError?: (error: string) => void;
 }
 
 export interface MessageCreate {
   role: "user" | "assistant" | "system";
   content: string;
+  citations?: Citation[];
 }
 
 export interface DocumentItem {
@@ -117,6 +151,52 @@ export interface DocumentEmbeddingStatusResponse {
 export interface DocumentDownloadResponse {
   download_url: string;
   expires_in: number;
+}
+
+export interface RetrievalSearchRequest {
+  query: string;
+  dense_top_k?: number;
+  lexical_top_k?: number;
+  rrf_k?: number;
+  candidate_pool_size?: number;
+  rerank_top_k?: number;
+  relevance_threshold?: number;
+}
+
+export interface RetrievedChunkItem {
+  chunk_id: string;
+  document_id: string;
+  content: string;
+  page_number_start: number;
+  page_number_end: number;
+  chunk_index: number;
+  dense_score?: number | null;
+  lexical_score?: number | null;
+  rrf_score?: number | null;
+  rerank_score?: number | null;
+  final_rank: number;
+  passed_relevance_gate: boolean;
+  retrieval_sources: string[];
+}
+
+export interface RetrievalTimingMetrics {
+  query_embedding_ms: number;
+  dense_retrieval_ms: number;
+  lexical_retrieval_ms: number;
+  rrf_ms: number;
+  rerank_ms: number;
+  total_retrieval_ms: number;
+}
+
+export interface RetrievalSearchResponse {
+  workspace_id: string;
+  query: string;
+  results: RetrievedChunkItem[];
+  total_results: number;
+  has_sufficient_evidence: boolean;
+  relevance_threshold: number;
+  timings: RetrievalTimingMetrics;
+  diagnostics?: Record<string, unknown> | null;
 }
 
 export class ApiError extends Error {
@@ -519,4 +599,132 @@ export const apiClient = {
       token
     );
   },
+
+  // ==========================================
+  // Retrieval Endpoints (Phase 7)
+  // ==========================================
+
+  /**
+   * Performs hybrid retrieval + Cross-Encoder reranking search on workspace chunks (Phase 7).
+   */
+  async searchRetrieval(
+    workspaceId: string,
+    payload: RetrievalSearchRequest,
+    token?: string | null
+  ): Promise<RetrievalSearchResponse> {
+    return request<RetrievalSearchResponse>(
+      `/api/v1/workspaces/${workspaceId}/retrieval/search`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  // ==========================================
+  // Phase 8 Grounded Chat Streaming Endpoint
+  // ==========================================
+
+  /**
+   * Streams grounded AI tutor answer tokens over Server-Sent Events (SSE).
+   */
+  async streamChat(
+    conversationId: string,
+    payload: {
+      content: string;
+      chat_mode?: string;
+      workspace_id?: string;
+    },
+    token: string | null | undefined,
+    callbacks: ChatStreamCallbacks,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const url = `${API_BASE_URL}/api/v1/conversations/${conversationId}/chat`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+    if (!response.ok) {
+      let errorMsg = `Server error (${response.status})`;
+      try {
+        const errJson = await response.json();
+        errorMsg = errJson.detail || errJson.message || errorMsg;
+      } catch {
+        // ignore JSON parse error
+      }
+      callbacks.onError?.(errorMsg);
+      throw new ApiError(errorMsg, response.status);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      callbacks.onError?.("Streaming not supported by browser environment.");
+      return;
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() || "";
+
+        for (const block of blocks) {
+          if (!block.trim()) continue;
+
+          let eventName = "message";
+          let dataStr = "";
+
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event: ")) {
+              eventName = line.slice(7).trim();
+            } else if (line.startsWith("data: ")) {
+              dataStr = line.slice(6).trim();
+            }
+          }
+
+          if (!dataStr) continue;
+
+          try {
+            const data = JSON.parse(dataStr);
+            if (eventName === "status") {
+              callbacks.onStatus?.(data.status, data.message);
+            } else if (eventName === "token") {
+              callbacks.onToken?.(data.token);
+            } else if (eventName === "done") {
+              callbacks.onDone?.(data);
+            } else if (eventName === "error") {
+              callbacks.onError?.(data.error);
+            }
+          } catch {
+            // Ignore non-json data
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (signal?.aborted) {
+        return;
+      }
+      const msg = err instanceof Error ? err.message : "Stream connection terminated unexpectedly";
+      callbacks.onError?.(msg);
+      throw err;
+    }
+  },
 };
+
