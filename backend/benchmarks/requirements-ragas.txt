@@ -1,0 +1,3 @@
+# Optional judge-only profile. Not installed by the normal backend requirements.
+ragas>=0.4.0,<0.5
+openai>=1.0.0

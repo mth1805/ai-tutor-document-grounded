@@ -2,6 +2,7 @@
 import pytest
 from unittest.mock import MagicMock
 from google.genai.errors import APIError
+from google.genai import types
 
 from app.core.config import settings
 from app.llm import (
@@ -94,7 +95,7 @@ def test_gemini_provider_uses_gemini_3_thinking_config(monkeypatch):
 
     assert provider.model_name == "gemini-3.8-flash"
     assert standard_config.max_output_tokens == 2048
-    assert standard_config.thinking_config.thinking_level == "medium"
+    assert standard_config.thinking_config.thinking_level == types.ThinkingLevel.MEDIUM
     assert standard_config.system_instruction == "Be helpful"
     assert "temperature" not in standard_config.model_fields_set
     assert "top_p" not in standard_config.model_fields_set

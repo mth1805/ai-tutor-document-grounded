@@ -1,0 +1,220 @@
+{
+  "metadata": {
+    "dataset_version": "1.0",
+    "query_count": 30,
+    "query_categories": {
+      "factual": 15,
+      "comparison": 5,
+      "multi_hop": 4,
+      "insufficient_document": 2,
+      "web_fallback": 4
+    },
+    "captured_run_count": 0,
+    "generated_at": "2026-10-03T18:24:21.129863+00:00",
+    "labeled_query_count": 0,
+    "routing_labeled_query_count": 0,
+    "python": "3.11.9",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "configuration": {
+      "retrieval": "dense + FTS + RRF + configured routing/reranker",
+      "dense_top_k": 25,
+      "lexical_top_k": 25,
+      "rrf_k": 60,
+      "candidate_pool_size": 30,
+      "rerank_top_k": 5,
+      "retrieval_routing_mode": "adaptive",
+      "reranker_model": "BAAI/bge-reranker-v2-m3",
+      "relevance_threshold": 0.35,
+      "min_answerable_rerank_score": 0.55,
+      "gemini_model": "gemini-3.8-flash"
+    },
+    "capture_file": null
+  },
+  "baselines": {
+    "Dense only": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0
+    },
+    "Lexical only": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0
+    },
+    "Hybrid + RRF": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0
+    },
+    "Hybrid + RRF + Cross-Encoder": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0
+    },
+    "Hybrid + RRF + Cross-Encoder + Evidence Gate": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0,
+      "evidence_gate": {
+        "true_positives": 0,
+        "true_negatives": 0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "sufficient_precision": null,
+        "sufficient_recall": null,
+        "false_sufficient_rate": null,
+        "false_insufficient_rate": null
+      }
+    },
+    "Full system + Web fallback": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0,
+      "web_fallback": {
+        "correct_web_triggers": 0,
+        "false_web_triggers": 0,
+        "correct_no_web_decisions": 0,
+        "routing_accuracy": null,
+        "web_positive_count": 0,
+        "no_web_count": 0
+      }
+    }
+  },
+  "reranker_comparison": {
+    "paired_query_count": 0,
+    "before": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0
+    },
+    "after": {
+      "query_count": 0,
+      "recall@1": null,
+      "recall@5": null,
+      "recall@10": null,
+      "precision@5": null,
+      "mrr@10": null,
+      "labeled_query_count": 0
+    },
+    "per_query": [],
+    "rerank_latency": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    }
+  },
+  "evidence_gate": {
+    "true_positives": 0,
+    "true_negatives": 0,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "sufficient_precision": null,
+    "sufficient_recall": null,
+    "false_sufficient_rate": null,
+    "false_insufficient_rate": null
+  },
+  "web_fallback": {
+    "correct_web_triggers": 0,
+    "false_web_triggers": 0,
+    "correct_no_web_decisions": 0,
+    "routing_accuracy": null,
+    "web_positive_count": 0,
+    "no_web_count": 0
+  },
+  "citations": {
+    "evaluated_queries": 0,
+    "citation_correctness_mean": null,
+    "citation_completeness_mean": null,
+    "results": []
+  },
+  "latency_ms": {
+    "query_embedding_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "dense_retrieval_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "lexical_retrieval_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "rrf_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "rerank_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "total_retrieval_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "web_search_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "ttft_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    },
+    "generation_ms": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p95": null
+    }
+  },
+  "latency_by_configuration_ms": {},
+  "unmapped_query_ids": [],
+  "limitations": [
+    "No captured run records supplied; retrieval, gate, citation, and latency metrics are unavailable."
+  ]
+}
