@@ -232,9 +232,13 @@ def write_outputs(records: list[dict], capture_path: Path, unavailable_reason: s
                   summary_path: Path | None = None) -> None:
     if len({record["eval_id"] for record in records}) != len(records):
         raise ValueError("Capture must contain exactly one final record per eval_id")
-    capture_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path = summary_path or ROOT / "results" / "captured_answer_summary.md"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_results_path = ROOT / "results" / "latest_answer_results.json"
+    latest_report_path = ROOT / "results" / "latest_answer_report.md"
+    output_paths = (capture_path, summary_path, latest_results_path, latest_report_path)
+    for path in output_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
     ordered_records = [_ordered_record(row) for row in records]
     with capture_path.open("w", encoding="utf-8", newline="\n") as output:
         json.dump(ordered_records, output, indent=2, ensure_ascii=False)
@@ -245,8 +249,8 @@ def write_outputs(records: list[dict], capture_path: Path, unavailable_reason: s
         report["metadata"]["capture_status"] = "unavailable"
         report["limitations"].append(unavailable_reason)
         markdown = markdown.replace("## Limitations", f"Generation unavailable: {unavailable_reason}\n\n## Limitations")
-    (ROOT / "results" / "latest_answer_results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    (ROOT / "results" / "latest_answer_report.md").write_text(markdown, encoding="utf-8")
+    latest_results_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    latest_report_path.write_text(markdown, encoding="utf-8")
 
 
 

@@ -198,6 +198,11 @@ def markdown_summary(report: dict) -> str:
     def fmt(value):
         return "n/a" if value is None else (f"{value:.3f}" if isinstance(value, (int, float)) else str(value))
 
+    def fmt_latency(value):
+        # Keep the reported latency value itself; unlike benchmark scores, latency
+        # summaries should not imply precision that is absent from the report.
+        return "n/a" if value is None else str(value)
+
     def fmt_config(value):
         if value is None:
             return "n/a"
@@ -224,8 +229,10 @@ def markdown_summary(report: dict) -> str:
                        ("Lexical retrieval", "lexical_retrieval_ms"),
                        ("RRF", "rrf_ms"), ("Reranking", "rerank_ms"),
                        ("Total retrieval", "total_retrieval_ms")):
-        stats = latency.get(key, {})
-        lines.append("| " + " | ".join([label] + [fmt(stats.get(field))
+        stats = latency.get(key)
+        if not isinstance(stats, dict):
+            stats = {}
+        lines.append("| " + " | ".join([label] + [fmt_latency(stats.get(field))
                      for field in ("mean", "median", "p95")]) + " |")
     return "\n".join(lines) + "\n"
 

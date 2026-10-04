@@ -17,11 +17,32 @@ MODEL_CACHE_VOLUME = modal.Volume.from_name(
     os.getenv("MODAL_MODEL_CACHE_VOLUME", "ai-tutor-model-cache"), create_if_missing=True
 )
 INGESTION_GPU = os.getenv("MODAL_INGESTION_GPU", "").strip() or None
+CPU_REQUIREMENTS = BACKEND / "requirements.lock.txt"
+GPU_REQUIREMENTS = BACKEND / "requirements-gpu.lock.txt"
 
 app = modal.App("ai-tutor-api")
-image = (
+base_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install_from_requirements(str(BACKEND / "requirements.lock.txt"))
+    # Image uploads support scanned PDFs/images and legacy .doc files, so install
+    # their native tools alongside the Python-only PDF/DOCX dependencies.
+    .apt_install(
+        "tesseract-ocr",
+        "tesseract-ocr-eng",
+        "tesseract-ocr-vie",
+        "libreoffice-writer",
+    )
+)
+# Query-time retrieval stays in the API process and uses CPU-only PyTorch.
+image = (
+    base_image
+    .pip_install_from_requirements(str(CPU_REQUIREMENTS))
+    .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
+    .env({"PYTHONPATH": "/root/backend", "HF_HOME": "/models/huggingface"})
+)
+# Keep the CUDA-enabled dependency set exclusive to per-job ingestion workers.
+gpu_image = (
+    base_image
+    .pip_install_from_requirements(str(GPU_REQUIREMENTS))
     .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
     .env({"PYTHONPATH": "/root/backend", "HF_HOME": "/models/huggingface"})
 )
@@ -65,7 +86,7 @@ def poll_ingestion_queue():
 
 
 @app.function(
-    image=image,
+    image=gpu_image,
     secrets=secrets,
     cpu=float(os.getenv("MODAL_INGESTION_CPU", "4")),
     memory=int(os.getenv("MODAL_INGESTION_MEMORY_MB", "12288")),

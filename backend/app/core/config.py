@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     # Phase 8: LLM Provider and Grounded Generation
     LLM_PROVIDER: str = "gemini"  # gemini | mock
     GEMINI_API_KEY: str | None = None
-    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
     GEMINI_THINKING_LEVEL: str = "medium"
     LLM_MAX_OUTPUT_TOKENS: int = 2048
     LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0

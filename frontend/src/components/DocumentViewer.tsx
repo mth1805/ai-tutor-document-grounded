@@ -100,9 +100,11 @@ export function DocumentViewer({
       const category = getFileCategory(document);
 
       try {
-        const apiUrl =
-          process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ||
-          "http://localhost:8000";
+        const apiUrl = (
+          process.env.NEXT_PUBLIC_API_BASE_URL ||
+          process.env.NEXT_PUBLIC_API_URL ||
+          ""
+        ).replace(/\/$/, "");
 
         // Fetch document bytes with verified Bearer token
         const res = await fetch(

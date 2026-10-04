@@ -125,7 +125,7 @@ For local development, install the system executables and OCR language data befo
    ```
 3. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements-dev.txt
    ```
 4. Start the FastAPI development server:
    ```bash
