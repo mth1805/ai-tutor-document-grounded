@@ -36,13 +36,16 @@ def _apply_rls_context(session: Session, transaction, connection) -> None:
     )
 
 
-if settings.DATABASE_URL:
+if settings.resolved_database_url:
     try:
         engine = create_async_engine(
-            settings.DATABASE_URL,
+            settings.resolved_database_url,
             echo=settings.ENVIRONMENT == "development",
             future=True,
             pool_pre_ping=True,
+            pool_size=settings.DB_POOL_SIZE,
+            max_overflow=settings.DB_MAX_OVERFLOW,
+            pool_timeout=settings.DB_POOL_TIMEOUT_SECONDS,
         )
         AsyncSessionLocal = async_sessionmaker(
             bind=engine,

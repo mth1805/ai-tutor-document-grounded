@@ -9,6 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.models.document import Document
 from app.models.chunk import DocumentChunk
+from app.models.ingestion_job import DocumentIngestionJob
 from app.services.document_service import DocumentService
 from app.services.ingestion.pipeline import IngestionPipeline
 from app.services.ingestion.models import ProcessedChunk
@@ -22,6 +23,44 @@ _IN_MEMORY_CHUNKS: dict[uuid.UUID, List[DocumentChunk]] = {}
 
 class IngestionService:
     """Coordinates parsing, OCR, cleaning, chunking, and database persistence."""
+
+    @classmethod
+    async def enqueue_document(
+        cls,
+        db: AsyncSession,
+        document: Document,
+        user_id: uuid.UUID,
+    ) -> bool:
+        """Persist/re-arm one owner-scoped job; a unique document key prevents duplicates."""
+        result = await db.execute(
+            select(DocumentIngestionJob)
+            .where(
+                DocumentIngestionJob.document_id == document.id,
+                DocumentIngestionJob.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        existing = result.scalar_one_or_none()
+        if existing and existing.status in {"queued", "processing"}:
+            return False
+        if existing:
+            await db.delete(existing)
+            # Release the per-document unique key within this transaction before
+            # inserting the replacement terminal-job retry row.
+            await db.flush()
+
+        document.status = "queued"
+        document.processing_error = None
+        document.processed_at = None
+        db.add(DocumentIngestionJob(
+            document_id=document.id,
+            workspace_id=document.workspace_id,
+            user_id=user_id,
+            status="queued",
+            attempt_count=0,
+            max_attempts=3,
+        ))
+        return True
 
     @classmethod
     async def process_document(
@@ -143,7 +182,8 @@ class IngestionService:
             if settings.AUTO_EMBED_AFTER_INGESTION:
                 from app.services.embedding_service import EmbeddingService
                 logger.info("Auto-triggering Phase 6 embedding for processed document %s", doc.id)
-                await EmbeddingService.embed_document(db, doc.id, user_id)
+                if not await EmbeddingService.embed_document(db, doc.id, user_id):
+                    raise RuntimeError("Embedding stage failed")
 
             return True
 
@@ -177,24 +217,22 @@ class IngestionService:
         document_id: uuid.UUID,
         user_id: uuid.UUID,
         pipeline: Optional[IngestionPipeline] = None,
-    ) -> None:
+    ) -> bool:
         """Asynchronous background worker execution for document ingestion."""
         if AsyncSessionLocal is None:
-            await cls.process_document(None, document_id, user_id, pipeline=pipeline)
-            return
+            return await cls.process_document(None, document_id, user_id, pipeline=pipeline)
 
         try:
             from app.db.session import get_db
             from app.main import app
             if get_db in app.dependency_overrides:
-                await cls.process_document(None, document_id, user_id, pipeline=pipeline)
-                return
+                return await cls.process_document(None, document_id, user_id, pipeline=pipeline)
         except Exception:
             pass
 
         async with AsyncSessionLocal() as session:
             session.info["rls_user_id"] = user_id
-            await cls.process_document(session, document_id, user_id, pipeline=pipeline)
+            return await cls.process_document(session, document_id, user_id, pipeline=pipeline)
 
     @classmethod
     async def list_document_chunks(

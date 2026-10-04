@@ -1,11 +1,11 @@
 import json
 import uuid
+import os
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from app.core.config import settings
 from app.db.session import _apply_rls_context
 
 
@@ -55,7 +55,10 @@ def test_transaction_hook_without_identity_still_fails_closed_under_rls():
 @pytest.mark.asyncio
 async def test_postgres_rls_hides_other_users_rows_without_app_filter():
     """End-to-end regression; run against a dedicated Supabase/Postgres test DB."""
-    database_url = settings.RLS_TEST_DATABASE_URL
+    # Do not inherit a database URL from the repository's .env. This test creates
+    # and drops a table, so it must be opted into through the process environment
+    # with a dedicated disposable database only.
+    database_url = os.environ.get("RLS_TEST_DATABASE_URL", "").strip()
     if not database_url:
         pytest.skip("Set RLS_TEST_DATABASE_URL to run the database RLS integration test")
 

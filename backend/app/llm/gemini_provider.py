@@ -1,5 +1,6 @@
 """Google Gemini provider implementation using google-genai SDK."""
 import logging
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -205,11 +206,12 @@ class GeminiProvider(BaseLLMProvider):
         """Synchronously or asynchronously produces non-streamed text completion."""
         config = self._build_config(system_instruction=system_instruction, **kwargs)
         try:
-            response = await self._client.aio.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
+            async with asyncio.timeout(settings.LLM_STREAMING_TIMEOUT_SECONDS):
+                response = await self._client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
             return response.text or ""
         except Exception as e:
             self._log_failure("non-streaming generation", e)
@@ -224,15 +226,16 @@ class GeminiProvider(BaseLLMProvider):
         """Asynchronously streams chunks of text tokens directly from Gemini API."""
         config = self._build_config(system_instruction=system_instruction, **kwargs)
         try:
-            stream = await self._client.aio.models.generate_content_stream(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
-            async for chunk in stream:
-                text_chunk = chunk.text
-                if text_chunk:
-                    yield text_chunk
+            async with asyncio.timeout(settings.LLM_STREAMING_TIMEOUT_SECONDS):
+                stream = await self._client.aio.models.generate_content_stream(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                async for chunk in stream:
+                    text_chunk = chunk.text
+                    if text_chunk:
+                        yield text_chunk
         except Exception as e:
             self._log_failure("streaming generation", e)
             raise self._map_error(e) from e
@@ -255,11 +258,12 @@ class GeminiProvider(BaseLLMProvider):
             update={"tools": [types.Tool(google_search=types.GoogleSearch())]}
         )
         try:
-            response = await self._client.aio.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
+            async with asyncio.timeout(settings.LLM_STREAMING_TIMEOUT_SECONDS):
+                response = await self._client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
             full_text = response.text or ""
             web_sources = self._extract_grounding_sources(response)
             return full_text, web_sources
@@ -286,17 +290,18 @@ class GeminiProvider(BaseLLMProvider):
             update={"tools": [types.Tool(google_search=types.GoogleSearch())]}
         )
         try:
-            stream = await self._client.aio.models.generate_content_stream(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
-            last_chunk = None
-            async for chunk in stream:
-                last_chunk = chunk
-                text_chunk = chunk.text
-                if text_chunk:
-                    yield text_chunk, []
+            async with asyncio.timeout(settings.LLM_STREAMING_TIMEOUT_SECONDS):
+                stream = await self._client.aio.models.generate_content_stream(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                last_chunk = None
+                async for chunk in stream:
+                    last_chunk = chunk
+                    text_chunk = chunk.text
+                    if text_chunk:
+                        yield text_chunk, []
             # After streaming completes, extract grounding from the final chunk
             if last_chunk is not None:
                 web_sources = self._extract_grounding_sources(last_chunk)

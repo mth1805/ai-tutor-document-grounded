@@ -3,6 +3,7 @@ from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
+from pydantic import model_validator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -17,6 +18,9 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     # Fail closed when deploy-time environment configuration is omitted.
     ENVIRONMENT: str = "production"
+    LOG_LEVEL: str = "INFO"
+    REQUEST_TIMEOUT_SECONDS: float = 120.0
+    MAX_REQUEST_BODY_BYTES: int = 27_000_000
 
     # CORS configuration
     BACKEND_CORS_ORIGINS: List[str] = [
@@ -38,11 +42,15 @@ class Settings(BaseSettings):
     # Supabase credentials (server-side)
     SUPABASE_URL: str | None = None
     SUPABASE_ANON_KEY: str | None = None
+    SUPABASE_DB_URL: str | None = None
     SUPABASE_SERVICE_ROLE_KEY: str | None = None
     SUPABASE_JWT_SECRET: str | None = None
 
     # PostgreSQL Database URL (Supabase PostgreSQL / asyncpg)
     DATABASE_URL: str | None = None
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 5
+    DB_POOL_TIMEOUT_SECONDS: float = 30.0
     # Optional integration-test database; server-side secret, never client exposed.
     RLS_TEST_DATABASE_URL: str | None = None
 
@@ -110,6 +118,35 @@ class Settings(BaseSettings):
     TAVILY_MAX_RESULTS: int = 5
     # Timeout in seconds for a single Tavily HTTP request
     WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
+
+    @model_validator(mode="after")
+    def validate_production_configuration(self):
+        """Fail early for missing production settings while keeping local startup flexible."""
+        if self.ENVIRONMENT.lower() in {"production", "prod"}:
+            missing = []
+            if not self.SUPABASE_URL:
+                missing.append("SUPABASE_URL")
+            if not self.SUPABASE_ANON_KEY:
+                missing.append("SUPABASE_ANON_KEY")
+            if not (self.SUPABASE_DB_URL or self.DATABASE_URL):
+                missing.append("SUPABASE_DB_URL (or DATABASE_URL)")
+            if self.LLM_PROVIDER == "gemini" and not self.GEMINI_API_KEY:
+                missing.append("GEMINI_API_KEY")
+            if self.WEB_SEARCH_FALLBACK_ENABLED and not self.TAVILY_API_KEY:
+                missing.append("TAVILY_API_KEY")
+            if not self.BACKEND_CORS_ORIGINS:
+                missing.append("BACKEND_CORS_ORIGINS")
+            if missing:
+                raise ValueError("Missing required production configuration: " + ", ".join(missing))
+            if any(origin.strip() == "*" for origin in self.BACKEND_CORS_ORIGINS):
+                raise ValueError("Wildcard CORS origins are not allowed in production")
+            if any("localhost" in origin or "127.0.0.1" in origin for origin in self.BACKEND_CORS_ORIGINS):
+                raise ValueError("Production CORS must use explicit deployed frontend origins")
+        return self
+
+    @property
+    def resolved_database_url(self) -> str | None:
+        return self.SUPABASE_DB_URL or self.DATABASE_URL
 
 
 
