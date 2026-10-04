@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "dataset_size": 24,
+    "captured_run_count": 24,
+    "gemini_model": "gemini-3.5-flash-lite",
+    "configured_gemini_model": null,
+    "ragas_version": "0.4.3",
+    "web_search_enabled": false
+  },
+  "citation_metrics": {
+    "citation_correctness_mean": 0.7803030303030302,
+    "citation_completeness_mean": 0.9347826086956522
+  },
+  "latency_ms": {
+    "ttft_ms": {
+      "count": 23,
+      "mean": 2909.608695652174
+    },
+    "generation_latency_ms": {
+      "count": 23,
+      "mean": 3646.7391304347825
+    },
+    "failure_latency_ms": {
+      "count": 0,
+      "mean": null
+    },
+    "total_answer_latency_ms": {
+      "count": 24,
+      "mean": 13989.82595833333
+    }
+  },
+  "ragas_metrics": {
+    "faithfulness": 0.6454974976714106,
+    "answer_relevance": 0.9083893702333418,
+    "context_precision": 0.8188405796387077,
+    "context_recall": 0.9782608695652174
+  },
+  "limitations": []
+}

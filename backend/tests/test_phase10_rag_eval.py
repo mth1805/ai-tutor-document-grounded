@@ -11,8 +11,9 @@ from app.web_search.mock_provider import MockWebSearchProvider
 from benchmarks.citation_eval import evaluate_citations
 from benchmarks.evidence_gate_eval import confusion_matrix, web_routing_metrics
 from benchmarks.metrics import aggregate_retrieval, compare_reranking, latency_summary, retrieval_metrics
-from benchmarks.run_rag_eval import build_report, markdown_report, read_jsonl
-from benchmarks.capture_rag_eval import FIXTURE_ALIAS_TO_INDEX, capture_dataset, load_dataset
+from benchmarks.run_rag_eval import build_report, markdown_report, markdown_summary, read_capture_json, read_jsonl
+from benchmarks.capture_rag_eval import (FIXTURE_ALIAS_TO_INDEX, capture_dataset, load_dataset,
+                                         write_capture)
 from benchmarks.run_ragas_eval import prepare_samples
 from app.services.ingestion_service import _IN_MEMORY_CHUNKS
 from app.services.retrieval_service import RetrievalService
@@ -52,9 +53,11 @@ async def test_capture_executes_dataset_and_serializes_results(tmp_path):
     assert all("total_retrieval_ms" in record["timings"] for record in records)
     assert web.call_count == sum(record["used_web_fallback"] for record in records)
 
-    output = tmp_path / "captured.jsonl"
-    output.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-    loaded = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    output = tmp_path / "captured.json"
+    write_capture(records, output)
+    loaded = json.loads(output.read_text(encoding="utf-8"))
+    assert len(loaded) == len(records)
+    assert len({record["eval_id"] for record in loaded}) == len(loaded)
     assert loaded[0]["eval_id"] == "eval-001"
     assert loaded[0]["retrieved_results"][0]["alias"].startswith("fixture:")
 
@@ -178,6 +181,54 @@ def test_latency_aggregation_and_report_serialization():
     markdown = markdown_report(report)
     assert "Dense only" in markdown
     assert "Recall@5" in markdown
+
+
+def test_capture_outputs_write_single_json_array_without_obsolete_copies(tmp_path):
+    records = [
+        {"eval_id": "eval-001", "query_id": "eval-001", "question": "\u00bfQu\u00e9 es AI?",
+         "query_type": "factual", "rankings": {"dense_only": ["fixture:ai"]},
+         "retrieved_results": [{"alias": "fixture:ai", "rerank_score": 0.91}],
+         "retrieval_configuration": {"dense_top_k": 10},
+         "timings": {"total_retrieval_ms": 12.5}, "extension": {"unchanged": True}},
+        {"eval_id": "eval-002", "query_id": "eval-002", "question": "Second query",
+         "query_type": "comparison", "rankings": {"dense_only": []},
+         "retrieved_results": [], "retrieval_configuration": {"dense_top_k": 10},
+         "timings": {"total_retrieval_ms": 0.0}},
+    ]
+    output = tmp_path / "captured_runs.json"
+    write_capture(records, output)
+
+    loaded = json.loads(output.read_text(encoding="utf-8"))
+    assert isinstance(loaded, list)
+    assert len(loaded) == 2
+    assert len({row["eval_id"] for row in loaded}) == 2
+    assert loaded == records
+    assert list(loaded[0])[:4] == ["eval_id", "query_id", "question", "query_type"]
+    assert read_capture_json(output) == records
+    assert not list(tmp_path.glob("*.jsonl"))
+    assert not list(tmp_path.glob("*_pretty.json"))
+
+
+
+def test_retrieval_markdown_summary_uses_actual_report_values():
+    report = {"metadata": {"dataset_version": "1.0", "query_count": 30,
+                           "labeled_query_count": 24, "generated_at": "2026-10-04T00:00:00Z",
+                           "configuration": {"dense_top_k": 20, "lexical_top_k": 15,
+                                              "rrf_k": 60, "candidate_pool_size": 25,
+                                              "rerank_top_k": 5, "routing_mode": "adaptive",
+                                              "reranker_model": "local-cross-encoder",
+                                              "relevance_threshold": 0.35,
+                                              "min_answerable_rerank_score": 0.55}},
+              "baselines": {"Dense only": {"recall@1": 0.5, "recall@5": 0.75,
+                                            "recall@10": 1.0, "precision@5": 0.2, "mrr@10": 0.6}},
+              "latency_ms": {"query_embedding_ms": {"mean": 1, "median": 0.9, "p95": 2},
+                             "total_retrieval_ms": {"mean": 10, "median": 9, "p95": 20}}}
+    summary = markdown_summary(report)
+    assert "Queries: 30" in summary
+    assert "Labeled queries: 24" in summary
+    assert "Dense Top-K: 20" in summary
+    assert "| Dense only | 0.500 | 0.750 | 1.000 | 0.200 | 0.600 |" in summary
+    assert "| Query embedding | 1 | 0.9 | 2 |" in summary
 
 
 def test_ragas_input_adapter_is_deterministic_and_validates_contract():

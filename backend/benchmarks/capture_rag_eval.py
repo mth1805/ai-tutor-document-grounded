@@ -21,6 +21,7 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from benchmarks.benchmark_retrieval import BENCHMARK_CHUNKS
+from benchmarks.fixture_mapping import FIXTURE_ALIAS_TO_INDEX, INDEX_TO_FIXTURE_ALIAS, fixture_alias
 from app.core.config import settings
 from app.ml.bge_provider import BGEEmbeddingProvider
 from app.ml.reranker_provider import CrossEncoderRerankerProvider
@@ -31,27 +32,14 @@ from app.services.retrieval_service import RetrievalService
 from app.web_search.mock_provider import MockWebSearchProvider
 
 ROOT = Path(__file__).resolve().parent
-
-# Dataset aliases are tied explicitly to chunk_index in benchmark_retrieval.py.
-# All other fixture chunks have stable positional aliases for captured rankings.
-FIXTURE_ALIAS_TO_INDEX = {
-    "fixture:artificial_intelligence": 0,
-    "fixture:machine_learning": 1,
-    "fixture:deep_learning": 2,
-    "fixture:transformer": 3,
-    "fixture:photosynthesis": 4,
-    "fixture:chlorophyll": 5,
-    "fixture:cellular_respiration": 6,
-    "fixture:newton_laws": 7,
-    "fixture:relational_database": 8,
-    "fixture:hnsw": 9,
-}
-INDEX_TO_FIXTURE_ALIAS = {index: alias for alias, index in FIXTURE_ALIAS_TO_INDEX.items()}
-
-
-def fixture_alias(chunk_index: int) -> str:
-    return INDEX_TO_FIXTURE_ALIAS.get(chunk_index, f"fixture:chunk_{chunk_index}")
-
+PRETTY_FIELD_ORDER = (
+    "eval_id", "query_id", "question", "query_type", "gold_label_status",
+    "gold_evidence_ids", "gold_alias_to_fixture_index", "unmapped_gold_aliases",
+    "rankings", "retrieved_results", "has_sufficient_evidence", "evidence_sufficient",
+    "top_rerank_score", "gold_should_use_web", "should_use_web", "used_web_fallback",
+    "web_search_mocked", "mock_web_search_called", "timings", "configuration_timings_ms",
+    "retrieval_configuration", "timings_are_measurements", "benchmark_note",
+)
 
 def load_dataset() -> list[dict]:
     with (ROOT / "eval_dataset.jsonl").open(encoding="utf-8") as source:
@@ -285,15 +273,27 @@ async def _capture_with_models(dataset: list[dict]) -> list[dict]:
     return await capture_dataset(dataset, embedding_provider, reranker_provider, MockWebSearchProvider())
 
 
+def write_capture(records: list[dict], output_path: Path) -> None:
+    """Write captured retrieval records as one readable JSON array."""
+    if len({record["eval_id"] for record in records}) != len(records):
+        raise ValueError("Capture must contain exactly one final record per eval_id")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered_records = []
+    for record in records:
+        ordered = {key: record[key] for key in PRETTY_FIELD_ORDER if key in record}
+        ordered.update((key, value) for key, value in record.items() if key not in ordered)
+        ordered_records.append(ordered)
+    with output_path.open("w", encoding="utf-8", newline="\n") as output:
+        json.dump(ordered_records, output, indent=2, ensure_ascii=False)
+        output.write("\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=ROOT / "results" / "captured_runs.jsonl")
+    parser.add_argument("--output", type=Path, default=ROOT / "results" / "captured_runs.json")
     args = parser.parse_args()
     records = asyncio.run(_capture_with_models(load_dataset()))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8", newline="\n") as output:
-        for record in records:
-            output.write(json.dumps(record, ensure_ascii=False) + "\n")
+    write_capture(records, args.output)
     print(f"Captured {len(records)} runs from {len(load_dataset())} queries: {args.output}")
 
 

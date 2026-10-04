@@ -31,11 +31,25 @@ TIMING_KEYS = ("query_embedding_ms", "dense_retrieval_ms", "lexical_retrieval_ms
 
 
 def read_jsonl(path: Path) -> list[dict]:
+    """Read line-oriented source datasets; captured benchmark results are JSON arrays."""
     with path.open(encoding="utf-8") as stream:
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def build_report(dataset: list[dict], records: dict[str, dict], config: dict) -> dict:
+def read_capture_json(path: Path) -> list[dict]:
+    """Read a captured run JSON array and require unique query IDs."""
+    records = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+        raise ValueError("Captured retrieval results must be a JSON array of objects")
+    eval_ids = [record.get("eval_id") for record in records]
+    if any(eval_id is None for eval_id in eval_ids) or len(set(eval_ids)) != len(eval_ids):
+        raise ValueError("Captured retrieval results must contain one record per unique eval_id")
+    return records
+
+
+def build_report(dataset: list[dict], records: dict[str, dict], config: dict,
+                 previous_configuration: dict | None = None,
+                 previous_reconciliation: dict | None = None) -> dict:
     baselines = {}
     for display, key in CONFIGS.items():
         scored = []
@@ -88,6 +102,24 @@ def build_report(dataset: list[dict], records: dict[str, dict], config: dict) ->
     for run in records.values():
         for key, value in run.get("configuration_timings_ms", {}).items():
             configuration_latencies.setdefault(key, []).append(float(value))
+    actual_configurations = []
+    for run in records.values():
+        actual = run.get("retrieval_configuration")
+        if actual is not None and actual not in actual_configurations:
+            actual_configurations.append(actual)
+    actual_configurations.sort(key=lambda value: json.dumps(value, sort_keys=True))
+    metadata_config = (actual_configurations[0] if len(actual_configurations) == 1
+                       else actual_configurations if actual_configurations else config)
+    reconciliation = None
+    if previous_reconciliation is not None:
+        reconciliation = previous_reconciliation
+    elif (previous_configuration is not None and actual_configurations
+          and previous_configuration != metadata_config):
+        reconciliation = {
+            "previous_reported_configuration": previous_configuration,
+            "configuration_observed_in_captured_runs": metadata_config,
+            "source": "captured_runs.json retrieval_configuration fields",
+        }
     return {
         "metadata": {"dataset_version": "1.0", "query_count": len(dataset),
                      "query_categories": dict(Counter(row.get("query_type", "unknown") for row in dataset)),
@@ -95,7 +127,10 @@ def build_report(dataset: list[dict], records: dict[str, dict], config: dict) ->
                      "labeled_query_count": sum(run.get("gold_label_status") == "mapped" for run in records.values()),
                      "routing_labeled_query_count": sum("should_use_web" in run for run in records.values()),
                      "python": sys.version.split()[0], "platform": platform.platform(),
-                     "configuration": config},
+                     "configuration": metadata_config,
+                     "configuration_source": ("captured_runs.json" if actual_configurations
+                                               else "current_settings_no_capture_config"),
+                     "configuration_reconciliation": reconciliation},
         "baselines": baselines,
         "reranker_comparison": {"paired_query_count": len(paired), "before": before_metrics,
                                 "after": after_metrics, "per_query": paired,
@@ -120,7 +155,13 @@ def markdown_report(report: dict) -> str:
     lines = ["# RAG Evaluation Report", "", f"Dataset version: {report['metadata']['dataset_version']}  ",
              f"Queries: {report['metadata']['query_count']}  ",
              f"Captured runs: {report['metadata']['captured_run_count']}  ",
-             f"Labeled queries: {report['metadata']['labeled_query_count']}", "",
+             f"Labeled queries: {report['metadata']['labeled_query_count']}  ",
+             f"Executed retrieval configuration: `{json.dumps(report['metadata']['configuration'], sort_keys=True)}`", ""]
+    reconciliation = report["metadata"].get("configuration_reconciliation")
+    if reconciliation:
+        lines += ["Configuration metadata reconciliation: the prior report configuration differed from the captured runs. "
+                  "Metrics below remain calculated from the historical capture records; configuration is now sourced from those records.", ""]
+    lines += [
              "## Retrieval baselines", "", "| Configuration | Labeled queries | Recall@1 | Recall@5 | Recall@10 | Precision@5 | MRR@10 |",
              "|---|---:|---:|---:|---:|---:|---:|"]
     for name, values in report["baselines"].items():
@@ -142,15 +183,75 @@ def markdown_report(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def markdown_summary(report: dict) -> str:
+    """Build a compact human-readable summary only from evaluated report data."""
+    metadata = report.get("metadata", {})
+    config = metadata.get("configuration") or {}
+    config_fields = (
+        ("Dense Top-K", "dense_top_k"), ("Lexical Top-K", "lexical_top_k"),
+        ("RRF K", "rrf_k"), ("Candidate Pool", "candidate_pool_size"),
+        ("Rerank Top-K", "rerank_top_k"), ("Routing Mode", "routing_mode"),
+        ("Reranker", "reranker_model"), ("Relevance Threshold", "relevance_threshold"),
+        ("Minimum Answerable Rerank Score", "min_answerable_rerank_score"),
+    )
+
+    def fmt(value):
+        return "n/a" if value is None else (f"{value:.3f}" if isinstance(value, (int, float)) else str(value))
+
+    def fmt_config(value):
+        if value is None:
+            return "n/a"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    lines = ["# Phase 10 Retrieval Benchmark Summary", "",
+             f"Dataset: eval_dataset.jsonl (version {metadata.get('dataset_version', 'n/a')})",
+             f"Queries: {metadata.get('query_count', 'n/a')}",
+             f"Labeled queries: {metadata.get('labeled_query_count', 'n/a')}",
+             f"Generated at: {metadata.get('generated_at', 'n/a')}", "", "## Configuration", ""]
+    lines.extend(f"{label}: {fmt_config(config.get(key))}" for label, key in config_fields)
+    lines.extend(["", "## Retrieval Metrics", "",
+                  "| Method | Recall@1 | Recall@5 | Recall@10 | Precision@5 | MRR@10 |",
+                  "|---|---:|---:|---:|---:|---:|"])
+    for name, values in report.get("baselines", {}).items():
+        lines.append("| " + " | ".join([name] + [fmt(values.get(key)) for key in
+                      ("recall@1", "recall@5", "recall@10", "precision@5", "mrr@10")]) + " |")
+    lines.extend(["", "## Latency", "", "| Stage | Mean | Median | P95 |", "|---|---:|---:|---:|"])
+    latency = report.get("latency_ms", {})
+    for label, key in (("Query embedding", "query_embedding_ms"),
+                       ("Dense retrieval", "dense_retrieval_ms"),
+                       ("Lexical retrieval", "lexical_retrieval_ms"),
+                       ("RRF", "rrf_ms"), ("Reranking", "rerank_ms"),
+                       ("Total retrieval", "total_retrieval_ms")):
+        stats = latency.get(key, {})
+        lines.append("| " + " | ".join([label] + [fmt(stats.get(field))
+                     for field in ("mean", "median", "p95")]) + " |")
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--records", type=Path, default=ROOT / "results" / "captured_runs.jsonl",
-                        help="Captured run JSONL (default: benchmarks/results/captured_runs.jsonl).")
+    parser.add_argument("--records", type=Path, default=ROOT / "results" / "captured_runs.json",
+                        help="Captured run JSON array (default: benchmarks/results/captured_runs.json).")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results")
+    parser.add_argument("--summary-output", type=Path,
+                        default=ROOT / "results" / "captured_runs_summary.md")
     args = parser.parse_args()
     dataset = read_jsonl(ROOT / "eval_dataset.jsonl")
-    runs = read_jsonl(args.records) if args.records.is_file() else []
+    runs = read_capture_json(args.records) if args.records.is_file() else []
     by_id = {record["eval_id"]: record for record in runs}
+    old_results_path = args.output_dir / "latest_results.json"
+    previous_configuration = None
+    previous_reconciliation = None
+    if old_results_path.is_file():
+        try:
+            old_metadata = json.loads(old_results_path.read_text(encoding="utf-8")).get("metadata", {})
+            previous_configuration = old_metadata.get("configuration")
+            previous_reconciliation = old_metadata.get("configuration_reconciliation")
+        except (json.JSONDecodeError, OSError):
+            previous_configuration = None
+            previous_reconciliation = None
     from app.core.config import settings
     config = {"retrieval": "dense + FTS + RRF + configured routing/reranker",
               "dense_top_k": settings.DENSE_TOP_K,
@@ -163,11 +264,13 @@ def main() -> None:
               "relevance_threshold": settings.RELEVANCE_THRESHOLD,
               "min_answerable_rerank_score": settings.MIN_ANSWERABLE_RERANK_SCORE,
               "gemini_model": settings.GEMINI_MODEL}
-    report = build_report(dataset, by_id, config)
+    report = build_report(dataset, by_id, config, previous_configuration, previous_reconciliation)
     report["metadata"]["capture_file"] = str(args.records) if args.records.is_file() else None
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "latest_results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (args.output_dir / "latest_report.md").write_text(markdown_report(report), encoding="utf-8")
+    args.summary_output.parent.mkdir(parents=True, exist_ok=True)
+    args.summary_output.write_text(markdown_summary(report), encoding="utf-8")
     print(markdown_report(report))
 
 

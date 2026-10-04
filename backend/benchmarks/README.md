@@ -4,7 +4,7 @@
 
 ## Captured run contract
 
-Run retrieval against a local, seeded corpus with production embedding/reranker providers as desired, then save one JSONL record per dataset `id` and pass it with `--records`. The report command itself never connects to PostgreSQL, Gemini, or Tavily. A record can contain:
+Run retrieval against a local, seeded corpus with production embedding/reranker providers as desired, then save one JSON object per dataset `id` in a JSON array and pass it with `--records`. The report command itself never connects to PostgreSQL, Gemini, or Tavily. A record can contain:
 
 ```json
 {"eval_id":"eval-001","rankings":{"dense_only":["fixture:machine_learning"],"lexical_only":[],"hybrid_rrf":[],"reranked":[]},"evidence_sufficient":true,"used_web_fallback":false,"citations":[],"timings":{"query_embedding_ms":4.2,"dense_retrieval_ms":8.1,"lexical_retrieval_ms":3.0,"rrf_ms":0.2,"rerank_ms":12.0,"total_retrieval_ms":30.0}}
@@ -19,10 +19,10 @@ From `backend/`:
 ```powershell
 python -m benchmarks.capture_rag_eval
 python -m benchmarks.run_rag_eval
-python -m benchmarks.run_rag_eval --records path/to/captured_runs.jsonl
+python -m benchmarks.run_rag_eval --records path/to/captured_runs.json
 ```
 
-Capture uses the BGE-M3 and Cross-Encoder providers from the existing local benchmark, the fixture chunks in memory, and `MockWebSearchProvider`. It requires local model weights but makes no Gemini/Tavily/Ragas calls. Captures are written to `benchmarks/results/captured_runs.jsonl`; each run contains ranking aliases, UUIDs from that execution, chunk ranks, scores, gate flags, mock web-call status, and timings. Aliases are explicitly mapped to fixture chunk indices and are never treated as production UUIDs. If any gold alias is not in that mapping, its run is marked `unmapped_alias` and excluded from retrieval metrics.
+Capture uses the BGE-M3 and Cross-Encoder providers from the existing local benchmark, the fixture chunks in memory, and `MockWebSearchProvider`. It requires local model weights but makes no Gemini/Tavily/Ragas calls. Captures are written to `benchmarks/results/captured_runs.json` as an indented JSON array; each run contains ranking aliases, UUIDs from that execution, chunk ranks, scores, gate flags, mock web-call status, and timings. Aliases are explicitly mapped to fixture chunk indices and are never treated as production UUIDs. If any gold alias is not in that mapping, its run is marked `unmapped_alias` and excluded from retrieval metrics.
 
 The report command defaults to that capture file and writes `benchmarks/results/latest_results.json` and `latest_report.md`. Dataset, thresholds, model configuration, runtime, and timestamp are recorded. No credentials are written. Queries with no fixture evidence remain unlabeled for retrieval; they still have routing labels.
 
@@ -31,9 +31,11 @@ The report command defaults to that capture file and writes `benchmarks/results/
 Ragas is not a normal dependency and the ordinary benchmark/tests do not call it. Install the isolated profile with `pip install -r benchmarks/requirements-ragas.txt`, set `OPENAI_API_KEY`, then run:
 
 ```powershell
-python -m benchmarks.run_ragas_eval path/to/prepared_answers.jsonl
+python -m benchmarks.run_ragas_eval benchmarks/results/captured_answer_runs.json
 ```
 
-Prepared answer JSONL records need `question`, `answer`, `contexts` (string list), and `reference`. This optional run uses Ragas v0.4's metrics collections (`ascore` API) for Faithfulness, Answer Relevance, Context Precision, and Context Recall. It makes external evaluator calls and is explicitly an LLM-as-a-judge result; it does not generate answers. No LangChain dependency is used.
+The answer capture command writes its indented JSON array directly to `benchmarks/results/captured_answer_runs.json` (override with `--output`). The same file can be passed to Ragas; failed or skipped generations are excluded from scoring.
+
+Prepared answer JSON array records need `question`, `answer`, `contexts` (string list), and `reference`; the answer benchmark capture array is also accepted and mapped to this contract. This optional run uses Ragas v0.4's metrics collections (`ascore` API) for Faithfulness, Answer Relevance, Context Precision, and Context Recall. It makes external evaluator calls and is explicitly an LLM-as-a-judge result; it does not generate answers. No LangChain dependency is used.
 
 The default evaluation cannot establish current production quality without captured rankings, gate decisions, citation payloads, and stage timings from a real local corpus. Mock/provider availability is not treated as a routing-quality result.

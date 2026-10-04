@@ -1,3 +1,6 @@
 # Optional judge-only profile. Not installed by the normal backend requirements.
-ragas>=0.4.0,<0.5
-openai>=1.0.0
+# Ragas 0.4.3 imports this legacy VertexAI module unconditionally; 0.4.2 removed it.
+ragas==0.4.3
+langchain-community==0.4.1
+# Keep the OpenAI SDK in the 1.x line used by Ragas 0.4.3 and Instructor 1.x.
+openai>=1.109.1,<2.0.0
