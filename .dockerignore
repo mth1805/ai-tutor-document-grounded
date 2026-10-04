@@ -27,6 +27,8 @@ model_cache
 **/model_cache
 models
 **/models
+!backend/app/models
+!backend/app/models/**
 backend/benchmarks
 **/benchmarks/results
 frontend

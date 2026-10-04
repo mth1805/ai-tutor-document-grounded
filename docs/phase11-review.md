@@ -1,99 +1,55 @@
-# Phase 11 productionization review
+# Phase 11 final review
 
-## Verdict
+**Review date:** 2026-10-05
 
-**CHANGES REQUESTED before production launch.** The repository now contains a durable database-backed ingestion queue, CPU API plus separately scheduled ingestion workers, pinned backend dependencies, health/readiness checks, environment validation, request logging, smoke checks, and deployment guidance. Migration execution and deployment behavior have not been verified against a live environment.
+**Verdict:** **CHANGES REQUESTED before manual production deployment.** The local CPU Docker build and backend suite pass, and Supabase Dev verification is reported complete. Production release still requires environment-specific setup and smoke verification. The Modal remote image build was intentionally not run because it may incur cloud compute cost.
 
-**Phase naming note:** the repository `AGENTS.md` roadmap describes Phase 11 as background processing/performance and Phase 13 as UI polish/deployment. The attached task explicitly named its productionization/deployment scope “Phase 11”; this work follows that requested scope and preserves the existing Phase 10 evaluation artifacts.
+The repository roadmap names deployment as Phase 13; this review follows the project’s requested Phase 11 productionization scope.
 
-## 1. Implemented
+## Verified evidence
 
-- Added a Modal `asgi_app` wrapper that returns the existing FastAPI application and preserves route paths.
-- Added production configuration validation for Supabase Auth, database, Gemini, enabled Tavily fallback, and explicit CORS origins. Added `SUPABASE_DB_URL` support with `DATABASE_URL` compatibility.
-- Added root `/ready` and `/api/v1/ready`; production readiness checks auth configuration and a lightweight PostgreSQL `SELECT 1`, without model inference.
-- Added request IDs, route/status/latency logs, sanitized generic 500 responses, and a declared content-length request-size guard.
-- Added bounded upload reads before full file buffering and a Gemini request/stream timeout.
-- Added configurable SQLAlchemy pool bounds and limited Modal ASGI input concurrency to a configurable default of 10.
-- Added a durable per-document ingestion job table and privileged queue RPCs with leases, bounded retries, and owner-scoped enqueue permissions. Database-backed uploads commit the document and job together; Modal's scheduled CPU poller dispatches individual jobs to a separately configurable CPU/GPU worker. In-memory development mode retains FastAPI background processing.
-- Added exact-version Python 3.11/Linux x86_64 locks for CPU API and CUDA-capable ingestion worker dependencies; local test dependencies stay in `requirements-dev.txt`.
-- Added structured `chat_stage_metrics` logs and SSE `done.stage_metrics` for retrieval stages, evidence decision, web fallback, provider/model, LLM TTFT, generation, and total request time.
-- Added deployment docs, production checklist, and an environment-driven live smoke script.
-- Kept provider singletons and retrieval configuration intact. Added a versioned migration, but did not apply it or change any production service.
+- **CPU dependency lock:** `backend/requirements.lock.txt` contains no CUDA, NVIDIA, or Triton package pins and pins `torch==2.14.1+cpu`. The separate `backend/requirements-gpu.lock.txt` pins CUDA/NVIDIA/Triton dependencies and `torch==2.14.1` for the ingestion worker.
+- **Backend tests:** `252 passed, 4 skipped` using `python -m pytest backend/tests -q`. The project `.venv` launcher points to an unavailable Windows Store Python, so the existing Python 3.11.15 task-local interpreter was run with `.venv\Lib\site-packages` on `PYTHONPATH`. `ENVIRONMENT=development` was set and RLS opt-in variables were cleared; no database was contacted.
+- **Docker:** A clean Linux image build completed with `docker build --pull --no-cache --file Dockerfile --tag ai-tutor-backend:local .`. Container checks confirmed `/app/app/models`, successful `app.models` and FastAPI imports, and `python -m pip check` reported no broken requirements. Tesseract, English and Vietnamese language data, and LibreOffice Writer were present. Docker copies the CPU lock and backend application only; `.dockerignore` excludes `.env*` and local caches.
+- **Supabase Dev:** User-reported verification is PASS for migration push, schema checks, and real RLS integration. Production Supabase was not contacted or modified in this review.
+- **Modal local validation:** User-reported local wrapper import and ASGI resolution are PASS. **Modal remote cloud image build: NOT VERIFIED**; it was intentionally not attempted because it may incur cloud compute cost.
+- **Whitespace:** `git diff --check` passed.
+- No deployment, GPU execution, or production traffic was performed.
 
-## 2. Verified
+## Review findings
 
-- Backend safe suite: **236 passed, 4 skipped, 2 deselected**. The two deselected tests have existing benchmark output-directory/summary expectation issues. The RLS integration now opts in only through a process environment variable, not `.env`, and skipped without a dedicated disposable DB URL.
-- Frontend tests: **23 passed**; Next.js production build passed.
-- Python compile check passed for `backend/app`, `backend/deploy`, and `scripts`; environment `pip check` passed.
-- `git diff --check`: passed.
-- Repository search found no apparent key-shaped Gemini/OpenAI/service-role credential in the changed application, docs, or example configuration. The pre-existing `.gitignore` edit was left untouched.
-- Inspected migration files for RLS, foreign keys/cascades, HNSW and GIN indexes. They remain enabled and no database changes were made.
-- Inspected current SSE flow, authorization check, event headers, message persistence, model singleton loaders, upload validation, and in-memory/background ingestion behavior.
+### Dependency and image boundaries
 
-## 3. Unverified
+The Modal API/poller image installs the CPU lock. The isolated per-job ingestion worker image installs the GPU lock, and only that Modal function accepts the optional `MODAL_INGESTION_GPU` setting. BGE-M3 and CrossEncoder dependencies remain available in both locks so ingestion and CPU query-time retrieval retain their required inference libraries. The root Dockerfile installs the CPU lock. The CPU Linux image was built and checked; the GPU worker image and Modal cloud image were not built in this review.
 
-- The workspace `.venv` launcher still targets a missing Windows Store Python. A task-local Python 3.11.15 interpreter was installed under the ignored workspace temp directory and used with the existing site-packages. `pip check` passed. The lock was resolved for Python 3.11/Linux x86_64, but a clean Linux/Modal image build was not run.
-- No Modal deployment, Vercel deployment, production Supabase, live Gemini/Tavily calls, GPU allocation, or public endpoint was created or tested.
-- End-to-end SSE disconnect cancellation, partial generation persistence, upstream timeout/error handling, and cross-tenant RLS through PostgreSQL remain unverified. Unit/context regressions ran without connecting to a database.
-- Modal scheduling, RPC SQL, migration application, cache volume behavior, and worker execution have not been exercised against Modal or Supabase. The job table/RPC migration must be applied before database-backed uploads can enqueue successfully.
-- BGE-M3 and Cross-Encoder query-time retrieval still execute inside the API process. The API is CPU-only by default and ingestion embedding can use an isolated GPU worker, but separate GPU inference serving for chat retrieval is not implemented.
-- Target Modal cold start, GPU memory, warm inference, production retrieval latency, and generation TTFT remain unknown.
+The Dockerfile copies `backend/requirements.lock.txt` and `backend/app` only, with `PYTHONPATH=/app`. The `.dockerignore` exception for `backend/app/models` ensures the Python source package is copied while model cache folders remain excluded. No `.env` or secret value is copied into the image. Modal code references named Modal Secrets; secret values are not in source or image build instructions.
 
-## 4. Findings
+### Security, RLS, and migration
 
-### [RESOLVED IN CODE, MIGRATION NOT APPLIED] Ingestion work is process-local
+The durable ingestion migration adds an RLS-protected job table and queue-control `SECURITY DEFINER` RPCs with explicit service-role-only execute grants. Authenticated users can enqueue only jobs tied to their own documents and remove only terminal jobs. Queue-control calls use the backend service key; document processing continues through the authenticated user database session. Existing ownership and RLS behavior was not weakened. Supabase Dev migration and real RLS PASS are user-reported; no production migration was run.
 
-Database-backed uploads now persist one unique job per document in the same transaction as document metadata. Reprocessing re-arms terminal jobs; active jobs deduplicate. A scheduled Modal poller atomically claims jobs with `SKIP LOCKED` leases, and a separate worker marks completion or applies bounded exponential retries. This depends on applying the new migration and configuring the worker's service-role secret. SQL and lifecycle were inspected and unit-tested, but no PostgreSQL execution was performed. Local in-memory mode remains process-local by design.
+Production secret values, role grants, bucket privacy, CORS origins, proxy upload limits, and deployed access controls still require verification in the target accounts. The request-size middleware enforces the declared `Content-Length`; hosting or proxy limits must also cover requests without a trustworthy length.
 
-### [PARTIALLY RESOLVED] Query-time retrieval still runs on the CPU API
+### Runtime and operational limits
 
-The FastAPI Modal function is CPU-only. Document ingestion/embedding jobs are dispatched to a separate worker whose GPU is optional via `MODAL_INGESTION_GPU`. Chat query embedding and reranking remain in the API process, so the current split does not isolate all model inference. Independent GPU serving for retrieval remains needed if CPU API latency is not acceptable. No hardware benchmark was run.
+Chat-time embedding and reranking remain CPU-bound inside the API process; target production latency and concurrency are not measured. The historical Phase 10 local CPU capture recorded mean embedding of about 1.30 seconds, reranking of 11.46 seconds, and total retrieval of 12.79 seconds. A separate answer capture recorded different retrieval and generation means, so the captures are not directly comparable. Treat query-time CPU performance as a release risk and benchmark against the intended workload. The durable queue, retries, leases, Modal scheduling, shared model-cache volume behavior, and worker execution have not been exercised on Modal. Logs include request and ingestion lifecycle events, but no production metrics sink or latency verification is established.
 
-### [RESOLVED IN REPOSITORY; IMAGE BUILD UNVERIFIED] Dependencies are not fully locked
+## Remaining blockers before manual production deployment
 
-Modal installs `backend/requirements.lock.txt` for the CPU API/poller and `backend/requirements-gpu.lock.txt` for ingestion workers. Both locks were resolver-checked for Python 3.11/Linux x86_64. The CPU lock selects `torch==2.14.1+cpu` and excludes NVIDIA/CUDA packages; the worker lock retains the CUDA-enabled `torch==2.14.1` dependency closure. Clean image installation and runtime imports still require Docker/Modal build validation.
+1. The Modal remote build remains unverified, and the GPU worker image has not been independently built. Decide whether to accept this validation gap or run a cost-reviewed build-only validation before deployment.
+2. Review the CPU query-time retrieval latency against the product target and representative corpus; the local benchmark is well above the documented TTFT target before generation begins.
+3. Apply the reviewed migration set to the intended production Supabase project through the normal migration workflow, then verify schema, RLS, queue RPC grants, and private Storage there. Supabase Dev verification does not apply changes to production.
+4. Create and review the Modal Secret and model-cache Volume manually. Confirm the secret contains the required backend configuration and that credentials remain server-side. Set exact production CORS and database pool/concurrency budgets.
+5. Review expected Modal costs and decide whether ingestion workers need a GPU. Configure `MODAL_INGESTION_GPU` only if approved.
+6. Perform the manual deployment and validate health/readiness, authenticated ownership, document ingestion/retries, and SSE through the deployed proxy.
+7. Configure the Vercel production API URL and browser-safe Supabase values, deploy the frontend when approved, and run the documented smoke test with a dedicated authorized user.
 
-### [MEDIUM] Request body guard depends on Content-Length
+## Manual deployment sequence
 
-The API rejects declared oversized bodies, and document uploads read at most one byte beyond the file limit. Requests without a trustworthy `Content-Length` still need a hosting-proxy limit or streaming enforcement. Confirm limits at Modal/proxy and multipart layers.
+1. Prepare the production Supabase project, review and apply the committed migrations, and verify the production schema/RLS and private bucket.
+2. Create the Modal Secret (default name `ai-tutor-production`, or set `MODAL_SECRET_NAME`) and the model-cache Volume. Set production origins, connection-pool limits, and resource settings.
+3. From the repository root, after explicitly accepting the remote-build/cost risk, run `modal deploy backend/deploy/modal_app.py`. This creates the API and scheduled poller functions; it was not run in this review.
+4. Check the deployed `/health` and `/ready` endpoints, then perform authenticated API, document ingestion, queue retry, RLS ownership, and SSE checks using a dedicated production test user and non-sensitive test document.
+5. Configure and deploy Vercel with `NEXT_PUBLIC_API_BASE_URL`, `NEXT_PUBLIC_SUPABASE_URL`, and `NEXT_PUBLIC_SUPABASE_ANON_KEY` only. Run `scripts/smoke_test_production.py` with dedicated authorized test credentials, then monitor logs, latency, and costs.
 
-### [RESOLVED IN CODE; SINK/PRODUCTION VALIDATION REMAIN]
-
-Retrieval and chat now emit compact structured stage metrics without query text or document contents, including TTFT and full generation time. The HTTP middleware logs response start and completion after the SSE body finishes. Metrics are currently application logs; no external metrics sink, aggregation, sampling, or production log verification exists.
-
-### [REMAINING] Backend verification has known failures and safety limits
-
-The original `.venv` launcher is unavailable; a task-local interpreter ran the safe suite. Two excluded benchmark tests remain: answer-capture output assumes a results directory exists, and a benchmark-summary assertion expects different metric formatting. The Gemini provider test now verifies the authoritative model. The RLS integration reads only an explicit process environment URL and skips by default; run only against a dedicated disposable database in controlled CI. No production database was contacted successfully or modified.
-
-## 5. Deployment prerequisites
-
-- Resolve the two unrelated benchmark test failures; run the RLS integration only against a dedicated disposable database.
-- Validate both CPU and GPU locks in clean Linux container/Modal image builds.
-- Create the Modal secret and cache volume manually, then review costs and access controls before `modal deploy`.
-- Configure exact Vercel origins, Supabase Auth settings, a persistent-backend-compatible database URL, Gemini, and Tavily secrets.
-- Verify private Storage, production RLS, connection-pool capacity, migrations, and token authorization against production-equivalent services.
-- Run `scripts/smoke_test_production.py` with a dedicated authorized user and conversation.
-
-## 6. Performance
-
-The Phase 10 retrieval artifact reports local mean query embedding **1,299.530 ms**, reranking **11,461.216 ms**, and total retrieval **12,791.938 ms**. The answer capture reports mean retrieval **839.422 ms** and generation **3,646.739 ms** over its successful answers. These artifacts cover different captures and neither predicts Modal production latency. GPU may reduce model inference time, but cold start, GPU memory, queueing, DB time, Gemini latency, and network overhead remain unmeasured.
-
-## 7. Security findings
-
-- No RLS policy was removed or weakened. Backend DB sessions continue to set transaction-local identity from the verified JWT.
-- Chat checks conversation ownership before opening SSE; document routes check ownership before access, and storage uses the existing private bucket path.
-- No production secrets were added to source. The Modal secret name is configurable; secret values are not embedded in the wrapper.
-- Production CORS rejects wildcard, localhost, and loopback origins.
-- Verify deployed secrets, Supabase bucket privacy, database role permissions, and proxy request limits in the target accounts before launch.
-
-## 8. Configuration discrepancy
-
-Current code defaults are authoritative for behavior when environment overrides are absent: dense/lexical top-k **25/25**, candidate pool **30**, rerank top-k **5**, routing **adaptive**, RRF k **60**, relevance threshold **0.35**, minimum answerable score **0.55**, BGE-M3, and `BAAI/bge-reranker-v2-m3`. The Phase 10 captured retrieval artifact records **20/20**, pool **20**, rerank top-k **10**, and `always_quality`, with the same listed score thresholds and model family. `.env.example` reflects the current code defaults. These configurations remain separate; this phase did not tune production retrieval to match benchmark capture metadata.
-
-## 9. Recommended next steps
-
-1. Resolve the two existing benchmark failures and run the complete non-database backend suite.
-2. Build the pinned Modal image and verify SSE behavior in a controlled deployment.
-3. Apply and validate the durable-job migration on a disposable Supabase-compatible database; verify retries, lease recovery, RLS, and cancellation.
-4. Decide whether CPU query-time retrieval meets latency needs; isolate it behind a model-serving worker if not.
-5. Connect structured logs to the production metrics platform and measure cold/warm deployment performance.
+Do not place service-role, database, Gemini, or Tavily secrets in Vercel browser variables. Do not use production data for smoke tests.
