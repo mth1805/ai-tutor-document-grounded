@@ -2,6 +2,13 @@
 
 Run from the repository root with `modal deploy backend/deploy/modal_app.py`.
 No Modal resources are created until that explicit command is run.
+
+Path-safety note: ROOT / parents[2] cannot be used unconditionally because Modal
+uploads this file to /root/modal_app.py (only two ancestors), which raises an
+IndexError at import time.  BACKEND is resolved as parents[1] of this file,
+which is the ``backend/`` directory in the local repo.  All BACKEND references
+are used exclusively at image build time (pip-requirements paths and add_local_dir);
+they are never evaluated inside a running container.
 """
 from pathlib import Path
 import os
@@ -10,8 +17,11 @@ import uuid
 
 import modal
 
-ROOT = Path(__file__).resolve().parents[2]
-BACKEND = ROOT / "backend"
+# ``backend/deploy/modal_app.py``  ->  parents[0]=deploy/  parents[1]=backend/
+# On Modal the file is /root/modal_app.py; parents[2] would raise IndexError.
+# BACKEND is only consumed at image build time (requirements paths, add_local_dir),
+# never inside a running container, so resolving from __file__ is safe.
+BACKEND = Path(__file__).resolve().parent.parent
 MAX_CONCURRENT_INPUTS = int(os.getenv("MODAL_MAX_CONCURRENT_INPUTS", "10"))
 MODEL_CACHE_VOLUME = modal.Volume.from_name(
     os.getenv("MODAL_MODEL_CACHE_VOLUME", "ai-tutor-model-cache"), create_if_missing=True

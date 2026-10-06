@@ -4,16 +4,44 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { resolveApiBaseUrl, validateHostedSupabase } from '../src/lib/public-config.mjs';
 
-test('API configuration preserves local Docker and requires valid hosted HTTPS', () => {
+test('API configuration permits localhost only locally and requires valid HTTPS in production', () => {
+  // Local development defaults to http://localhost:8000
   assert.equal(resolveApiBaseUrl(), 'http://localhost:8000');
-  assert.equal(resolveApiBaseUrl('http://localhost:8000/', undefined, { production: true }), 'http://localhost:8000');
+  assert.equal(resolveApiBaseUrl('http://localhost:8000/'), 'http://localhost:8000');
+  assert.equal(resolveApiBaseUrl(undefined, 'http://localhost:8000/'), 'http://localhost:8000');
+
+  // Local development browser origins
+  assert.equal(resolveApiBaseUrl(undefined, undefined, { browserHostname: 'localhost' }), 'http://localhost:8000');
+  assert.equal(resolveApiBaseUrl('http://localhost:8000/', undefined, { browserHostname: '127.0.0.1' }), 'http://localhost:8000');
+
+  // Local container build override (Docker)
+  assert.equal(resolveApiBaseUrl('http://localhost:8000/', undefined, { production: true, allowLocal: true }), 'http://localhost:8000');
+
+  // Production requires valid HTTPS and uses NEXT_PUBLIC_API_BASE_URL
+  assert.equal(resolveApiBaseUrl('https://test-api.modal.run///', undefined, { production: true }), 'https://test-api.modal.run');
   assert.equal(resolveApiBaseUrl('https://test-api.modal.run///', undefined, { hosted: true }), 'https://test-api.modal.run');
+  assert.equal(resolveApiBaseUrl('https://test-api.modal.run///', undefined, { browserHostname: 'ai-tutor.vercel.app' }), 'https://test-api.modal.run');
   assert.equal(resolveApiBaseUrl(undefined, 'https://test-api.modal.run'), 'https://test-api.modal.run');
+
+  // Production must not silently fall back to localhost
+  assert.throws(() => resolveApiBaseUrl(undefined, undefined, { production: true }), /required for production/);
+  assert.throws(() => resolveApiBaseUrl('', undefined, { production: true }), /required for production/);
+  assert.throws(() => resolveApiBaseUrl(undefined, undefined, { hosted: true }), /required for production/);
+  assert.throws(() => resolveApiBaseUrl(undefined, undefined, { browserHostname: 'ai-tutor.vercel.app' }), /required for production/);
+
+  // http://localhost:8000 is forbidden in production
+  assert.throws(() => resolveApiBaseUrl('http://localhost:8000/', undefined, { production: true }), /allowed only in local development/);
+  assert.throws(() => resolveApiBaseUrl('http://localhost:8000/', undefined, { hosted: true }));
+  assert.throws(() => resolveApiBaseUrl('http://localhost:8000/', undefined, { browserHostname: 'ai-tutor.vercel.app' }), /allowed only in local development/);
+
+  // Rejection of invalid origins in production and hosted
   for (const value of [undefined, '', 'http://localhost:8000', 'https://127.0.0.1', '/api', 'http://test-api.modal.run', 'https://user:password@test.invalid', 'https://test.invalid/api', 'https://test.invalid?key=x']) {
     assert.throws(() => resolveApiBaseUrl(value, undefined, { hosted: true }));
+    assert.throws(() => resolveApiBaseUrl(value, undefined, { production: true }));
   }
-  assert.throws(() => resolveApiBaseUrl(undefined, undefined, { production: true }));
-  assert.throws(() => resolveApiBaseUrl('https://a.invalid', 'https://b.invalid'));
+
+  // Conflict between primary and legacy variables
+  assert.throws(() => resolveApiBaseUrl('https://a.invalid', 'https://b.invalid'), /conflict/);
 });
 
 test('hosted Supabase rejects missing, placeholder and privileged credentials', () => {

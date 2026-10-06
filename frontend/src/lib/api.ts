@@ -217,6 +217,15 @@ async function request<T>(
   options: RequestInit = {},
   token?: string | null
 ): Promise<T> {
+  if (typeof window !== "undefined") {
+    const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+    if (!isLocal && API_BASE_URL.startsWith("http://localhost")) {
+      throw new ApiError(
+        `Production configuration error: Cannot connect to ${API_BASE_URL} from hosted domain (${window.location.origin}). NEXT_PUBLIC_API_BASE_URL must be set to your deployed HTTPS API.`
+      );
+    }
+  }
+
   const url = `${API_BASE_URL}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
 
   const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
@@ -638,6 +647,15 @@ export const apiClient = {
     callbacks: ChatStreamCallbacks,
     signal?: AbortSignal
   ): Promise<void> {
+    if (typeof window !== "undefined") {
+      const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+      if (!isLocal && API_BASE_URL.startsWith("http://localhost")) {
+        const err = `Production configuration error: Cannot connect to ${API_BASE_URL} from hosted domain (${window.location.origin}). NEXT_PUBLIC_API_BASE_URL must be set to your deployed HTTPS API.`;
+        callbacks.onError?.(err);
+        throw new ApiError(err);
+      }
+    }
+
     const url = `${API_BASE_URL}/api/v1/conversations/${conversationId}/chat`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
