@@ -106,3 +106,20 @@ def test_chat_stream_rejects_missing_auth_without_creating_stream():
         json={"content": "test"},
     )
     assert response.status_code == 401
+
+
+def test_modal_app_image_construction_order():
+    pytest.importorskip("modal")
+    import deploy.modal_app as modal_app
+
+    # Ensure add_local_dir is at the end of the chain (represented as Image(local files))
+    # and all build steps (pip installs, env setup) occur BEFORE add_local_dir.
+    assert repr(modal_app.image) == "Image(local files)"
+    assert repr(modal_app.gpu_image) == "Image(local files)"
+    assert modal_app.app.name == "ai-tutor-api"
+    assert len(modal_app.secrets) == 1
+    assert modal_app.MODEL_CACHE_VOLUME is not None
+    assert repr(modal_app.fastapi_app) == "Function(fastapi_app)"
+    assert repr(modal_app.poll_ingestion_queue) == "Function(poll_ingestion_queue)"
+    assert repr(modal_app.process_ingestion_job) == "Function(process_ingestion_job)"
+

@@ -1,6 +1,6 @@
 from typing import List, Union
 from pathlib import Path
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 from pydantic import model_validator
@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     SUPABASE_DB_URL: str | None = None
     SUPABASE_SERVICE_ROLE_KEY: str | None = None
     SUPABASE_JWT_SECRET: str | None = None
+    SUPABASE_AUTH_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=60)
 
     # PostgreSQL Database URL (Supabase PostgreSQL / asyncpg)
     DATABASE_URL: str | None = None
@@ -73,6 +74,9 @@ class Settings(BaseSettings):
     EMBEDDING_NORMALIZE: bool = True
     AUTO_EMBED_AFTER_INGESTION: bool = True
     PREWARM_MODELS: bool = False
+    LOCAL_SHARED_MODELS: bool = False
+    LOCAL_MODEL_API_URL: str = "http://backend:8000"
+    LOCAL_MODEL_MAX_TOKENS: int = Field(default=512, ge=128, le=1024)
 
     # Phase 7: Hybrid Retrieval + Cross-Encoder Reranking configuration
     DENSE_TOP_K: int = 25
@@ -122,6 +126,8 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_configuration(self):
         """Fail early for missing production settings while keeping local startup flexible."""
+        if self.LOCAL_SHARED_MODELS and self.ENVIRONMENT.lower() != "development":
+            raise ValueError("LOCAL_SHARED_MODELS is restricted to development")
         if self.ENVIRONMENT.lower() in {"production", "prod"}:
             missing = []
             if not self.SUPABASE_URL:

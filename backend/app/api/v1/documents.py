@@ -296,6 +296,11 @@ async def embed_document(
         )
 
     # Immediately mark embedding_status as processing
+    from app.core.config import settings
+    if settings.LOCAL_SHARED_MODELS:
+        from app.ml.local_runtime import ready
+        if not ready.is_set():
+            raise HTTPException(503, "Local models are warming up; retry shortly")
     doc.embedding_status = "processing"
     if db is not None:
         try:

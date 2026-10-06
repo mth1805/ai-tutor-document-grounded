@@ -36,15 +36,15 @@ base_image = (
 image = (
     base_image
     .pip_install_from_requirements(str(CPU_REQUIREMENTS))
-    .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
     .env({"PYTHONPATH": "/root/backend", "HF_HOME": "/models/huggingface"})
+    .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
 )
 # Keep the CUDA-enabled dependency set exclusive to per-job ingestion workers.
 gpu_image = (
     base_image
     .pip_install_from_requirements(str(GPU_REQUIREMENTS))
-    .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
     .env({"PYTHONPATH": "/root/backend", "HF_HOME": "/models/huggingface"})
+    .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
 )
 
 # The persistent volume prevents model downloads on container restarts. It is

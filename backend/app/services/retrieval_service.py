@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any, Set, Tuple
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.concurrency import run_in_threadpool
+from app.ml.local_runtime import infer
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
@@ -394,11 +395,12 @@ class RetrievalService:
         pairs = [(query, c.content) for c in candidates]
 
         # Execute blocking model inference in threadpool to keep the asyncio event loop responsive
-        scores: List[float] = await run_in_threadpool(
-            reranker.predict,
-            pairs,
-            batch_size=batch_size,
-        )
+        scores: List[float] = []
+        if settings.LOCAL_SHARED_MODELS:
+            for pair in pairs:
+                scores.extend(await infer(reranker.predict, [pair], batch_size=1))
+        else:
+            scores = await infer(reranker.predict, pairs, batch_size=batch_size)
 
         for candidate, score in zip(candidates, scores):
             candidate.rerank_score = round(float(score), 4)
@@ -464,6 +466,11 @@ class RetrievalService:
             else settings.RELEVANCE_THRESHOLD
         )
 
+        # Avoid waiting on the loading singleton inside a local request.
+        if settings.LOCAL_SHARED_MODELS:
+            from app.ml.local_runtime import ready
+            if not ready.is_set():
+                raise ValueError("Local models are warming up or unavailable; retry shortly")
         # Model providers (reused singletons)
         emb_provider = embedding_provider or get_embedding_provider()
         rerank_provider = reranker_provider or get_reranker_provider()
@@ -473,7 +480,7 @@ class RetrievalService:
         # Step 1 & 2: Concurrent Dense and Lexical Retrieval
         async def _execute_dense() -> Tuple[List[RetrievalCandidate], float, float]:
             t_d0 = time.perf_counter()
-            query_vectors = await run_in_threadpool(
+            query_vectors = await infer(
                 emb_provider.encode_batch,
                 [query_str],
                 normalize=settings.EMBEDDING_NORMALIZE,

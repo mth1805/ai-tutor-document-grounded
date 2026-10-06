@@ -6,6 +6,7 @@ and writes run through the existing user-scoped authenticated SQLAlchemy session
 import asyncio
 import logging
 import os
+import signal
 import uuid
 from typing import Any
 
@@ -74,42 +75,130 @@ async def process_claimed_job(job_id: uuid.UUID) -> bool:
     """Run one claimed job; parser/provider detail is kept out of queue logs."""
     job = await load_claimed_job(job_id)
     if not job:
-        logger.warning("ingestion job unavailable job_id=%s", job_id)
+        logger.warning("ingestion_job_unavailable job_id=%s", job_id)
         return False
     document_id = uuid.UUID(job["claimed_document_id"])
     user_id = uuid.UUID(job["claimed_user_id"])
     attempt = int(job["claimed_attempt"])
     logger.info(
-        "ingestion job started job_id=%s document_id=%s attempt=%d",
+        "ingestion_job_claimed job_id=%s document_id=%s attempt=%d",
         job_id, document_id, attempt,
     )
     try:
-        succeeded = await IngestionService.process_document_background(document_id, user_id)
+        succeeded = await IngestionService.process_document_background(
+            document_id, user_id, defer_failure_to_queue=True,
+        )
+        if succeeded and settings.LOCAL_SHARED_MODELS:
+            succeeded = await request_local_embedding(job_id, attempt)
     except Exception as exc:
         logger.error(
-            "ingestion job raised job_id=%s category=%s",
-            job_id, type(exc).__name__, exc_info=True,
+            "ingestion_job_failed job_id=%s category=%s",
+            job_id, type(exc).__name__,
         )
         succeeded = False
+    if settings.LOCAL_SHARED_MODELS:
+        current = await load_claimed_job(job_id)
+        if not current or int(current["claimed_attempt"]) != attempt:
+            logger.warning("ingestion_attempt_stale job_id=%s attempt=%d", job_id, attempt)
+            return False
     await finish_job(job_id, succeeded=succeeded)
     logger.info(
-        "ingestion job finished job_id=%s document_id=%s succeeded=%s",
-        job_id, document_id, succeeded,
+        "%s job_id=%s document_id=%s attempt=%d",
+        "ingestion_job_completed" if succeeded else "ingestion_job_failed",
+        job_id, document_id, attempt,
     )
     return succeeded
 
 
-async def run_worker_forever(poll_seconds: float = 5.0) -> None:
+async def run_worker_forever(
+    poll_seconds: float = 5.0,
+    stop_event: asyncio.Event | None = None,
+) -> None:
     """Local/dev worker process; production uses the scheduled Modal poller."""
-    while True:
-        jobs = await claim_jobs()
-        if not jobs:
-            await asyncio.sleep(poll_seconds)
-            continue
-        for job in jobs:
-            await process_claimed_job(uuid.UUID(job["job_id"]))
+    stop = stop_event or asyncio.Event()
+    # Claim only the job being worked on: a sequential CPU worker must not lease
+    # a batch whose later jobs might expire before their parsing even starts.
+    while not stop.is_set():
+        try:
+            if settings.LOCAL_SHARED_MODELS:
+                await wait_local_models(stop)
+                if stop.is_set():
+                    break
+            jobs = await claim_jobs(limit=1)
+            for job in jobs:
+                # Drain a claimed attempt on SIGTERM; don't leave an idle lease.
+                await process_claimed_job(uuid.UUID(job["job_id"]))
+        except Exception as exc:
+            # The queue keeps the lease/retry record if finalization fails.
+            # Transient RPC/network failures must not terminate the only worker.
+            logger.error("ingestion_worker_poll_failed category=%s", type(exc).__name__)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=max(1.0, poll_seconds))
+        except asyncio.TimeoutError:
+            pass
+
+
+def local_headers() -> dict[str, str]:
+    from app.api.v1.local_models import worker_token
+    return {"Authorization": "Bearer " + worker_token()}
+
+
+async def wait_local_models(stop: asyncio.Event) -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        while not stop.is_set():
+            try:
+                response = await client.get(settings.LOCAL_MODEL_API_URL + "/internal/local-models", headers=local_headers())
+                response.raise_for_status()
+                if response.json().get("ready") is True:
+                    return
+            except httpx.HTTPError:
+                pass
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def request_local_embedding(job_id: uuid.UUID, attempt: int) -> bool:
+    # A retry attaches to the same backend task. Leave ample time within the lease.
+    async with httpx.AsyncClient(timeout=1500) as client:
+        for retry in range(2):
+            try:
+                response = await client.post(
+                    settings.LOCAL_MODEL_API_URL + "/internal/local-models/embed",
+                    headers=local_headers(), json={"job_id": str(job_id), "attempt": attempt},
+                )
+                response.raise_for_status()
+                return response.json().get("succeeded") is True
+            except httpx.TransportError:
+                if retry:
+                    raise
+        return False
+
+
+async def main() -> None:
+    """CPU Compose entrypoint with signal-aware shutdown and pool cleanup."""
+    from app.db.session import AsyncSessionLocal, engine
+
+    _rpc_config()
+    if AsyncSessionLocal is None:
+        raise QueueConfigurationError("Local ingestion worker requires a configured PostgreSQL connection")
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # Native Windows development.
+            signal.signal(sig, lambda *_args: loop.call_soon_threadsafe(stop.set))
+    logger.info("ingestion_worker_started concurrency=1 poll_seconds=5")
+    try:
+        await run_worker_forever(stop_event=stop)
+    finally:
+        if engine is not None:
+            await engine.dispose()
+        logger.info("ingestion_worker_stopped")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-    asyncio.run(run_worker_forever())
+    asyncio.run(main())

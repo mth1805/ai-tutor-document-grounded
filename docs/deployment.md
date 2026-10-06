@@ -2,6 +2,8 @@
 
 This guide describes the current application deployment path. No resources are provisioned by the repository itself.
 
+For the CPU-only three-service local Compose demo and manual Dev queue migration, see [local Docker runtime](local-docker-runtime.md). Modal production boundaries stay unchanged.
+
 ## A. Architecture
 
 - Next.js 14 frontend on Vercel.
@@ -13,7 +15,7 @@ This guide describes the current application deployment path. No resources are p
 
 ### Local development
 
-Copy `.env.example` to `.env`; use local frontend URL `http://localhost:3000`, local API URL `http://localhost:8000`, and development-only credentials. The frontend reads its API endpoint from `NEXT_PUBLIC_API_BASE_URL` (with legacy `NEXT_PUBLIC_API_URL` compatibility) and has no baked-in API host. `frontend/.env.local` is ignored and must not contain server secrets.
+Copy the root `.env.example` to `.env` for backend/Compose, and `frontend/.env.example` to `frontend/.env.local` for browser-safe frontend values. Local frontend/API origins are `http://localhost:3000` and `http://localhost:8000`. The centralized frontend configuration reads `NEXT_PUBLIC_API_BASE_URL` (legacy `NEXT_PUBLIC_API_URL` compatibility), defaults to localhost only in development, and requires an explicit origin for production builds. Private env files are ignored and frontend env must never contain backend secrets.
 
 ### Production backend
 
@@ -68,7 +70,7 @@ Model memory needs, cold-start duration, and warm inference latency are unknown 
 
 ## H. Vercel frontend setup
 
-Set `NEXT_PUBLIC_API_BASE_URL` to the deployed Modal URL (no trailing slash). Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` only when needed by the current browser auth flow. Never set service-role, DB, Gemini, or Tavily credentials in Vercel browser variables. Preview deployments need their own exact origins added to backend CORS if they must call the API.
+Follow the dedicated [Vercel deployment guide](vercel-deployment.md). All three public variables (`NEXT_PUBLIC_API_BASE_URL`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`) are required for Vercel builds. Never set service-role, DB, Gemini, or Tavily credentials in Vercel. Preview deployments need exact trusted CORS origins and their own reviewed auth configuration.
 
 ## I. CORS configuration
 

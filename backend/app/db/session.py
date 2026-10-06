@@ -40,7 +40,8 @@ if settings.resolved_database_url:
     try:
         engine = create_async_engine(
             settings.resolved_database_url,
-            echo=settings.ENVIRONMENT == "development",
+            # SQL parameters can contain document text, vectors, and JWT claims.
+            echo=False,
             future=True,
             pool_pre_ping=True,
             pool_size=settings.DB_POOL_SIZE,
