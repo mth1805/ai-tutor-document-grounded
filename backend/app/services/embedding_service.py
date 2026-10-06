@@ -16,6 +16,7 @@ from app.ml.base import BaseEmbeddingProvider
 from app.ml.loader import get_embedding_provider
 from app.db.session import AsyncSessionLocal
 from app.ml.local_runtime import infer
+from app.services.ingestion.telemetry import stage, metric, event
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +120,10 @@ class EmbeddingService:
                 return True
 
             # 5. Extract texts and prepare embedding provider
-            active_provider = provider or get_embedding_provider()
+            with stage("model_load"):
+                active_provider = provider or await run_in_threadpool(get_embedding_provider)
             effective_batch_size = batch_size or settings.EMBEDDING_BATCH_SIZE
+            metric(model_device=active_provider.device, embedding_batch_size=effective_batch_size, chunk_count=len(chunks))
 
             texts = [c.content for c in chunks]
 
@@ -140,8 +143,10 @@ class EmbeddingService:
                     vectors.extend(await infer(active_provider.encode_batch, [content],
                         normalize=settings.EMBEDDING_NORMALIZE, batch_size=1, background=True))
             else:
-                vectors = await run_in_threadpool(active_provider.encode_batch, texts,
-                    normalize=settings.EMBEDDING_NORMALIZE, batch_size=effective_batch_size)
+                with stage("embedding"):
+                    vectors = await run_in_threadpool(active_provider.encode_batch, texts,
+                        normalize=settings.EMBEDDING_NORMALIZE, batch_size=effective_batch_size)
+            metric(embedding_count=len(vectors))
 
             if len(vectors) != len(chunks):
                 raise ValueError(
@@ -165,8 +170,9 @@ class EmbeddingService:
             doc.embedding_error = None
 
             if db is not None:
-                await db.commit()
-                await db.refresh(doc)
+                with stage("vector_store"):
+                    await db.commit()
+                    await db.refresh(doc)
             else:
                 # Update in-memory document state
                 doc_record = _IN_MEMORY_DOCUMENTS.get(document_id)
@@ -185,9 +191,13 @@ class EmbeddingService:
             return True
 
         except Exception as err:
+            event("failed", error_category=type(err).__name__, error_code="EMBEDDING_FAILED")
             logger.error("embedding_failed document_id=%s category=%s", document_id, type(err).__name__)
             failed_time = datetime.now(timezone.utc)
-            error_msg = str(err)
+            error_msg = (
+                "Could not create document embeddings. Please retry processing."
+                if settings.ENVIRONMENT.lower() in {"production", "prod"} else str(err)
+            )
 
             if isinstance(err, StaleEmbeddingAttempt):
                 if db is not None:

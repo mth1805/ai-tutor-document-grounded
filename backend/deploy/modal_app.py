@@ -14,6 +14,7 @@ from pathlib import Path
 import os
 import asyncio
 import uuid
+import logging
 
 import modal
 
@@ -26,7 +27,7 @@ MAX_CONCURRENT_INPUTS = int(os.getenv("MODAL_MAX_CONCURRENT_INPUTS", "10"))
 MODEL_CACHE_VOLUME = modal.Volume.from_name(
     os.getenv("MODAL_MODEL_CACHE_VOLUME", "ai-tutor-model-cache"), create_if_missing=True
 )
-INGESTION_GPU = os.getenv("MODAL_INGESTION_GPU", "").strip() or None
+INGESTION_GPU = os.getenv("MODAL_INGESTION_GPU", "T4").strip() or "T4"
 CPU_REQUIREMENTS = BACKEND / "requirements.lock.txt"
 GPU_REQUIREMENTS = BACKEND / "requirements-gpu.lock.txt"
 
@@ -107,6 +108,23 @@ def poll_ingestion_queue():
 )
 def process_ingestion_job(job_id: str):
     """Process a single durable job; GPU is allocated only to this worker function."""
+    # Set worker-only options before importing Settings; API/poller stay on CPU.
+    os.environ["EMBEDDING_DEVICE"] = "cuda"
+    # Match HF_HOME's normal hub subdirectory so CPU/GPU workers share weights.
+    os.environ["EMBEDDING_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
+    os.environ["AUTO_EMBED_AFTER_INGESTION"] = "true"
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     from app.workers.ingestion_queue import process_claimed_job
 
-    return asyncio.run(process_claimed_job(uuid.UUID(job_id)))
+    # Reuse the event loop as well as the model singleton in warm containers:
+    # SQLAlchemy's pooled async connections belong to their original loop.
+    global _worker_runner
+    if "_worker_runner" not in globals():
+        _worker_runner = asyncio.Runner()
+    try:
+        return _worker_runner.run(process_claimed_job(uuid.UUID(job_id)))
+    finally:
+        try:
+            MODEL_CACHE_VOLUME.commit()
+        except Exception as exc:
+            logging.getLogger(__name__).error("model_cache_commit_failed job_id=%s category=%s", job_id, type(exc).__name__)
