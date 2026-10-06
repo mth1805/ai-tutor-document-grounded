@@ -2,7 +2,7 @@
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Callable, Awaitable
+from typing import List, Optional, Dict, Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.concurrency import run_in_threadpool
@@ -15,13 +15,8 @@ from app.services.ingestion_service import _IN_MEMORY_CHUNKS
 from app.ml.base import BaseEmbeddingProvider
 from app.ml.loader import get_embedding_provider
 from app.db.session import AsyncSessionLocal
-from app.ml.local_runtime import infer
 
 logger = logging.getLogger(__name__)
-
-
-class StaleEmbeddingAttempt(RuntimeError):
-    """An expired queue attempt must not overwrite a newer attempt's state."""
 
 
 class EmbeddingService:
@@ -35,7 +30,6 @@ class EmbeddingService:
         user_id: uuid.UUID,
         provider: Optional[BaseEmbeddingProvider] = None,
         batch_size: Optional[int] = None,
-        lease_guard: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> bool:
         """Computes embeddings for all chunks of a processed document and commits them atomically.
 
@@ -46,17 +40,10 @@ class EmbeddingService:
         - Document lifecycle transitions: 'pending' -> 'processing' -> 'completed' (or 'failed').
         - On failure, transaction is rolled back so partial embeddings are not committed.
         """
-        if settings.LOCAL_SHARED_MODELS:
-            from app.ml.local_runtime import ready
-            if not ready.is_set():
-                logger.warning("local_embedding_unavailable models_ready=false")
-                return False
         # 1. Fetch document and enforce tenant isolation
         doc = await DocumentService.get_document(db, document_id, user_id)
         if not doc:
             logger.warning("Document %s not found or unauthorized for user %s", document_id, user_id)
-            return False
-        if lease_guard is not None and not await lease_guard():
             return False
 
         # 2. Enforce Phase 5 prerequisite: Document MUST be 'processed'
@@ -79,11 +66,10 @@ class EmbeddingService:
                 await db.commit()
                 await db.refresh(doc)
             except Exception as e:
-                logger.error("embedding_status_update_failed document_id=%s category=%s", document_id, type(e).__name__)
+                logger.error("Failed to update document embedding status to 'processing': %s", e)
                 await db.rollback()
 
         try:
-            logger.info("embedding_started document_id=%s", document_id)
             # 4. Fetch canonical chunks
             chunks: List[DocumentChunk] = []
             if db is not None:
@@ -105,8 +91,6 @@ class EmbeddingService:
                 chunks.sort(key=lambda c: c.chunk_index)
 
             if not chunks:
-                if lease_guard is not None and not await lease_guard():
-                    raise StaleEmbeddingAttempt()
                 logger.info("Document %s has 0 chunks to embed. Marking embedding as completed.", document_id)
                 completed_time = datetime.now(timezone.utc)
                 doc.embedding_status = "completed"
@@ -115,7 +99,6 @@ class EmbeddingService:
                 if db is not None:
                     await db.commit()
                     await db.refresh(doc)
-                logger.info("embedding_completed document_id=%s count=0", document_id)
                 return True
 
             # 5. Extract texts and prepare embedding provider
@@ -134,14 +117,12 @@ class EmbeddingService:
                 active_provider.device,
             )
 
-            vectors: List[List[float]] = []
-            if settings.LOCAL_SHARED_MODELS:
-                for content in texts:
-                    vectors.extend(await infer(active_provider.encode_batch, [content],
-                        normalize=settings.EMBEDDING_NORMALIZE, batch_size=1, background=True))
-            else:
-                vectors = await run_in_threadpool(active_provider.encode_batch, texts,
-                    normalize=settings.EMBEDDING_NORMALIZE, batch_size=effective_batch_size)
+            vectors: List[List[float]] = await run_in_threadpool(
+                active_provider.encode_batch,
+                texts,
+                normalize=settings.EMBEDDING_NORMALIZE,
+                batch_size=effective_batch_size,
+            )
 
             if len(vectors) != len(chunks):
                 raise ValueError(
@@ -149,8 +130,6 @@ class EmbeddingService:
                 )
 
             # 7. Atomic persistence: Update existing canonical chunks with embedding vectors
-            if lease_guard is not None and not await lease_guard():
-                raise StaleEmbeddingAttempt()
             completed_time = datetime.now(timezone.utc)
 
             for chunk, vec in zip(chunks, vectors):
@@ -176,7 +155,7 @@ class EmbeddingService:
                     doc_record.embedding_error = None
 
             logger.info(
-                "embedding_completed document_id=%s count=%d dimension=%d model=%s",
+                "Document %s successfully embedded (%d chunks, dim=%d, model=%s).",
                 document_id,
                 len(chunks),
                 active_provider.dimension,
@@ -185,14 +164,9 @@ class EmbeddingService:
             return True
 
         except Exception as err:
-            logger.error("embedding_failed document_id=%s category=%s", document_id, type(err).__name__)
+            logger.error("Embedding generation failed for document %s: %s", document_id, err, exc_info=True)
             failed_time = datetime.now(timezone.utc)
             error_msg = str(err)
-
-            if isinstance(err, StaleEmbeddingAttempt):
-                if db is not None:
-                    await db.rollback()
-                return False
 
             if db is not None:
                 try:
@@ -205,9 +179,9 @@ class EmbeddingService:
                         await db.commit()
                 except Exception as db_err:
                     logger.critical(
-                        "embedding_failure_record_failed document_id=%s category=%s",
+                        "Failed to record embedding failure state for document %s: %s",
                         document_id,
-                        type(db_err).__name__,
+                        db_err,
                     )
             else:
                 doc.embedding_status = "failed"

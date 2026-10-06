@@ -129,9 +129,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (configured) {
         const supabase = createClient();
         const { error } = await supabase.auth.signUp({ email, password });
-        // Email-confirmation signups may return no session/auth event.
-        setIsLoading(false);
         if (error) {
+          setIsLoading(false);
           return { error: error.message };
         }
         return {};

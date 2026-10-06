@@ -7,7 +7,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status
 
 from app.models.document import Document
-from app.models.ingestion_job import DocumentIngestionJob
 from app.services.workspace_service import WorkspaceService
 from app.services.storage_service import (
     StorageService,
@@ -81,16 +80,7 @@ class DocumentService:
         # 5. Persist metadata in PostgreSQL with transactional rollback on failure
         if db is not None:
             try:
-                doc.status = "queued"
                 db.add(doc)
-                db.add(DocumentIngestionJob(
-                    document_id=doc.id,
-                    workspace_id=doc.workspace_id,
-                    user_id=doc.user_id,
-                    status="queued",
-                    attempt_count=0,
-                    max_attempts=3,
-                ))
                 await db.commit()
                 await db.refresh(doc)
                 return doc
