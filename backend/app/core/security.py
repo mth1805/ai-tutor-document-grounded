@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import logging
 from typing import Optional
@@ -72,8 +73,16 @@ async def verify_supabase_token(token: str) -> AuthenticatedUser:
             "apikey": settings.SUPABASE_ANON_KEY,
         }
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get(auth_url, headers=headers)
+            async with httpx.AsyncClient(timeout=settings.SUPABASE_AUTH_TIMEOUT_SECONDS) as client:
+                for attempt in range(2):
+                    try:
+                        res = await client.get(auth_url, headers=headers)
+                        break
+                    except httpx.TransportError as error:
+                        if attempt == 1:
+                            raise
+                        logger.warning("Supabase Auth transport retry category=%s", type(error).__name__)
+                        await asyncio.sleep(0.25)
                 if res.status_code == 200:
                     user_data = res.json()
                     user_id = user_data.get("id")
@@ -95,7 +104,7 @@ async def verify_supabase_token(token: str) -> AuthenticatedUser:
         except HTTPException:
             raise
         except Exception as e:
-            logger.error("Supabase Auth API request error: %s", e)
+            logger.error("Supabase Auth API request error category=%s", type(e).__name__)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Authentication service temporarily unavailable",

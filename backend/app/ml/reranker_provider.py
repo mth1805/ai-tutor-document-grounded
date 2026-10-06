@@ -1,5 +1,6 @@
 """Cross-Encoder reranker provider with local caching, batch scoring, and device fallback."""
 import logging
+from collections import OrderedDict
 import math
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -52,6 +53,10 @@ class CrossEncoderRerankerProvider(BaseRerankerProvider):
         # Disable dropout layers for deterministic inference
         if hasattr(self._model, "model") and hasattr(self._model.model, "eval"):
             self._model.model.eval()
+        if settings.LOCAL_SHARED_MODELS:
+            self._model.max_length = settings.LOCAL_MODEL_MAX_TOKENS
+            self._version = "mmarco-minilm-local-windowed-v1"
+            self._local_cache = OrderedDict()
 
         logger.info("CrossEncoderRerankerProvider successfully initialized.")
 
@@ -103,6 +108,34 @@ class CrossEncoderRerankerProvider(BaseRerankerProvider):
 
         # CrossEncoder expects list of [query, text] lists/tuples
         formatted_pairs = [[query, text] for query, text in pairs]
+
+        if settings.LOCAL_SHARED_MODELS:
+            from app.ml.text_windows import text_windows
+            result = []
+            tokenizer = self._model.tokenizer
+            with torch.no_grad():
+                for query, passage in pairs:
+                    key = (query, passage)
+                    if key in self._local_cache:
+                        self._local_cache.move_to_end(key)
+                        result.append(self._local_cache[key])
+                        continue
+                    query_windows = text_windows(tokenizer, query, settings.LOCAL_MODEL_MAX_TOKENS // 2)
+                    logits = []
+                    for query_window in query_windows:
+                        query_length = len(tokenizer(query_window, add_special_tokens=False)["input_ids"])
+                        windows = text_windows(tokenizer, passage, settings.LOCAL_MODEL_MAX_TOKENS - query_length - 4)
+                        raw = self._model.predict([[query_window, window] for window in windows],
+                            batch_size=1, show_progress_bar=False, convert_to_numpy=True,
+                            activation_fn=torch.nn.Identity())
+                        logits.extend(np.asarray(raw, dtype=float).reshape(-1).tolist())
+                    score = float(1.0 / (1.0 + np.exp(-np.clip(max(logits), -50, 50))))
+                    result.append(score)
+                    if len(query) + len(passage) <= 8192:
+                        self._local_cache[key] = score
+                        if len(self._local_cache) > 32:
+                            self._local_cache.popitem(last=False)
+            return result
 
         with torch.no_grad():
             raw_scores = self._model.predict(

@@ -2,6 +2,7 @@
  * API client abstraction for AI Tutor Assistant.
  * Centralizes all HTTP communication with the FastAPI backend.
  */
+import { API_BASE_URL } from "./config";
 
 export interface HealthStatus {
   status: string;
@@ -210,9 +211,6 @@ export class ApiError extends Error {
     this.data = data;
   }
 }
-
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "http://localhost:8000";
 
 async function request<T>(
   endpoint: string,
@@ -675,6 +673,7 @@ export const apiClient = {
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let terminalEventReceived = false;
 
     try {
       while (true) {
@@ -708,14 +707,19 @@ export const apiClient = {
             } else if (eventName === "token") {
               callbacks.onToken?.(data.token);
             } else if (eventName === "done") {
+              terminalEventReceived = true;
               callbacks.onDone?.(data);
             } else if (eventName === "error") {
+              terminalEventReceived = true;
               callbacks.onError?.(data.error);
             }
           } catch {
             // Ignore non-json data
           }
         }
+      }
+      if (!terminalEventReceived && !signal?.aborted) {
+        throw new ApiError("Stream ended before completion. Please retry.");
       }
     } catch (err: unknown) {
       if (signal?.aborted) {
@@ -724,7 +728,8 @@ export const apiClient = {
       const msg = err instanceof Error ? err.message : "Stream connection terminated unexpectedly";
       callbacks.onError?.(msg);
       throw err;
+    } finally {
+      reader.releaseLock();
     }
   },
 };
-

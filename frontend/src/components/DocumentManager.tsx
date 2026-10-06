@@ -20,6 +20,7 @@ import {
   Search,
 } from "lucide-react";
 import { apiClient, DocumentItem } from "@/lib/api";
+import { isDocumentProcessing } from "@/lib/document-status";
 import { useAuth } from "@/lib/auth-context";
 import { RetrievalInspectorModal } from "@/components/RetrievalInspectorModal";
 
@@ -87,10 +88,10 @@ export function DocumentManager({
   };
 
   // Fetch documents for the workspace
-  const fetchDocuments = useCallback(async () => {
+  const fetchDocuments = useCallback(async (background = false) => {
     if (!token || !workspaceId) return;
 
-    setIsLoading(true);
+    if (!background) setIsLoading(true);
     setError(null);
     try {
       const data = await apiClient.listDocuments(workspaceId, token);
@@ -102,7 +103,7 @@ export function DocumentManager({
       const msg = err instanceof Error ? err.message : "Failed to load documents";
       setError(msg);
     } finally {
-      setIsLoading(false);
+      if (!background) setIsLoading(false);
     }
   }, [token, workspaceId, onDocumentCountChange]);
 
@@ -112,16 +113,11 @@ export function DocumentManager({
 
   // Auto-poll document list if any document is currently processing, queued, or embedding
   useEffect(() => {
-    const hasActiveProcessing = documents.some(
-      (d) =>
-        d.status === "processing" ||
-        d.status === "uploaded" ||
-        d.embedding_status === "processing"
-    );
+    const hasActiveProcessing = documents.some(isDocumentProcessing);
     if (!hasActiveProcessing || !token || !workspaceId) return;
 
     const interval = setInterval(() => {
-      fetchDocuments();
+      fetchDocuments(true);
     }, 3000);
 
     return () => clearInterval(interval);
@@ -263,6 +259,17 @@ export function DocumentManager({
 
   // Render status badge
   const renderStatusBadge = (doc: DocumentItem) => {
+    if (doc.status === "queued") {
+      return (
+        <span
+          className="inline-flex items-center text-[10px] font-medium text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/40 px-1.5 py-0.5 rounded"
+          title={doc.processing_error ? "Queued for another ingestion attempt" : "Waiting for the ingestion worker; first model load may take longer"}
+        >
+          <Loader2 className="w-2.5 h-2.5 mr-1 animate-spin" />
+          Queued
+        </span>
+      );
+    }
     if (doc.status === "processing") {
       return (
         <span
@@ -465,7 +472,7 @@ export function DocumentManager({
         <div className="flex items-center justify-between px-1 mb-1 text-[11px] text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wider">
           <span>Files ({documents.length})</span>
           <button
-            onClick={fetchDocuments}
+            onClick={() => fetchDocuments()}
             disabled={isLoading}
             className="text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300 p-0.5 rounded transition-colors"
             title="Refresh document list"
