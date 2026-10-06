@@ -1,0 +1,15 @@
+.git
+.next
+node_modules
+.env*
+!.env.example
+**/__pycache__
+**/*.py[cod]
+.cache
+cache
+coverage
+dist
+out
+*.log
+*.tsbuildinfo
+tests

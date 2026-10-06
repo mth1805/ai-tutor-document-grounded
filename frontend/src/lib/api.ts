@@ -2,6 +2,7 @@
  * API client abstraction for AI Tutor Assistant.
  * Centralizes all HTTP communication with the FastAPI backend.
  */
+import { API_BASE_URL } from "./config";
 
 export interface HealthStatus {
   status: string;
@@ -211,14 +212,20 @@ export class ApiError extends Error {
   }
 }
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "http://localhost:8000";
-
 async function request<T>(
   endpoint: string,
   options: RequestInit = {},
   token?: string | null
 ): Promise<T> {
+  if (typeof window !== "undefined") {
+    const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+    if (!isLocal && API_BASE_URL.startsWith("http://localhost")) {
+      throw new ApiError(
+        `Production configuration error: Cannot connect to ${API_BASE_URL} from hosted domain (${window.location.origin}). NEXT_PUBLIC_API_BASE_URL must be set to your deployed HTTPS API.`
+      );
+    }
+  }
+
   const url = `${API_BASE_URL}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
 
   const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
@@ -640,6 +647,15 @@ export const apiClient = {
     callbacks: ChatStreamCallbacks,
     signal?: AbortSignal
   ): Promise<void> {
+    if (typeof window !== "undefined") {
+      const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+      if (!isLocal && API_BASE_URL.startsWith("http://localhost")) {
+        const err = `Production configuration error: Cannot connect to ${API_BASE_URL} from hosted domain (${window.location.origin}). NEXT_PUBLIC_API_BASE_URL must be set to your deployed HTTPS API.`;
+        callbacks.onError?.(err);
+        throw new ApiError(err);
+      }
+    }
+
     const url = `${API_BASE_URL}/api/v1/conversations/${conversationId}/chat`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -675,6 +691,7 @@ export const apiClient = {
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let terminalEventReceived = false;
 
     try {
       while (true) {
@@ -708,14 +725,19 @@ export const apiClient = {
             } else if (eventName === "token") {
               callbacks.onToken?.(data.token);
             } else if (eventName === "done") {
+              terminalEventReceived = true;
               callbacks.onDone?.(data);
             } else if (eventName === "error") {
+              terminalEventReceived = true;
               callbacks.onError?.(data.error);
             }
           } catch {
             // Ignore non-json data
           }
         }
+      }
+      if (!terminalEventReceived && !signal?.aborted) {
+        throw new ApiError("Stream ended before completion. Please retry.");
       }
     } catch (err: unknown) {
       if (signal?.aborted) {
@@ -724,7 +746,8 @@ export const apiClient = {
       const msg = err instanceof Error ? err.message : "Stream connection terminated unexpectedly";
       callbacks.onError?.(msg);
       throw err;
+    } finally {
+      reader.releaseLock();
     }
   },
 };
-

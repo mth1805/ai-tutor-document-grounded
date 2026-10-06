@@ -14,6 +14,7 @@ import {
   Moon,
 } from "lucide-react";
 import { apiClient } from "@/lib/api";
+import { API_BASE_URL } from "@/lib/config";
 import { useAuth } from "@/lib/auth-context";
 import { useTheme } from "@/lib/theme-context";
 
@@ -87,10 +88,10 @@ export function Header() {
           }`}
           title={
             backendStatus === "connected"
-              ? "FastAPI Backend is connected (/health: ok)"
+              ? `FastAPI Backend is connected (${API_BASE_URL}/health: ok)`
               : backendStatus === "checking"
-              ? "Checking backend connection..."
-              : "Backend unreachable. Ensure FastAPI server is running on port 8000."
+              ? `Checking backend connection (${API_BASE_URL})...`
+              : `Backend unreachable (${API_BASE_URL}). Ensure FastAPI backend is running and reachable.`
           }
         >
           {backendStatus === "connected" ? (
