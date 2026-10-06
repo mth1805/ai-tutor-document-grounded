@@ -1,4 +1,0 @@
--r requirements-cpu.in
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
-modal==1.6.1

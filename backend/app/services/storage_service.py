@@ -196,8 +196,9 @@ class StorageService:
                     res = await client.post(url, content=content, headers=headers)
                     if res.status_code not in (200, 201):
                         logger.error(
-                            "Supabase storage upload failed status=%s",
+                            "Supabase storage upload failed (%s): %s",
                             res.status_code,
+                            res.text,
                         )
                         raise HTTPException(
                             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -207,7 +208,7 @@ class StorageService:
             except HTTPException:
                 raise
             except Exception as e:
-                logger.error("Supabase Storage error category=%s", type(e).__name__)
+                logger.error("Supabase Storage error: %s", e)
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail="Failed to persist file in storage service",

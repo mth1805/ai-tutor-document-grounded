@@ -11,7 +11,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.observability import request_id_context
 from app.models.document import Document
 from app.models.message import Message
 from app.schemas.message import MessageCreate
@@ -47,42 +46,6 @@ WEB_FALLBACK_SYSTEM_INSTRUCTION = (
 
 class RAGService:
     """Orchestrates document-grounded answer generation with strict evidence gating."""
-
-    @staticmethod
-    def _emit_stage_metrics(
-        retrieval_response: RetrievalResponse,
-        *,
-        evidence_gate_decision: str,
-        evidence_gate_ms: float,
-        web_search_ms: float,
-        llm_ttft_ms: float | None,
-        generation_ms: float,
-        used_web_fallback: bool,
-        provider: Optional[BaseLLMProvider] = None,
-        total_request_latency_ms: float,
-    ) -> dict[str, Any]:
-        timings = retrieval_response.timings
-        metrics = {
-            "request_id": request_id_context.get(),
-            "retrieval_mode": retrieval_response.routing_path,
-            "evidence_gate_decision": evidence_gate_decision,
-            "used_web_fallback": used_web_fallback,
-            "model_provider": type(provider).__name__ if provider else None,
-            "model_selected": getattr(provider, "model_name", None) if provider else None,
-            "query_embedding_ms": timings.query_embedding_ms,
-            "dense_retrieval_ms": timings.dense_retrieval_ms,
-            "lexical_retrieval_ms": timings.lexical_retrieval_ms,
-            "rrf_ms": timings.rrf_ms,
-            "rerank_ms": timings.rerank_ms,
-            "evidence_gate_ms": round(evidence_gate_ms, 2),
-            "web_search_ms": round(web_search_ms, 2),
-            "llm_ttft_ms": round(llm_ttft_ms, 2) if llm_ttft_ms is not None else None,
-            "generation_ms": round(generation_ms, 2),
-            "total_retrieval_ms": timings.total_retrieval_ms,
-            "total_request_latency_ms": round(total_request_latency_ms, 2),
-        }
-        logger.info("chat_stage_metrics %s", json.dumps(metrics, separators=(",", ":")))
-        return metrics
 
     @classmethod
     async def resolve_document_names(
@@ -230,7 +193,6 @@ class RAGService:
         # Chunks passing Tier 1 but failing Tier 2 (QUALITY path only) are "related but
         # not answerable" — web fallback is the correct route. This decision is made from
         # retrieval scores alone, before any LLM call.
-        gate_started = time.perf_counter()
         is_quality_path = retrieval_response.routing_path == "QUALITY"
         top_rerank_score: float = max(
             (c.rerank_score for c in retrieval_response.results if c.rerank_score is not None),
@@ -247,8 +209,6 @@ class RAGService:
             and bool(retrieval_response.results)
             and tier2_passes
         )
-        evidence_gate_ms = (time.perf_counter() - gate_started) * 1000
-        web_search_ms = 0.0
 
         if not evidence_is_answerable:
             logger.info(
@@ -273,14 +233,12 @@ class RAGService:
                 yield f"event: status\ndata: {json.dumps({'status': 'web_search', 'message': 'Searching web...'})}\n\n"
 
                 # 1. Fetch web results from Tavily
-                web_search_started = time.perf_counter()
                 try:
                     web_search_provider = get_web_search_provider()
                     tavily_results: List[WebSearchResult] = await web_search_provider.search(
                         query=query,
                         max_results=settings.TAVILY_MAX_RESULTS,
                     )
-                    web_search_ms = (time.perf_counter() - web_search_started) * 1000
                     logger.info(
                         "[Phase 9] Tavily returned %d results for conv=%s",
                         len(tavily_results),
@@ -339,16 +297,12 @@ class RAGService:
                 # 4. Stream tokens from existing generate_stream() — NO native grounding
                 provider = llm_provider or get_llm_provider()
                 accumulated_tokens: List[str] = []
-                generation_started = time.perf_counter()
-                llm_ttft_ms = None
                 try:
                     async for token in provider.generate_stream(
                         prompt=web_prompt,
                         system_instruction=WEB_FALLBACK_SYSTEM_INSTRUCTION,
                     ):
                         if token:
-                            if llm_ttft_ms is None:
-                                llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
                             accumulated_tokens.append(token)
                             yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
                     logger.info(
@@ -367,7 +321,6 @@ class RAGService:
                     logger.error("[Phase 9] Unexpected error in web-grounded LLM streaming: %s", e, exc_info=True)
                     yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web-grounded response generation.'})}\n\n"
                     return
-                generation_ms = (time.perf_counter() - generation_started) * 1000
 
                 full_raw_text = "".join(accumulated_tokens).strip()
                 if not full_raw_text:
@@ -395,17 +348,6 @@ class RAGService:
                 )
 
                 total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
-                stage_metrics = cls._emit_stage_metrics(
-                    retrieval_response,
-                    evidence_gate_decision="insufficient",
-                    evidence_gate_ms=evidence_gate_ms,
-                    web_search_ms=web_search_ms,
-                    llm_ttft_ms=llm_ttft_ms,
-                    generation_ms=generation_ms,
-                    used_web_fallback=True,
-                    provider=provider,
-                    total_request_latency_ms=total_elapsed_ms,
-                )
                 logger.info(
                     "[Phase 9] Tavily-grounded generation completed in %.2fms: %d web sources, msg=%s",
                     total_elapsed_ms,
@@ -422,7 +364,6 @@ class RAGService:
                     "used_web_fallback": True,
                     "routing_path": retrieval_response.routing_path,
                     "total_elapsed_ms": total_elapsed_ms,
-                    "stage_metrics": stage_metrics,
                 }
                 yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
                 return
@@ -440,17 +381,6 @@ class RAGService:
                 data=MessageCreate(role="assistant", content=fallback_text, citations=[]),
             )
 
-            total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
-            stage_metrics = cls._emit_stage_metrics(
-                retrieval_response,
-                evidence_gate_decision="insufficient",
-                evidence_gate_ms=evidence_gate_ms,
-                web_search_ms=web_search_ms,
-                llm_ttft_ms=None,
-                generation_ms=0,
-                used_web_fallback=False,
-                total_request_latency_ms=total_elapsed_ms,
-            )
             done_payload = {
                 "message_id": str(asst_msg.id),
                 "content": fallback_text,
@@ -458,8 +388,7 @@ class RAGService:
                 "web_sources": [],
                 "has_sufficient_evidence": False,
                 "routing_path": retrieval_response.routing_path,
-                "total_elapsed_ms": total_elapsed_ms,
-                "stage_metrics": stage_metrics,
+                "total_elapsed_ms": round((time.perf_counter() - t_start) * 1000, 2),
             }
             yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
             return
@@ -487,8 +416,6 @@ class RAGService:
         # 9. Invoke LLM streaming
         provider = llm_provider or get_llm_provider()
         accumulated_tokens: List[str] = []
-        generation_started = time.perf_counter()
-        llm_ttft_ms = None
 
         try:
             async for token in provider.generate_stream(
@@ -496,8 +423,6 @@ class RAGService:
                 system_instruction=assembled.system_instruction,
             ):
                 if token:
-                    if llm_ttft_ms is None:
-                        llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
                     accumulated_tokens.append(token)
                     yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
         except LLMError as le:
@@ -508,7 +433,6 @@ class RAGService:
             logger.error("Unexpected error during LLM streaming: %s", e, exc_info=True)
             yield f"event: error\ndata: {json.dumps({'error': 'An error occurred during response generation.'})}\n\n"
             return
-        generation_ms = (time.perf_counter() - generation_started) * 1000
 
         full_raw_text = "".join(accumulated_tokens).strip()
 
@@ -532,17 +456,6 @@ class RAGService:
         )
 
         total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
-        stage_metrics = cls._emit_stage_metrics(
-            retrieval_response,
-            evidence_gate_decision="sufficient",
-            evidence_gate_ms=evidence_gate_ms,
-            web_search_ms=web_search_ms,
-            llm_ttft_ms=llm_ttft_ms,
-            generation_ms=generation_ms,
-            used_web_fallback=False,
-            provider=provider,
-            total_request_latency_ms=total_elapsed_ms,
-        )
         logger.info(
             "RAG generation completed successfully in %.2fms: %d citations, msg=%s",
             total_elapsed_ms,
@@ -558,7 +471,6 @@ class RAGService:
             "has_sufficient_evidence": True,
             "routing_path": retrieval_response.routing_path,
             "total_elapsed_ms": total_elapsed_ms,
-            "stage_metrics": stage_metrics,
         }
         yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
 

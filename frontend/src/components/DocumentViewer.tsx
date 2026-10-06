@@ -19,7 +19,6 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { DocumentItem, apiClient } from "@/lib/api";
-import { API_BASE_URL } from "@/lib/config";
 import { useAuth } from "@/lib/auth-context";
 import { DocumentManager } from "@/components/DocumentManager";
 
@@ -101,9 +100,13 @@ export function DocumentViewer({
       const category = getFileCategory(document);
 
       try {
+        const apiUrl =
+          process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ||
+          "http://localhost:8000";
+
         // Fetch document bytes with verified Bearer token
         const res = await fetch(
-          `${API_BASE_URL}/api/v1/documents/${document.id}/download`,
+          `${apiUrl}/api/v1/documents/${document.id}/download`,
           {
             headers: {
               Authorization: `Bearer ${token}`,

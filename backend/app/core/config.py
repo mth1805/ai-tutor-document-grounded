@@ -1,9 +1,8 @@
 from typing import List, Union
 from pathlib import Path
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
-from pydantic import model_validator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -18,9 +17,6 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     # Fail closed when deploy-time environment configuration is omitted.
     ENVIRONMENT: str = "production"
-    LOG_LEVEL: str = "INFO"
-    REQUEST_TIMEOUT_SECONDS: float = 120.0
-    MAX_REQUEST_BODY_BYTES: int = 27_000_000
 
     # CORS configuration
     BACKEND_CORS_ORIGINS: List[str] = [
@@ -42,16 +38,11 @@ class Settings(BaseSettings):
     # Supabase credentials (server-side)
     SUPABASE_URL: str | None = None
     SUPABASE_ANON_KEY: str | None = None
-    SUPABASE_DB_URL: str | None = None
     SUPABASE_SERVICE_ROLE_KEY: str | None = None
     SUPABASE_JWT_SECRET: str | None = None
-    SUPABASE_AUTH_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=60)
 
     # PostgreSQL Database URL (Supabase PostgreSQL / asyncpg)
     DATABASE_URL: str | None = None
-    DB_POOL_SIZE: int = 5
-    DB_MAX_OVERFLOW: int = 5
-    DB_POOL_TIMEOUT_SECONDS: float = 30.0
     # Optional integration-test database; server-side secret, never client exposed.
     RLS_TEST_DATABASE_URL: str | None = None
 
@@ -74,9 +65,6 @@ class Settings(BaseSettings):
     EMBEDDING_NORMALIZE: bool = True
     AUTO_EMBED_AFTER_INGESTION: bool = True
     PREWARM_MODELS: bool = False
-    LOCAL_SHARED_MODELS: bool = False
-    LOCAL_MODEL_API_URL: str = "http://backend:8000"
-    LOCAL_MODEL_MAX_TOKENS: int = Field(default=512, ge=128, le=1024)
 
     # Phase 7: Hybrid Retrieval + Cross-Encoder Reranking configuration
     DENSE_TOP_K: int = 25
@@ -99,7 +87,7 @@ class Settings(BaseSettings):
     # Phase 8: LLM Provider and Grounded Generation
     LLM_PROVIDER: str = "gemini"  # gemini | mock
     GEMINI_API_KEY: str | None = None
-    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
     GEMINI_THINKING_LEVEL: str = "medium"
     LLM_MAX_OUTPUT_TOKENS: int = 2048
     LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
@@ -122,37 +110,6 @@ class Settings(BaseSettings):
     TAVILY_MAX_RESULTS: int = 5
     # Timeout in seconds for a single Tavily HTTP request
     WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
-
-    @model_validator(mode="after")
-    def validate_production_configuration(self):
-        """Fail early for missing production settings while keeping local startup flexible."""
-        if self.LOCAL_SHARED_MODELS and self.ENVIRONMENT.lower() != "development":
-            raise ValueError("LOCAL_SHARED_MODELS is restricted to development")
-        if self.ENVIRONMENT.lower() in {"production", "prod"}:
-            missing = []
-            if not self.SUPABASE_URL:
-                missing.append("SUPABASE_URL")
-            if not self.SUPABASE_ANON_KEY:
-                missing.append("SUPABASE_ANON_KEY")
-            if not (self.SUPABASE_DB_URL or self.DATABASE_URL):
-                missing.append("SUPABASE_DB_URL (or DATABASE_URL)")
-            if self.LLM_PROVIDER == "gemini" and not self.GEMINI_API_KEY:
-                missing.append("GEMINI_API_KEY")
-            if self.WEB_SEARCH_FALLBACK_ENABLED and not self.TAVILY_API_KEY:
-                missing.append("TAVILY_API_KEY")
-            if not self.BACKEND_CORS_ORIGINS:
-                missing.append("BACKEND_CORS_ORIGINS")
-            if missing:
-                raise ValueError("Missing required production configuration: " + ", ".join(missing))
-            if any(origin.strip() == "*" for origin in self.BACKEND_CORS_ORIGINS):
-                raise ValueError("Wildcard CORS origins are not allowed in production")
-            if any("localhost" in origin or "127.0.0.1" in origin for origin in self.BACKEND_CORS_ORIGINS):
-                raise ValueError("Production CORS must use explicit deployed frontend origins")
-        return self
-
-    @property
-    def resolved_database_url(self) -> str | None:
-        return self.SUPABASE_DB_URL or self.DATABASE_URL
 
 
 
