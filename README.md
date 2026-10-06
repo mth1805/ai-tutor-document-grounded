@@ -1,5 +1,7 @@
 # AI Tutor Assistant
 
+For frontend deployment preparation and manual Vercel settings, see [Vercel deployment guide](docs/vercel-deployment.md). FastAPI remains on Modal; use `frontend/.env.example` for browser-safe configuration.
+
 AI Tutor Assistant is an enterprise-grade, document-grounded AI learning assistant designed to help users learn directly from their uploaded documents (PDF/DOCX) organized into private workspaces.
 
 ---
@@ -85,11 +87,12 @@ c:/2_AITutor/
 Copy `.env.example` to configure your environment:
 ```bash
 cp .env.example .env
+cp frontend/.env.example frontend/.env.local
 ```
 
 | Variable | Description | Target |
 |---|---|---|
-| `NEXT_PUBLIC_API_URL` | Base URL for FastAPI backend (default: `http://localhost:8000`) | Frontend Browser |
+| `NEXT_PUBLIC_API_BASE_URL` | FastAPI origin; development default `http://localhost:8000`, required HTTPS origin on Vercel | Frontend Browser |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project API URL | Frontend Browser |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Public anonymous Supabase key | Frontend Browser |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase privileged service role key (NEVER expose to frontend) | Backend Server |
@@ -101,6 +104,16 @@ The FastAPI database dependency binds each SQLAlchemy transaction to the verifie
 ---
 
 ## 5. Local Setup & Running Instructions
+
+### One-command Docker demo
+
+Copy `.env.example` to `.env`, then start both local services from the repository root:
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:3000`; the browser calls `http://localhost:8000`. Stop the full stack with `docker compose down`. Compose starts frontend, backend, and the CPU ingestion worker automatically; no extra worker terminal is needed. Supabase remains managed/cloud. Root `.env` holds backend/worker Dev runtime settings, while frontend build arguments contain only browser-safe API/Supabase values. Models persist in a named Docker volume, so first model load may take longer but restarts reuse downloads. Placeholder auth values cannot provide a usable authenticated demo. Complete the one-time manual Dev migration/configuration in [local Docker runtime guide](docs/local-docker-runtime.md) before the first upload; never use a service-role key in the frontend.
 
 ### Phase 5 ingestion runtime dependencies
 
@@ -125,7 +138,7 @@ For local development, install the system executables and OCR language data befo
    ```
 3. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements-dev.txt
    ```
 4. Start the FastAPI development server:
    ```bash
