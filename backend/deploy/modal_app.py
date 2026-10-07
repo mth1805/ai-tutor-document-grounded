@@ -97,11 +97,11 @@ def poll_ingestion_queue():
 
 
 @app.function(
-    image=gpu_image,
+    image=image, #gpu_image
     secrets=secrets,
     cpu=float(os.getenv("MODAL_INGESTION_CPU", "4")),
     memory=int(os.getenv("MODAL_INGESTION_MEMORY_MB", "12288")),
-    gpu=INGESTION_GPU,
+    #gpu=INGESTION_GPU,
     volumes={"/models": MODEL_CACHE_VOLUME},
     timeout=1800,
     scaledown_window=300,
@@ -109,7 +109,8 @@ def poll_ingestion_queue():
 def process_ingestion_job(job_id: str):
     """Process a single durable job; GPU is allocated only to this worker function."""
     # Set worker-only options before importing Settings; API/poller stay on CPU.
-    os.environ["EMBEDDING_DEVICE"] = "cuda"
+    #os.environ["EMBEDDING_DEVICE"] = "cuda"
+    os.environ["EMBEDDING_DEVICE"] = "cpu"
     # Match HF_HOME's normal hub subdirectory so CPU/GPU workers share weights.
     os.environ["EMBEDDING_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
     os.environ["AUTO_EMBED_AFTER_INGESTION"] = "true"
