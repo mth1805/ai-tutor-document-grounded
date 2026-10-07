@@ -59,6 +59,8 @@ class BGEEmbeddingProvider(BaseEmbeddingProvider):
         req = requested_device.lower().strip()
 
         if req == "auto":
+            if not cuda_available:
+                logger.warning("embedding_cpu_fallback requested_device=auto cuda_available=false")
             return "cuda" if cuda_available else "cpu"
         elif req.startswith("cuda"):
             if not cuda_available:

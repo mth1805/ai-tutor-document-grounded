@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { User, Session } from "@supabase/supabase-js";
 import { createClient, isSupabaseConfigured } from "@/lib/supabase/client";
+import { friendlyAuthError } from "@/lib/auth-messages";
 
 interface AuthUser {
   id: string;
@@ -96,7 +97,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) {
           setIsLoading(false);
-          return { error: error.message };
+          return { error: friendlyAuthError(error) };
         }
         return {};
       } else {
@@ -132,7 +133,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // Email-confirmation signups may return no session/auth event.
         setIsLoading(false);
         if (error) {
-          return { error: error.message };
+          return { error: friendlyAuthError(error) };
         }
         return {};
       } else {

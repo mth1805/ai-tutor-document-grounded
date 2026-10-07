@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import {
   FileText,
   Download,
@@ -18,10 +18,11 @@ import {
   Check,
   ChevronDown,
 } from "lucide-react";
-import { DocumentItem, apiClient } from "@/lib/api";
+import { DocumentItem } from "@/lib/api";
 import { API_BASE_URL } from "@/lib/config";
 import { useAuth } from "@/lib/auth-context";
 import { DocumentManager } from "@/components/DocumentManager";
+import { downloadOriginalDocument } from "@/lib/document-download";
 
 interface DocumentViewerProps {
   workspaceId: string;
@@ -42,6 +43,7 @@ export function DocumentViewer({
   const [error, setError] = useState<string | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [textContent, setTextContent] = useState<string | null>(null);
+  const [previewMime, setPreviewMime] = useState("");
 
   // Image zoom state
   const [imageZoom, setImageZoom] = useState<number>(100);
@@ -85,6 +87,7 @@ export function DocumentViewer({
     if (!document || !token) {
       setObjectUrl(null);
       setTextContent(null);
+      setPreviewMime("");
       setIsLoading(false);
       return;
     }
@@ -97,13 +100,15 @@ export function DocumentViewer({
       setError(null);
       setImageZoom(100);
       setTextContent(null);
+      setObjectUrl(null);
+      setPreviewMime("");
 
       const category = getFileCategory(document);
 
       try {
         // Fetch document bytes with verified Bearer token
         const res = await fetch(
-          `${API_BASE_URL}/api/v1/documents/${document.id}/download`,
+          `${API_BASE_URL}/api/v1/documents/${document.id}/${category === "word" ? "preview" : "download"}`,
           {
             headers: {
               Authorization: `Bearer ${token}`,
@@ -120,8 +125,9 @@ export function DocumentViewer({
 
         localBlobUrl = URL.createObjectURL(blob);
         setObjectUrl(localBlobUrl);
+        setPreviewMime(blob.type);
 
-        if (category === "txt") {
+        if (category === "txt" || blob.type.startsWith("text/plain")) {
           const text = await blob.text();
           if (isMounted) setTextContent(text);
         }
@@ -157,17 +163,9 @@ export function DocumentViewer({
   const handleDownload = async () => {
     if (!document || !token) return;
     try {
-      const res = await apiClient.getDocumentDownloadUrl(document.id, token);
-      if (res.download_url) {
-        window.open(res.download_url, "_blank", "noopener,noreferrer");
-      }
+      await downloadOriginalDocument(document.id, document.original_filename, token);
     } catch {
-      if (objectUrl) {
-        const a = window.document.createElement("a");
-        a.href = objectUrl;
-        a.download = document.original_filename;
-        a.click();
-      }
+      setError("Unable to download the original document. Please try again.");
     }
   };
 
@@ -282,7 +280,7 @@ export function DocumentViewer({
           </button>
 
           {/* Open in new window if objectUrl exists */}
-          {objectUrl && category !== "word" && (
+          {objectUrl && (
             <button
               onClick={() => window.open(objectUrl, "_blank")}
               className="p-1.5 text-slate-500 hover:text-brand-600 dark:text-slate-400 dark:hover:text-brand-300 rounded hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
@@ -326,7 +324,7 @@ export function DocumentViewer({
               Try Direct Download
             </button>
           </div>
-        ) : category === "pdf" && objectUrl ? (
+        ) : (category === "pdf" || previewMime === "application/pdf") && objectUrl ? (
           /* PDF Preview: Embedded Sandbox Viewer (Preserving native document legibility) */
           <div className="w-full h-full rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-inner">
             <iframe
@@ -346,7 +344,7 @@ export function DocumentViewer({
               className="rounded-lg shadow-md dark:shadow-xl object-contain transition-all duration-150"
             />
           </div>
-        ) : category === "txt" && textContent !== null ? (
+        ) : textContent !== null ? (
           /* Text Preview: Scrollable Code/Document Reader */
           <div className="w-full h-full overflow-y-auto bg-white dark:bg-slate-950 rounded-lg border border-slate-200 dark:border-slate-800/80 p-4 shadow-inner font-mono text-xs text-slate-800 dark:text-slate-200 select-text leading-relaxed">
             <pre className="whitespace-pre-wrap break-words">{textContent}</pre>
@@ -368,9 +366,9 @@ export function DocumentViewer({
             </div>
 
             <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed text-left space-y-1">
-              <div className="font-semibold text-slate-800 dark:text-slate-300">Phase 4 Notice:</div>
+              <div className="font-semibold text-slate-800 dark:text-slate-300">Preview unavailable</div>
               <p>
-                Word files are persistently stored in private storage. Full document parsing, structure extraction, and text chunking will activate in Phase 5.
+                Download the original document to view its content.
               </p>
             </div>
 

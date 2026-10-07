@@ -1,4 +1,5 @@
 import uuid
+from urllib.parse import quote
 from typing import List
 from fastapi import (
     APIRouter,
@@ -26,9 +27,33 @@ from app.services.document_service import DocumentService
 from app.services.storage_service import StorageService
 from app.services.ingestion_service import IngestionService
 from app.services.embedding_service import EmbeddingService
+from app.services.document_preview import get_preview_content
 from app.core.config import settings
 
 router = APIRouter(tags=["documents"])
+
+
+def content_disposition(filename: str, disposition: str = "attachment") -> str:
+    from app.services.storage_service import sanitize_filename
+    name = sanitize_filename(filename)
+    fallback = name.encode("ascii", "ignore").decode().replace('"', "_").replace("\\", "_") or "document"
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+
+
+@router.get("/documents/{document_id}/preview", summary="Preview Private Document")
+async def preview_document(
+    document_id: uuid.UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    preview = await get_preview_content(db, document_id, current_user.id)
+    if preview is None:
+        raise HTTPException(404, "Document file not found or unauthorized")
+    content, mime, name = preview
+    return Response(content, media_type=mime, headers={
+        "Content-Disposition": content_disposition(name, "inline"),
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.post(
@@ -168,8 +193,9 @@ async def download_document(
         content=content,
         media_type=doc.mime_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{doc.original_filename}"',
-            "Cache-Control": "private, max-age=3600",
+            "Content-Disposition": content_disposition(doc.original_filename),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 

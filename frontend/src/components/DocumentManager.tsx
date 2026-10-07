@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { apiClient, DocumentItem } from "@/lib/api";
 import { isDocumentProcessing } from "@/lib/document-status";
+import { downloadOriginalDocument } from "@/lib/document-download";
 import { useAuth } from "@/lib/auth-context";
 import { RetrievalInspectorModal } from "@/components/RetrievalInspectorModal";
 
@@ -207,10 +208,7 @@ export function DocumentManager({
     if (!token) return;
 
     try {
-      const res = await apiClient.getDocumentDownloadUrl(docId, token);
-      if (res.download_url) {
-        window.open(res.download_url, "_blank", "noopener,noreferrer");
-      }
+      await downloadOriginalDocument(docId, docName, token);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to get download URL";
       setError(msg);
