@@ -2,6 +2,7 @@
 import uuid
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, field_validator
+from app.schemas.math_solver import SolverMetadata
 
 
 class ChatRequest(BaseModel):
@@ -39,3 +40,4 @@ class ChatResponse(BaseModel):
     content: str
     citations: List[Dict[str, Any]] = Field(default_factory=list)
     has_sufficient_evidence: bool = True
+    solver: Optional[SolverMetadata] = None

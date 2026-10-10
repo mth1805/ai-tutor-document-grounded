@@ -3,6 +3,7 @@
 LLM token streaming, citation extraction, and message persistence.
 """
 import json
+import asyncio
 import logging
 import time
 import uuid
@@ -25,6 +26,11 @@ from app.rag.citation_service import CitationService, Citation, WebCitation
 from app.web_search import get_web_search_provider, WebSearchProvider
 from app.web_search.base import WebSearchResult
 from app.web_search.exceptions import WebSearchError
+from app.schemas.math_solver import MathSolverResult, SolverMetadata
+from app.tools.math_solver import MathSolver
+from app.tools.math_task_parser import MathTaskParser
+from app.tools.solver_router import SolverRouter
+from app.tools.math_presentation import generate_guidance, verified_final
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +256,40 @@ class RAGService:
         evidence_gate_ms = (time.perf_counter() - gate_started) * 1000
         web_search_ms = 0.0
 
-        if not evidence_is_answerable:
+        # Phase 9.1: retrieval and existing evidence gates always precede tools.
+        # Document references can only use relevant uploaded-document statements.
+        solver_result = None
+        solver_metadata = None
+        solver_used = False
+        intent = SolverRouter.route(query)
+        if intent == "math_problem":
+            solver_started = time.perf_counter()
+            task = None
+            source = "retrieved_document" if SolverRouter.is_document_reference(query) else "user_question"
+            try:
+                if source == "retrieved_document":
+                    if not evidence_is_answerable:
+                        raise ValueError("No answerable exercise evidence")
+                    task = await asyncio.to_thread(MathTaskParser.from_retrieved, query, retrieval_response.results)
+                else:
+                    task = await asyncio.to_thread(MathTaskParser.parse, query)
+                solver_used = True
+                solver_result = await MathSolver.execute(task, settings.MATH_SOLVER_TIMEOUT_SECONDS)
+            except Exception as exc:
+                solver_result = MathSolverResult(
+                    success=False, problem_type=task.operation if task else None,
+                    error="Calculation verification was unavailable. Please provide the complete exercise and variable.",
+                    error_type=type(exc).__name__,
+                )
+            solver_metadata = SolverMetadata(used=solver_used, operation=solver_result.problem_type, verified=solver_result.success)
+            logger.info("solver_execution %s", json.dumps({
+                "solver_intent": intent, "solver_operation": solver_result.problem_type,
+                "solver_used": solver_used, "solver_success": solver_result.success,
+                "solver_duration_ms": round((time.perf_counter() - solver_started) * 1000, 2),
+                "solver_source": source, "solver_error_type": solver_result.error_type,
+            }, separators=(",", ":")))
+
+        if not evidence_is_answerable and solver_result is None:
             logger.info(
                 "Insufficient/non-answerable document evidence for query in conv %s "
                 "(route=%s, has_evidence=%s, top_rerank=%.4f, answerable_threshold=%.4f, "
@@ -465,10 +504,16 @@ class RAGService:
             return
 
         # 7. Resolve real document names for chunks that passed relevance gate
-        passed_chunks = [c for c in retrieval_response.results if c.passed_relevance_gate]
-        if not passed_chunks:
+        passed_chunks = [c for c in retrieval_response.results if c.passed_relevance_gate] if evidence_is_answerable else []
+        if not passed_chunks and evidence_is_answerable:
             # Fallback to top ranked chunk if none passed explicitly
             passed_chunks = retrieval_response.results[:settings.RERANK_TOP_K]
+
+        if solver_result is not None and solver_result.success and task is not None and task.source_chunk_ids:
+            passed_chunks = [chunk for chunk in passed_chunks if chunk.chunk_id in task.source_chunk_ids]
+        elif solver_result is not None and task is None and source == "retrieved_document":
+            # Do not let an adjacent exercise stand in for the requested one.
+            passed_chunks = []
 
         doc_ids = {c.document_id for c in passed_chunks}
         doc_names = await cls.resolve_document_names(db, doc_ids, user_id)
@@ -480,6 +525,10 @@ class RAGService:
             document_names=doc_names,
             chat_mode=chat_mode,
             conversation_history=history_list,
+            solver_result=solver_result,
+            solver_used=solver_used,
+            solver_operation=solver_result.problem_type if solver_result else None,
+            solver_verified=solver_result.success if solver_result else False,
         )
 
         yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating grounded answer...'})}\n\n"
@@ -490,11 +539,24 @@ class RAGService:
         generation_started = time.perf_counter()
         llm_ttft_ms = None
 
-        try:
+        async def response_tokens():
+            if solver_result is not None and solver_result.success and chat_mode != ChatMode.FULL_SOLUTION:
+                # Hint-only output is enforced before any token reaches the client.
+                yield await generate_guidance(provider, assembled, solver_result, chat_mode, query)
+                return
+            if solver_result is not None and not solver_result.success:
+                yield "Calculation verification was unavailable. "
             async for token in provider.generate_stream(
-                prompt=assembled.prompt,
-                system_instruction=assembled.system_instruction,
+                prompt=assembled.prompt, system_instruction=assembled.system_instruction,
             ):
+                yield token
+            if solver_result is not None and solver_result.success:
+                yield "\n\n" + verified_final(solver_result)
+                if solver_result.notes:
+                    yield "\n" + " ".join(solver_result.notes)
+
+        try:
+            async for token in response_tokens():
                 if token:
                     if llm_ttft_ms is None:
                         llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
@@ -534,7 +596,7 @@ class RAGService:
         total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
         stage_metrics = cls._emit_stage_metrics(
             retrieval_response,
-            evidence_gate_decision="sufficient",
+            evidence_gate_decision="sufficient" if evidence_is_answerable else "insufficient",
             evidence_gate_ms=evidence_gate_ms,
             web_search_ms=web_search_ms,
             llm_ttft_ms=llm_ttft_ms,
@@ -555,11 +617,13 @@ class RAGService:
             "message_id": str(asst_msg.id),
             "content": normalized_content,
             "citations": citations_payload,
-            "has_sufficient_evidence": True,
+            "has_sufficient_evidence": evidence_is_answerable,
             "routing_path": retrieval_response.routing_path,
             "total_elapsed_ms": total_elapsed_ms,
             "stage_metrics": stage_metrics,
         }
+        if solver_metadata is not None:
+            done_payload["solver"] = solver_metadata.model_dump()
         yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
 
     @classmethod
@@ -578,6 +642,7 @@ class RAGService:
         citations: List[Dict[str, Any]] = []
         message_id: Optional[str] = None
         has_evidence = False
+        solver_metadata = None
 
         async for event_chunk in cls.stream_chat(
             db=db,
@@ -599,6 +664,7 @@ class RAGService:
                             full_text = data.get("content", full_text)
                             citations = data.get("citations", [])
                             has_evidence = data.get("has_sufficient_evidence", False)
+                            solver_metadata = data.get("solver")
                         elif "error" in data:
                             raise RuntimeError(data["error"])
                     except json.JSONDecodeError:
@@ -609,4 +675,5 @@ class RAGService:
             "content": full_text,
             "citations": citations,
             "has_sufficient_evidence": has_evidence,
+            "solver": solver_metadata,
         }

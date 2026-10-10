@@ -126,4 +126,5 @@ async def sync_chat_message(
         content=result.get("content", ""),
         citations=result.get("citations", []),
         has_sufficient_evidence=result.get("has_sufficient_evidence", True),
+        solver=result.get("solver"),
     )

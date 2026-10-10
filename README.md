@@ -2,6 +2,10 @@
 
 For frontend deployment preparation and manual Vercel settings, see [Vercel deployment guide](docs/vercel-deployment.md). FastAPI remains on Modal; use `frontend/.env.example` for browser-safe configuration.
 
+For verified symbolic mathematics, see [Phase 9.1 — Verified Math Solver](docs/phase9_1_verified_math_solver.md).
+
+For Word equation extraction, readable preview fallback, and the collapsible navigation sidebar, see [DOCX equations and sidebar controls](docs/docx-equations-sidebar.md).
+
 AI Tutor Assistant is an enterprise-grade, document-grounded AI learning assistant designed to help users learn directly from their uploaded documents (PDF/DOCX) organized into private workspaces.
 
 ---
@@ -303,8 +307,14 @@ Phase 6 implements dense semantic vector embeddings for chunked learning materia
 
 - The device is resolved automatically via `EMBEDDING_DEVICE`:
   - `auto`: Uses CUDA if `torch.cuda.is_available()` is True; otherwise falls back gracefully to CPU.
-  - `cpu`: Forces CPU execution.
+  - `cpu` (default): Forces CPU execution; local Docker also sets this explicitly.
   - `cuda`: Uses CUDA if available; if requested but unavailable, logs a warning and falls back to CPU without breaking the server or tests.
+
+Modal also defaults to CPU. Set `MODAL_INGESTION_GPU=T4` or `MODAL_INGESTION_GPU=L4`
+in the deployment launcher's environment to opt only the ingestion worker into
+the GPU image and CUDA embedding. An absent, empty, or whitespace-only value
+selects the CPU image and CPU embedding. FastAPI and the queue poller stay on CPU;
+this Modal setting does not change local Docker. See [compute-device configuration](docs/deployment.md#compute-device-modes).
 
 ### Database Schema & pgvector HNSW Index
 
@@ -349,7 +359,7 @@ Migration file: `supabase/migrations/20261001060000_bge_m3_pgvector_embeddings.s
 | `EMBEDDING_MODEL_NAME` | String | `BAAI/bge-m3` | Hugging Face model identifier for dense embeddings. |
 | `EMBEDDING_DIMENSION` | Integer | `1024` | Vector dimensionality matching the embedding model. |
 | `EMBEDDING_BATCH_SIZE` | Integer | `16` | Micro-batch size for chunk encoding to prevent OOM. |
-| `EMBEDDING_DEVICE` | String | `auto` | Target compute device (`auto`, `cpu`, `cuda`). |
+| `EMBEDDING_DEVICE` | String | `cpu` | Target compute device (`auto`, `cpu`, `cuda`). |
 | `EMBEDDING_MODEL_CACHE_DIR` | Path | `None` | Optional custom persistent local directory for cached weights. |
 | `EMBEDDING_NORMALIZE` | Boolean | `True` | L2-normalizes vectors for cosine distance indexing. |
 | `AUTO_EMBED_AFTER_INGESTION` | Boolean | `True` | Automatically triggers embedding after successful Phase 5 chunking. |
@@ -415,7 +425,7 @@ User Query
 - **Zero In-Request Instantiation:** Cross-Encoder models are loaded once per backend process as a thread-safe singleton (`get_reranker_provider()`).
 - **Persistent Local Cache:** Weights are stored in `RERANKER_MODEL_CACHE_DIR` or `EMBEDDING_MODEL_CACHE_DIR`. Server restarts reuse cached weights without re-downloading.
 - **Multilingual Support:** Defaults to `BAAI/bge-reranker-base`, providing high-accuracy ranking across English and Vietnamese educational materials.
-- **Device Fallback:** Automatically selects CUDA if available, falling back cleanly to CPU with memory-safe `torch.no_grad()` and `.eval()` mode.
+- **Device Fallback:** Defaults to CPU; explicit `auto` or `cuda` settings retain safe CPU fallback when CUDA is unavailable, with memory-safe `torch.no_grad()` and `.eval()` mode.
 - **Non-Blocking Inference:** CPU/GPU-bound tokenization and model inference are offloaded via `run_in_threadpool`.
 
 ### Database Schema & Migration (BM25 FTS)
@@ -443,7 +453,7 @@ Migration file: `supabase/migrations/20261001070000_document_chunks_fts_bm25.sql
 | `CANDIDATE_POOL_SIZE` | Integer | `30` | Number of candidate chunks preserved after RRF before reranking. |
 | `RERANKER_MODEL_NAME` | String | `BAAI/bge-reranker-base` | Multilingual Cross-Encoder model. |
 | `RERANKER_BATCH_SIZE` | Integer | `16` | Micro-batch size for Cross-Encoder inference. |
-| `RERANKER_DEVICE` | String | `auto` | Compute device (`auto`, `cpu`, `cuda`). |
+| `RERANKER_DEVICE` | String | `cpu` | Compute device (`auto`, `cpu`, `cuda`). |
 | `RERANK_TOP_K` | Integer | `5` | Final top-K ranked evidence chunks returned. |
 | `RELEVANCE_THRESHOLD` | Float | `0.35` | Minimum reranker score required to pass relevance gate. |
 | `USE_MOCK_RERANKER` | Boolean | `False` | Forces deterministic MockRerankerProvider in tests. |

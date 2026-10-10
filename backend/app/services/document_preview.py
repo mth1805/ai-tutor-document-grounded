@@ -1,9 +1,13 @@
 """Private, temporary Word previews. No preview artifacts are stored persistently."""
 import logging
+import io
+import re
 import shutil
 import subprocess
 import tempfile
 import uuid
+import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 from fastapi import HTTPException
@@ -27,14 +31,23 @@ async def get_preview_content(
     mime, name = doc.mime_type, doc.original_filename
     if Path(name).suffix.lower() in {".doc", ".docx"}:
         try:
-            content = await run_in_threadpool(convert_word_to_pdf, content, name)
+            preview = await run_in_threadpool(convert_word_to_verified_pdf, content, name)
+            content = preview
             mime, name = "application/pdf", str(Path(name).with_suffix(".pdf"))
         except Exception as exc:
             logger.warning("word_preview_conversion_failed document_id=%s category=%s", document_id, type(exc).__name__)
-            # Old DOC uploads remain readable from owner-scoped persisted chunks
-            # even when LibreOffice is unavailable.
-            chunks = await IngestionService.list_document_chunks(db, document_id, user_id)
-            text = "\n\n".join(chunk.content for chunk in (chunks or []))
+            # DOCX fallback must read the original: older persisted chunks may
+            # have omitted equations. Legacy DOC can still use scoped chunks
+            # when LibreOffice is unavailable.
+            text = ""
+            if Path(doc.original_filename).suffix.lower() == ".docx":
+                try:
+                    text = await run_in_threadpool(extract_word_text, content, doc.original_filename)
+                except Exception:
+                    logger.warning("word_preview_text_failed document_id=%s", document_id)
+            else:
+                chunks = await IngestionService.list_document_chunks(db, document_id, user_id)
+                text = "\n\n".join(chunk.content for chunk in (chunks or []))
             if not text:
                 try:
                     text = await run_in_threadpool(extract_word_text, content, doc.original_filename)
@@ -43,6 +56,38 @@ async def get_preview_content(
             content = text.encode("utf-8")
             mime, name = "text/plain", str(Path(name).with_suffix(".txt"))
     return content, mime, name
+
+
+def convert_word_to_verified_pdf(content: bytes, filename: str) -> bytes:
+    """Try native conversion; require readable equation evidence for DOCX math.
+
+    PDF text cannot reliably prove stacked mathematical layout. A conservative
+    failed check uses the existing readable text preview, never a blank formula.
+    """
+    pdf = convert_word_to_pdf(content, filename)
+    if Path(filename).suffix.lower() != ".docx":
+        return pdf
+    import docx
+    from app.services.ingestion.parsers.docx_math import document_equations
+
+    equations = document_equations(docx.Document(io.BytesIO(content)).element.body)
+    if not equations:
+        return pdf
+    if any(not equation.supported for equation in equations):
+        raise RuntimeError("PREVIEW_MATH_UNVERIFIABLE")
+    import fitz
+
+    def normalized(text: str) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).translate(
+            str.maketrans({"−": "-", "×": "*", "÷": "/"})
+        )
+
+    with fitz.open(stream=pdf, filetype="pdf") as document:
+        rendered = normalized("\n".join(page.get_text() for page in document))
+    expected = Counter(normalized(equation.text) for equation in equations)
+    if any(rendered.count(expression) < count for expression, count in expected.items()):
+        raise RuntimeError("PREVIEW_MATH_UNVERIFIABLE")
+    return pdf
 
 
 def convert_word_to_pdf(content: bytes, filename: str) -> bytes:
