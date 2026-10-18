@@ -122,7 +122,104 @@ python scripts/smoke_test_production.py
 
 Run with actual deployment credentials only when you choose to perform a live check. For no-secret local checks, omit the token and conversation ID; the script checks health/readiness and verifies protected access rejects unauthenticated requests.
 
-## M. Rollback and troubleshooting
+## M. Optional daily development Supabase activity check
+
+Supabase may pause Free projects with low activity over seven days to conserve
+resources ([Supabase availability guidance](https://supabase.com/docs/guides/deployment/going-into-prod)).
+The optional `Supabase development keep-alive` GitHub Actions workflow performs a
+real database read once daily at **03:17 UTC (10:17 Asia/Saigon)** using cron
+`17 3 * * *`. This may help maintain activity; it is **not a guarantee against
+inactivity pausing**, availability issues, or future platform policy changes.
+
+The workflow talks directly to Supabase PostgREST. It never contacts FastAPI,
+Gemini, Tavily, Modal, Storage, Auth login, or any model loader. It needs no laptop,
+application dependencies, Docker build, GPU, or always-running process.
+
+### Setup for `ai-tutor-dev` only
+
+1. In the Supabase dashboard, positively identify **ai-tutor-dev** and copy its
+   project reference. Confirm that it is not your production project. Restore the
+   development project manually first if it is already paused.
+2. Review and apply
+   `supabase/migrations/20261018140000_keepalive_heartbeat.sql` through the normal
+   migration process against that development project. This additive, idempotent
+   migration creates a two-column singleton and seeds `(1, 'ai-tutor-dev')` once.
+   It enables RLS, removes default role grants, and grants `anon` only
+   SELECT with a policy limited to that row. No application/auth policies change.
+   The daily checker never runs migrations or writes rows. The static label is
+   not proof of project identity; confirming the development project reference is
+   an operator setup requirement. Do not point the workflow at production.
+3. In the GitHub repository, open **Settings → Secrets and variables → Actions →
+   New repository secret** and add these three values from **ai-tutor-dev**:
+   - `SUPABASE_DEV_URL`: its HTTPS project origin, without an API path.
+   - `SUPABASE_DEV_PROJECT_REF`: independently confirmed project reference. The
+     script requires the URL hostname to match this reference exactly.
+   - `SUPABASE_DEV_ANON_KEY`: its browser-safe **publishable key**
+     (`sb_publishable_...`) or legacy **anon JWT**. Never supply a secret key,
+     service-role key, personal access token, or user access token. Elevated keys
+     are rejected before making a request. Supabase verifies the key; the script's
+     legacy JWT parsing is only a configuration guard, not signature verification.
+4. After reviewing the changes, commit/push them yourself and make the workflow
+   available on the repository's default branch. This implementation does not push
+   or configure GitHub/Supabase remotely. Scheduled runs require the default branch;
+   manual runs on other branches are intentionally skipped.
+
+The query is one GET to
+`/rest/v1/keepalive_heartbeat?select=id,project_label&id=eq.1&limit=1`, equivalent to:
+
+```sql
+SELECT id, project_label FROM public.keepalive_heartbeat WHERE id = 1 LIMIT 1;
+```
+
+Only the harmless heartbeat is readable by this policy. An API key is required;
+there is no additional unprotected HTTP endpoint. The public key is not a user
+identity, and the singleton contains no user/workspace/document/chat information.
+Existing RLS continues to protect private application data. The script uses only
+the dedicated `SUPABASE_DEV_*` secrets, never `.env` or generic production settings,
+never follows redirects, and makes no retries. The request timeout is 15 seconds,
+the response is bounded to 1 KiB, and the job timeout is two minutes.
+
+### Testing, monitoring, disabling, and resource use
+
+- In **Actions → Supabase development keep-alive → Run workflow**, select the
+  default branch. A successful job logs `PASS`, HTTP status, row count, and duration.
+  Missing configuration, HTTP/network errors, missing heartbeat/RLS visibility,
+  malformed responses, or the wrong label fail the job. Logs omit credentials,
+  URLs, response bodies, and raw exception messages.
+- Inspect previous runs and failed jobs in that same Actions page. GitHub's
+  existing workflow notifications can be used; no notification service is added.
+- Disable it using the workflow page's **… → Disable workflow**, or remove the
+  workflow. Disable it before retiring/replacing the development project. Do not
+  redirect its secrets to production. The singleton can remain without any process
+  running or new rows accumulating.
+- Expect **28–31 database GETs per month**, plus intentional manual tests, each
+  returning one tiny row (typically tens of bytes). There are no recurring writes,
+  LLM tokens, Gemini/Modal credits, uploaded artifacts, or paid external services.
+  It still uses a small amount of Supabase compute/egress and one short Ubuntu
+  GitHub Actions job per day; runner startup and your account's billing rules affect
+  charged minutes. Check your own usage limits rather than assuming zero cost.
+- GitHub schedules may be delayed or dropped under load; scheduling at minute 17
+  avoids the top-of-hour peak. Public repositories may have scheduled workflows
+  disabled after 60 days without repository activity. Check execution history and
+  re-enable as needed; no artificial commits are generated. See
+  [GitHub schedule documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+  A successful check confirms this read, not Supabase's future pause decision.
+
+Offline validation from the repository root (existing development environment):
+
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests -p test_supabase_keepalive.py -v
+.venv/Scripts/python.exe -m py_compile scripts/supabase_keepalive.py tests/test_supabase_keepalive.py
+git diff --check
+```
+
+These checks mock network access, validate the workflow YAML/permissions and
+success/failure/secret-handling behavior, and inspect the migration. They do not
+prove live Supabase RLS or run GitHub Actions; the manual run above verifies the
+configured development service after migration/setup. No live request is needed
+for offline validation.
+
+## N. Rollback and troubleshooting
 
 - Redeploy the previously known-good Modal code revision; use Modal deployment history/rollback controls.
 - Revert Vercel to its previous deployment and restore the matching API base URL.
