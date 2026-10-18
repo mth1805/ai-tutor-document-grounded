@@ -65,7 +65,7 @@ flowchart TD
 
 | Design decision | Why it matters |
 |---|---|
-| **BGE-M3 + pgvector HNSW** | Multilingual semantic retrieval for English/Vietnamese materials, with vector search persisted in PostgreSQL. |
+| **BGE-M3 + pgvector** | Multilingual semantic retrieval for English/Vietnamese materials, with vector search persisted in PostgreSQL. |
 | **Hybrid retrieval + RRF** | Combines semantic relevance with exact-term matching; fuses candidate rankings before reranking. |
 | **Cross-Encoder reranking + relevance gate** | Scores query–chunk pairs more precisely and decides whether available document evidence is sufficient. |
 | **Document-first + web fallback** | Avoids replacing uploaded material with generic web answers; falls back to Tavily when document evidence is insufficient. |
