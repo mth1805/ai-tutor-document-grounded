@@ -259,14 +259,127 @@ def test_device_selection_and_cpu_fallback_logging(monkeypatch, caplog):
     assert "falling back to CPU" in caplog.text
 
 
-def test_modal_gpu_resource_and_cpu_function_configuration(monkeypatch):
+def _modal_implementation(handle):
+    """_spec_ contains Modal's async implementation objects, not sync handles."""
+    from modal._utils.async_utils import synchronizer
+    return synchronizer._translate_in(handle)
+
+
+def test_modal_worker_resource_and_cpu_function_configuration():
     pytest.importorskip("modal")
     import deploy.modal_app as deployment
-    assert deployment.INGESTION_GPU == "T4"
-    assert deployment.process_ingestion_job._spec_.gpus == "T4"
+    assert deployment.USE_INGESTION_GPU == (deployment.INGESTION_GPU is not None)
+    assert deployment.process_ingestion_job._spec_.gpus == deployment.INGESTION_GPU
+    expected_image = deployment.gpu_image if deployment.USE_INGESTION_GPU else deployment.image
+    assert deployment.ingestion_image is expected_image
+    assert deployment.process_ingestion_job._spec_.image is _modal_implementation(expected_image)
     assert deployment.fastapi_app._spec_.gpus is None
     assert deployment.poll_ingestion_queue._spec_.gpus is None
-    assert repr(deployment.process_ingestion_job._spec_.volumes["/models"]) == repr(deployment.MODEL_CACHE_VOLUME)
+    assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.MODEL_CACHE_VOLUME)
+
+
+@pytest.fixture
+def load_modal_configuration(monkeypatch):
+    """Evaluate each wrapper independently without reloading the shared module.
+
+    Environment and temporary module registration are restored immediately;
+    other tests keep their original deploy.modal_app object and configuration.
+    """
+    pytest.importorskip("modal")
+    import importlib.util
+    import sys
+
+    def load(gpu):
+        with monkeypatch.context() as isolated:
+            if gpu is None:
+                isolated.delenv("MODAL_INGESTION_GPU", raising=False)
+            else:
+                isolated.setenv("MODAL_INGESTION_GPU", gpu)
+            name = f"deploy._device_test_{uuid.uuid4().hex}"
+            path = Path(__file__).resolve().parents[1] / "deploy" / "modal_app.py"
+            spec = importlib.util.spec_from_file_location(name, path)
+            deployment = importlib.util.module_from_spec(spec)
+            isolated.setitem(sys.modules, name, deployment)
+            spec.loader.exec_module(deployment)
+            return deployment
+
+    return load
+
+
+@pytest.mark.parametrize("configured_gpu,expected_gpu", [
+    (None, None), ("", None), ("  ", None), ("T4", "T4"), ("L4", "L4"), (" L4 ", "L4"),
+])
+def test_modal_cpu_and_explicit_gpu_configuration(load_modal_configuration, configured_gpu, expected_gpu):
+    import os
+    before = os.environ.get("MODAL_INGESTION_GPU")
+    deployment = load_modal_configuration(configured_gpu)
+    assert os.environ.get("MODAL_INGESTION_GPU") == before
+    assert deployment.INGESTION_GPU == expected_gpu
+    assert deployment.USE_INGESTION_GPU == (expected_gpu is not None)
+    expected_image = deployment.gpu_image if expected_gpu else deployment.image
+    assert deployment.ingestion_image is expected_image
+    assert deployment.process_ingestion_job._spec_.image is _modal_implementation(expected_image)
+    assert deployment.process_ingestion_job._spec_.gpus == expected_gpu
+    assert deployment.fastapi_app._spec_.gpus is None
+    assert deployment.fastapi_app._spec_.image is _modal_implementation(deployment.image)
+    assert deployment.poll_ingestion_queue._spec_.gpus is None
+    assert deployment.poll_ingestion_queue._spec_.image is _modal_implementation(deployment.image)
+    assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.MODEL_CACHE_VOLUME)
+
+
+@pytest.mark.parametrize("gpu,expected_device", [(None, "cpu"), ("", "cpu"), ("T4", "cuda"), ("L4", "cuda")])
+@pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
+def test_modal_worker_sets_device_before_processing_and_reuses_loop(
+    monkeypatch, load_modal_configuration, gpu, expected_device,
+):
+    import os
+    import asyncio
+    from unittest.mock import Mock
+    from app.core.config import Settings
+    from app.workers import ingestion_queue
+
+    deployment = load_modal_configuration(gpu)
+    # Register original env values with monkeypatch so direct worker mutations
+    # are undone even when these keys were initially absent from the process.
+    for key in ("EMBEDDING_DEVICE", "EMBEDDING_MODEL_CACHE_DIR", "AUTO_EMBED_AFTER_INGESTION"):
+        monkeypatch.setenv(key, os.environ.get(key, "test-original"))
+    calls = []
+    async def process(job_id):
+        configured = Settings(_env_file=None, ENVIRONMENT="development")
+        calls.append((job_id, asyncio.get_running_loop()))
+        assert configured.EMBEDDING_DEVICE == expected_device
+        assert str(configured.EMBEDDING_MODEL_CACHE_DIR).replace("\\", "/") == "/models/huggingface/hub"
+        assert configured.AUTO_EMBED_AFTER_INGESTION
+        return True
+    monkeypatch.setattr(ingestion_queue, "process_claimed_job", process)
+    commit = Mock()
+    monkeypatch.setattr(deployment, "MODEL_CACHE_VOLUME", SimpleNamespace(commit=commit))
+    job_id = uuid.uuid4()
+    try:
+        assert deployment.process_ingestion_job.local(str(job_id)) is True
+        assert deployment.process_ingestion_job.local(str(job_id)) is True
+        assert calls[0][0] == calls[1][0] == job_id
+        assert calls[0][1] is calls[1][1]
+        assert commit.call_count == 2
+    finally:
+        if hasattr(deployment, "_worker_runner"):
+            deployment._worker_runner.close()
+
+
+def test_local_device_defaults_ignore_modal_gpu_configuration(monkeypatch):
+    from app.core.config import Settings
+    from app.ml.bge_provider import BGEEmbeddingProvider
+    from app.ml.reranker_provider import CrossEncoderRerankerProvider
+    import torch
+
+    monkeypatch.delenv("EMBEDDING_DEVICE", raising=False)
+    monkeypatch.delenv("RERANKER_DEVICE", raising=False)
+    monkeypatch.setenv("MODAL_INGESTION_GPU", "L4")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    configured = Settings(_env_file=None, ENVIRONMENT="development")
+    assert configured.EMBEDDING_DEVICE == configured.RERANKER_DEVICE == "cpu"
+    assert BGEEmbeddingProvider._resolve_device(configured.EMBEDDING_DEVICE) == "cpu"
+    assert CrossEncoderRerankerProvider._resolve_device(configured.RERANKER_DEVICE) == "cpu"
 
 
 def test_bge_cuda_cache_and_warm_singleton_reuse(monkeypatch, tmp_path):

@@ -1,13 +1,26 @@
 import { resolveApiBaseUrl } from "./public-config.mjs";
 
 const isBrowser = typeof window !== "undefined";
+
 const isLocalBrowser =
-  isBrowser && ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+  isBrowser &&
+  ["localhost", "127.0.0.1", "[::1]"].includes(
+    window.location.hostname
+  );
+
+const deploymentTarget =
+  process.env.NEXT_PUBLIC_DEPLOYMENT_TARGET?.trim();
+
+const isLocalDeployment = deploymentTarget === "local";
+
 const isHosted =
   process.env.VERCEL === "1" ||
   Boolean(process.env.NEXT_PUBLIC_VERCEL_ENV) ||
+  deploymentTarget === "production" ||
   (isBrowser && !isLocalBrowser);
-const isProduction = process.env.NODE_ENV === "production" || isHosted;
+
+const isProduction =
+  process.env.NODE_ENV === "production" || isHosted;
 
 export const API_BASE_URL: string = resolveApiBaseUrl(
   process.env.NEXT_PUBLIC_API_BASE_URL,
@@ -15,5 +28,6 @@ export const API_BASE_URL: string = resolveApiBaseUrl(
   {
     production: isProduction,
     hosted: isHosted,
+    allowLocal: isLocalDeployment,
   }
 );

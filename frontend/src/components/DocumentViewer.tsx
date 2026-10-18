@@ -347,6 +347,11 @@ export function DocumentViewer({
         ) : textContent !== null ? (
           /* Text Preview: Scrollable Code/Document Reader */
           <div className="w-full h-full overflow-y-auto bg-white dark:bg-slate-950 rounded-lg border border-slate-200 dark:border-slate-800/80 p-4 shadow-inner font-mono text-xs text-slate-800 dark:text-slate-200 select-text leading-relaxed">
+            {category === "word" && (
+              <p className="mb-3 font-sans text-slate-500 dark:text-slate-400">
+                Readable text preview. Equations are shown inline; download the original for its page layout.
+              </p>
+            )}
             <pre className="whitespace-pre-wrap break-words">{textContent}</pre>
           </div>
         ) : category === "word" ? (

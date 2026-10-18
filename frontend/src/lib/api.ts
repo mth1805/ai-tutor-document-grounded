@@ -78,8 +78,16 @@ export interface ChatStreamCallbacks {
     web_sources?: WebCitation[];
     has_sufficient_evidence: boolean;
     used_web_fallback?: boolean;
+    solver?: SolverMetadata;
   }) => void;
   onError?: (error: string) => void;
+}
+
+export interface SolverMetadata {
+  used: boolean;
+  type: "math";
+  operation: "calculate" | "solve_equation" | "differentiate" | "integrate" | "simplify" | null;
+  verified: boolean;
 }
 
 export interface MessageCreate {
@@ -642,6 +650,8 @@ export const apiClient = {
       content: string;
       chat_mode?: string;
       workspace_id?: string;
+      document_id?: string;
+      active_document_id?: string;
     },
     token: string | null | undefined,
     callbacks: ChatStreamCallbacks,

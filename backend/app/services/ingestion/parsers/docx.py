@@ -5,6 +5,7 @@ from typing import List
 
 from app.services.ingestion.models import DocumentPage
 from app.services.ingestion.cleaner import clean_text
+from app.services.ingestion.parsers.docx_math import ordered_text
 from app.services.ingestion.parsers.base import (
     BaseParser,
     EmptyDocumentError,
@@ -41,7 +42,7 @@ class DocxParser(BaseParser):
             if tag == "p":
                 # Paragraph element
                 p = docx.text.paragraph.Paragraph(child, doc)
-                text = p.text.strip()
+                text = ordered_text(child).strip()
                 if not text:
                     continue
 
@@ -62,7 +63,11 @@ class DocxParser(BaseParser):
                 tbl = docx.table.Table(child, doc)
                 table_lines = []
                 for row in tbl.rows:
-                    row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                    row_cells = [
+                        " ".join(ordered_text(p).strip() for p in cell._tc.iterchildren()
+                                 if p.tag.split("}")[-1] == "p").replace("\n", " ")
+                        for cell in row.cells
+                    ]
                     # Only add if row has non-empty cells
                     if any(row_cells):
                         table_lines.append("| " + " | ".join(row_cells) + " |")

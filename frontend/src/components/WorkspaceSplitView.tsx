@@ -87,7 +87,7 @@ export function WorkspaceSplitView() {
   return (
     <div
       ref={containerRef}
-      className="flex-1 flex flex-col h-full overflow-hidden relative bg-white dark:bg-slate-950 transition-colors"
+      className="flex-1 min-w-0 flex flex-col h-full overflow-hidden relative bg-white dark:bg-slate-950 transition-colors"
     >
       {/* Mobile Screen Segmented Tab Switcher (< 1024px) */}
       <div className="lg:hidden flex items-center justify-between p-2 bg-white dark:bg-slate-950 border-b border-slate-200 dark:border-slate-800 shrink-0">

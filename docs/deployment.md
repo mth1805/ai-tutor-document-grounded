@@ -53,16 +53,38 @@ Set `TAVILY_API_KEY`; `TAVILY_MAX_RESULTS` is bounded by the application's sourc
 1. Install and authenticate the Modal CLI locally (`pip install modal`, then `modal setup`).
 2. Create a Modal Secret named `ai-tutor-production` containing the production backend variables above. Or set `MODAL_SECRET_NAME` to a secret you created.
 3. From the repository root, deploy manually with `modal deploy backend/deploy/modal_app.py`.
-4. Modal uses `backend/requirements.lock.txt` for the CPU API and poller, and `backend/requirements-gpu.lock.txt` only for ingestion workers. Both are exact Python 3.11/Linux x86_64 locks. Their source inputs are `requirements-cpu.in` (PyTorch CPU index and `torch==2.14.1+cpu`) and `requirements-gpu.in` (`torch==2.14.1` from PyPI); both keep the same Sentence Transformers, BGE-M3, and CrossEncoder dependencies. The API lock excludes CUDA/NVIDIA runtime packages, while the worker lock retains them. Both images install Tesseract with English/Vietnamese language data and LibreOffice Writer for scanned-PDF/image OCR and legacy `.doc` uploads. The root Dockerfile installs the CPU lock. Validate clean Linux image builds before rollout.
+4. Modal uses `backend/requirements.lock.txt` for the CPU API, poller, and default CPU ingestion worker. Only explicitly GPU-configured ingestion workers use `backend/requirements-gpu.lock.txt`. Both are exact Python 3.11/Linux x86_64 locks. Their source inputs are `requirements-cpu.in` (PyTorch CPU index and `torch==2.14.1+cpu`) and `requirements-gpu.in` (`torch==2.14.1` from PyPI); both keep the same Sentence Transformers, BGE-M3, and CrossEncoder dependencies. The API lock excludes CUDA/NVIDIA runtime packages, while the GPU worker lock retains them. Both images install Tesseract with English/Vietnamese language data and LibreOffice Writer for scanned-PDF/image OCR and legacy `.doc` uploads. The root Dockerfile installs the CPU lock. Validate clean Linux image builds before rollout.
 5. Apply the durable ingestion migration using the normal reviewed Supabase migration workflow before deploying this application version. Do not apply ad-hoc production DDL. The worker queue requires `SUPABASE_URL` and backend-only `SUPABASE_SERVICE_ROLE_KEY`; only the narrowly scoped queue RPCs use that key. Document content processing continues through the authenticated per-user database session.
 6. The wrapper uses a persistent Modal Volume named `ai-tutor-model-cache` (override with `MODAL_MODEL_CACHE_VOLUME`) mounted at `/models`; Hugging Face uses `/models/huggingface`.
-7. API and worker CPU/memory are configurable with `MODAL_API_CPU`, `MODAL_API_MEMORY_MB`, `MODAL_INGESTION_CPU`, and `MODAL_INGESTION_MEMORY_MB`. `MODAL_MAX_CONCURRENT_INPUTS` bounds ASGI concurrency per container. Set this with SQLAlchemy pool settings and Supabase connection limits in mind. `MODAL_INGESTION_GPU` defaults to `T4` and allocates an actual GPU only to per-job ingestion workers (a blank value also selects T4). API and poller stay CPU-only. The scheduled poller runs every 15 seconds, claims up to 10 due jobs with a 60-minute lease, and workers retry failures up to three attempts with backoff. The worker timeout is 30 minutes; expired leases are reclaimed by the database RPC.
+7. API and worker CPU/memory are configurable with `MODAL_API_CPU`, `MODAL_API_MEMORY_MB`, `MODAL_INGESTION_CPU`, and `MODAL_INGESTION_MEMORY_MB`. `MODAL_MAX_CONCURRENT_INPUTS` bounds ASGI concurrency per container. Set this with SQLAlchemy pool settings and Supabase connection limits in mind. `MODAL_INGESTION_GPU` defaults to no GPU: an absent, empty, or whitespace-only value selects CPU. An explicit GPU name allocates that GPU only to per-job ingestion workers. API and poller stay CPU-only. The scheduled poller runs every 15 seconds, claims up to 10 due jobs with a 60-minute lease, and workers retry failures up to three attempts with backoff. The worker timeout is 30 minutes; expired leases are reclaimed by the database RPC.
 
 `modal deploy` provisions public API and scheduled worker functions, and may incur charges. Do not run it until you intend to create those resources. The repository does not deploy automatically.
 
 ## G. Model configuration and queue operation
 
-`EMBEDDING_DEVICE=auto` and `RERANKER_DEVICE=auto` select CUDA when available and otherwise CPU. The API image contains CPU-only PyTorch and serves query-time embedding/reranking on CPU. The separate ingestion-worker image contains CUDA-enabled PyTorch and defaults to an allocated T4 GPU. The worker sets its own embedding device to `cuda`, cache directory to `/models/huggingface/hub` (the normal HF_HOME hub directory), and automatic embedding to enabled before loading Settings; CPU fallback is logged. The model providers are process singletons and receive configured Hugging Face cache paths; models are not downloaded on every request. `PREWARM_MODELS=true` loads both models at startup, increasing cold start and startup memory. With prewarming off, first retrieval incurs lazy model initialization. Database access, auth, API orchestration, Gemini, and Tavily do not require a GPU.
+`EMBEDDING_DEVICE` and `RERANKER_DEVICE` default to `cpu`. Explicit `auto` settings still select CUDA when available and otherwise CPU; explicit `cuda` retains the existing CPU fallback when CUDA is unavailable. The API image contains CPU-only PyTorch and serves query-time embedding/reranking on CPU. The ingestion worker selects the CPU image by default, or the CUDA-enabled image when a GPU is explicitly configured. It sets its own embedding device to match that selection before importing worker Settings, keeps the cache at `/models/huggingface/hub` (the normal HF_HOME hub directory), and enables automatic embedding. The model providers remain process singletons and receive configured Hugging Face cache paths; models are not downloaded on every request. `PREWARM_MODELS=true` loads both models at startup, increasing cold start and startup memory. With prewarming off, first retrieval incurs lazy model initialization. Database access, auth, API orchestration, Gemini, Tavily, and the SymPy math solver do not require a GPU.
+
+### Compute-device modes
+
+- **Local CPU:** `EMBEDDING_DEVICE=cpu` and `RERANKER_DEVICE=cpu`. These are the
+  shared defaults, and Compose explicitly overrides both devices to CPU for the
+  backend and local worker. Local Docker installs the CPU dependency lock and
+  requires no NVIDIA runtime. A Modal GPU setting never changes this profile.
+- **Modal CPU:** Leave `MODAL_INGESTION_GPU` unset or use `MODAL_INGESTION_GPU=`.
+  The worker uses `image`, requests `gpu=None`, and sets `EMBEDDING_DEVICE=cpu`.
+- **Modal GPU:** Use `MODAL_INGESTION_GPU=T4`, `MODAL_INGESTION_GPU=L4`, or another
+  GPU supported by your Modal account. The worker uses `gpu_image`, requests that
+  exact trimmed GPU name, and sets `EMBEDDING_DEVICE=cuda`. FastAPI and the poller
+  continue to use the CPU image with no GPU allocation in every mode.
+
+`MODAL_INGESTION_GPU` is read from the deployment launcher's environment when the
+wrapper is imported and resources are registered. Set it in that environment
+before a future manual deployment; putting it only in runtime Modal Secret values
+does not select deployment resources. The wrapper does not load the local `.env`
+to allocate GPUs. Actual GPU provisioning still requires account access to the
+requested hardware; missing or blank configuration selects CPU, while unavailable
+explicit allocations must be resolved in the deployment environment. No remote
+GPU build or execution is implied by local configuration tests.
 
 See [ingestion and document preview changes](production-ingestion-preview.md) for storage compensation, preview lifecycle, validation limits, and manual rollout commands.
 
@@ -100,7 +122,104 @@ python scripts/smoke_test_production.py
 
 Run with actual deployment credentials only when you choose to perform a live check. For no-secret local checks, omit the token and conversation ID; the script checks health/readiness and verifies protected access rejects unauthenticated requests.
 
-## M. Rollback and troubleshooting
+## M. Optional daily development Supabase activity check
+
+Supabase may pause Free projects with low activity over seven days to conserve
+resources ([Supabase availability guidance](https://supabase.com/docs/guides/deployment/going-into-prod)).
+The optional `Supabase development keep-alive` GitHub Actions workflow performs a
+real database read once daily at **03:17 UTC (10:17 Asia/Saigon)** using cron
+`17 3 * * *`. This may help maintain activity; it is **not a guarantee against
+inactivity pausing**, availability issues, or future platform policy changes.
+
+The workflow talks directly to Supabase PostgREST. It never contacts FastAPI,
+Gemini, Tavily, Modal, Storage, Auth login, or any model loader. It needs no laptop,
+application dependencies, Docker build, GPU, or always-running process.
+
+### Setup for `ai-tutor-dev` only
+
+1. In the Supabase dashboard, positively identify **ai-tutor-dev** and copy its
+   project reference. Confirm that it is not your production project. Restore the
+   development project manually first if it is already paused.
+2. Review and apply
+   `supabase/migrations/20261018140000_keepalive_heartbeat.sql` through the normal
+   migration process against that development project. This additive, idempotent
+   migration creates a two-column singleton and seeds `(1, 'ai-tutor-dev')` once.
+   It enables RLS, removes default role grants, and grants `anon` only
+   SELECT with a policy limited to that row. No application/auth policies change.
+   The daily checker never runs migrations or writes rows. The static label is
+   not proof of project identity; confirming the development project reference is
+   an operator setup requirement. Do not point the workflow at production.
+3. In the GitHub repository, open **Settings → Secrets and variables → Actions →
+   New repository secret** and add these three values from **ai-tutor-dev**:
+   - `SUPABASE_DEV_URL`: its HTTPS project origin, without an API path.
+   - `SUPABASE_DEV_PROJECT_REF`: independently confirmed project reference. The
+     script requires the URL hostname to match this reference exactly.
+   - `SUPABASE_DEV_ANON_KEY`: its browser-safe **publishable key**
+     (`sb_publishable_...`) or legacy **anon JWT**. Never supply a secret key,
+     service-role key, personal access token, or user access token. Elevated keys
+     are rejected before making a request. Supabase verifies the key; the script's
+     legacy JWT parsing is only a configuration guard, not signature verification.
+4. After reviewing the changes, commit/push them yourself and make the workflow
+   available on the repository's default branch. This implementation does not push
+   or configure GitHub/Supabase remotely. Scheduled runs require the default branch;
+   manual runs on other branches are intentionally skipped.
+
+The query is one GET to
+`/rest/v1/keepalive_heartbeat?select=id,project_label&id=eq.1&limit=1`, equivalent to:
+
+```sql
+SELECT id, project_label FROM public.keepalive_heartbeat WHERE id = 1 LIMIT 1;
+```
+
+Only the harmless heartbeat is readable by this policy. An API key is required;
+there is no additional unprotected HTTP endpoint. The public key is not a user
+identity, and the singleton contains no user/workspace/document/chat information.
+Existing RLS continues to protect private application data. The script uses only
+the dedicated `SUPABASE_DEV_*` secrets, never `.env` or generic production settings,
+never follows redirects, and makes no retries. The request timeout is 15 seconds,
+the response is bounded to 1 KiB, and the job timeout is two minutes.
+
+### Testing, monitoring, disabling, and resource use
+
+- In **Actions → Supabase development keep-alive → Run workflow**, select the
+  default branch. A successful job logs `PASS`, HTTP status, row count, and duration.
+  Missing configuration, HTTP/network errors, missing heartbeat/RLS visibility,
+  malformed responses, or the wrong label fail the job. Logs omit credentials,
+  URLs, response bodies, and raw exception messages.
+- Inspect previous runs and failed jobs in that same Actions page. GitHub's
+  existing workflow notifications can be used; no notification service is added.
+- Disable it using the workflow page's **… → Disable workflow**, or remove the
+  workflow. Disable it before retiring/replacing the development project. Do not
+  redirect its secrets to production. The singleton can remain without any process
+  running or new rows accumulating.
+- Expect **28–31 database GETs per month**, plus intentional manual tests, each
+  returning one tiny row (typically tens of bytes). There are no recurring writes,
+  LLM tokens, Gemini/Modal credits, uploaded artifacts, or paid external services.
+  It still uses a small amount of Supabase compute/egress and one short Ubuntu
+  GitHub Actions job per day; runner startup and your account's billing rules affect
+  charged minutes. Check your own usage limits rather than assuming zero cost.
+- GitHub schedules may be delayed or dropped under load; scheduling at minute 17
+  avoids the top-of-hour peak. Public repositories may have scheduled workflows
+  disabled after 60 days without repository activity. Check execution history and
+  re-enable as needed; no artificial commits are generated. See
+  [GitHub schedule documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+  A successful check confirms this read, not Supabase's future pause decision.
+
+Offline validation from the repository root (existing development environment):
+
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests -p test_supabase_keepalive.py -v
+.venv/Scripts/python.exe -m py_compile scripts/supabase_keepalive.py tests/test_supabase_keepalive.py
+git diff --check
+```
+
+These checks mock network access, validate the workflow YAML/permissions and
+success/failure/secret-handling behavior, and inspect the migration. They do not
+prove live Supabase RLS or run GitHub Actions; the manual run above verifies the
+configured development service after migration/setup. No live request is needed
+for offline validation.
+
+## N. Rollback and troubleshooting
 
 - Redeploy the previously known-good Modal code revision; use Modal deployment history/rollback controls.
 - Revert Vercel to its previous deployment and restore the matching API base URL.

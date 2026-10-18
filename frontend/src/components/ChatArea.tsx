@@ -41,7 +41,7 @@ export function ChatArea() {
   const conversationId = (params?.conversationId as string) || null;
 
   const { user, token } = useAuth();
-  const { setSelectedDocument, setIsViewerCollapsed } = useDocument();
+  const { selectedDocument, setSelectedDocument, setIsViewerCollapsed } = useDocument();
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
@@ -139,6 +139,8 @@ export function ChatArea() {
           content,
           chat_mode: chatMode,
           workspace_id: workspaceId || undefined,
+          active_document_id: selectedDocument?.workspace_id === workspaceId
+            ? selectedDocument.id : undefined,
         },
         token,
         {
@@ -252,7 +254,7 @@ export function ChatArea() {
   };
 
   return (
-    <main className="flex-1 flex flex-col h-full bg-slate-50/50 dark:bg-slate-900/60 relative overflow-hidden transition-colors">
+    <main className="flex-1 min-w-0 flex flex-col h-full bg-slate-50/50 dark:bg-slate-900/60 relative overflow-hidden transition-colors">
       {/* Workspace / Conversation Sub-header */}
       {workspaceId && (
         <div className="h-10 border-b border-slate-200 dark:border-slate-800/80 bg-white/80 dark:bg-slate-950/40 px-4 flex items-center justify-between text-xs text-slate-600 dark:text-slate-300 shrink-0">
