@@ -41,7 +41,7 @@ export function ChatArea() {
   const conversationId = (params?.conversationId as string) || null;
 
   const { user, token } = useAuth();
-  const { setSelectedDocument, setIsViewerCollapsed } = useDocument();
+  const { selectedDocument, setSelectedDocument, setIsViewerCollapsed } = useDocument();
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
@@ -139,6 +139,8 @@ export function ChatArea() {
           content,
           chat_mode: chatMode,
           workspace_id: workspaceId || undefined,
+          active_document_id: selectedDocument?.workspace_id === workspaceId
+            ? selectedDocument.id : undefined,
         },
         token,
         {

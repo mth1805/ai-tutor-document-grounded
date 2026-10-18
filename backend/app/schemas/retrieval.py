@@ -15,6 +15,8 @@ class RetrievalRoutingMode(str, Enum):
 class RetrievalRequest(BaseModel):
     """Request payload for hybrid retrieval and reranking search."""
 
+    document_id: Optional[uuid.UUID] = Field(default=None, description="Restrict both retrieval channels to this document within the authorized workspace.")
+
     query: str = Field(
         ...,
         min_length=1,

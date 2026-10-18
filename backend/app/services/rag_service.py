@@ -20,6 +20,8 @@ from app.schemas.retrieval import RetrievalRequest, RetrievalResponse, Retrieved
 from app.services.conversation_service import ConversationService
 from app.services.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService, _IN_MEMORY_DOCUMENTS
+from app.services.document_reference import DocumentReferenceResolver
+from fastapi import HTTPException
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
 from app.rag.prompt_builder import PromptBuilder, ChatMode, SourceEvidence
 from app.rag.citation_service import CitationService, Citation, WebCitation
@@ -141,6 +143,8 @@ class RAGService:
         chat_mode_str: str = "Detailed Guidance",
         workspace_id: Optional[uuid.UUID] = None,
         llm_provider: Optional[BaseLLMProvider] = None,
+        document_id: Optional[uuid.UUID] = None,
+        active_document_id: Optional[uuid.UUID] = None,
     ) -> AsyncIterator[str]:
         """Executes full RAG workflow and yields SSE events.
 
@@ -197,10 +201,32 @@ class RAGService:
             if m.id != user_msg.id  # exclude current message
         ][-6:]
 
+        try:
+            resolution = await DocumentReferenceResolver.resolve(
+                db, conv_workspace_id, user_id, query,
+                document_id=document_id, active_document_id=active_document_id,
+                history=[m for m in history_records if m.id != user_msg.id],
+            )
+        except HTTPException as exc:
+            yield f"event: error\ndata: {json.dumps({'error': exc.detail})}\n\n"
+            return
+        if resolution.message:
+            # Clarifications and actual processing states use the normal persistence/SSE contract.
+            asst_msg = await ConversationService.create_message(
+                db=db, conversation_id=conversation_id, user_id=user_id,
+                data=MessageCreate(role="assistant", content=resolution.message, citations=[]),
+            )
+            yield f"event: token\ndata: {json.dumps({'token': resolution.message})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'message_id': str(asst_msg.id), 'content': resolution.message, 'citations': [], 'has_sufficient_evidence': False})}\n\n"
+            return
+
         # 5. Execute Phase 7 hybrid retrieval and reranking
         t_retrieval_start = time.perf_counter()
         try:
-            retrieval_req = RetrievalRequest(query=query)
+            retrieval_req = RetrievalRequest(
+                query=resolution.retrieval_query(query),
+                document_id=resolution.document.id if resolution.document else None,
+            )
             retrieval_response: RetrievalResponse = await RetrievalService.retrieve(
                 db=db,
                 workspace_id=conv_workspace_id,
@@ -530,6 +556,13 @@ class RAGService:
             solver_operation=solver_result.problem_type if solver_result else None,
             solver_verified=solver_result.success if solver_result else False,
         )
+        if resolution.document:
+            assembled.system_instruction += (
+                "\nDOCUMENT REFERENCE: Document selection has been resolved for this request. "
+                "Interpret document references such as 'this file' as the document identified by the "
+                "provided evidence. Its evidence is retrieved content, not a statement that no file was uploaded. "
+                "Answer only what that evidence supports and preserve source citations."
+            )
 
         yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating grounded answer...'})}\n\n"
 
@@ -636,6 +669,8 @@ class RAGService:
         chat_mode_str: str = "Detailed Guidance",
         workspace_id: Optional[uuid.UUID] = None,
         llm_provider: Optional[BaseLLMProvider] = None,
+        document_id: Optional[uuid.UUID] = None,
+        active_document_id: Optional[uuid.UUID] = None,
     ) -> Dict[str, Any]:
         """Non-streaming generation helper for tests and automated benchmarks."""
         full_text = ""
@@ -652,6 +687,8 @@ class RAGService:
             chat_mode_str=chat_mode_str,
             workspace_id=workspace_id,
             llm_provider=llm_provider,
+            document_id=document_id,
+            active_document_id=active_document_id,
         ):
             for line in event_chunk.split("\n"):
                 line = line.strip()

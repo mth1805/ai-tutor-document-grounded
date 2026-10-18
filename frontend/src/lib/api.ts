@@ -650,6 +650,8 @@ export const apiClient = {
       content: string;
       chat_mode?: string;
       workspace_id?: string;
+      document_id?: string;
+      active_document_id?: string;
     },
     token: string | null | undefined,
     callbacks: ChatStreamCallbacks,

@@ -1,6 +1,7 @@
 """HTTP, SSE, tutor policy, and persistence coverage for the existing chat stack."""
 import json
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,10 @@ from app.services.retrieval_service import RetrievalService
 from app.tools.math_solver import MathSolver
 from app.rag.prompt_builder import ChatMode, PromptBuilder
 from app.services.workspace_service import _IN_MEMORY_WORKSPACES
+from app.services.document_service import _IN_MEMORY_DOCUMENTS
+from app.services.ingestion_service import _IN_MEMORY_CHUNKS
+from app.models.document import Document
+from app.models.chunk import DocumentChunk
 from app.services.conversation_service import _IN_MEMORY_CONVERSATIONS, _IN_MEMORY_MESSAGES
 from tests.test_math_solver import chunk
 
@@ -24,12 +29,14 @@ headers = {"Authorization": "Bearer test-token:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaa
 
 @pytest.fixture(autouse=True)
 def environment(monkeypatch):
-    for store in (_IN_MEMORY_WORKSPACES, _IN_MEMORY_CONVERSATIONS, _IN_MEMORY_MESSAGES):
+    for store in (_IN_MEMORY_WORKSPACES, _IN_MEMORY_CONVERSATIONS, _IN_MEMORY_MESSAGES,
+                  _IN_MEMORY_DOCUMENTS, _IN_MEMORY_CHUNKS):
         store.clear()
     monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
     yield
     reset_llm_provider()
-    for store in (_IN_MEMORY_WORKSPACES, _IN_MEMORY_CONVERSATIONS, _IN_MEMORY_MESSAGES):
+    for store in (_IN_MEMORY_WORKSPACES, _IN_MEMORY_CONVERSATIONS, _IN_MEMORY_MESSAGES,
+                  _IN_MEMORY_DOCUMENTS, _IN_MEMORY_CHUNKS):
         store.clear()
 
 
@@ -50,6 +57,20 @@ def mock_retrieval(monkeypatch, chunks=None, sufficient=True, order=None):
                                  timings=RetrievalTimingMetrics(query_embedding_ms=0, dense_retrieval_ms=0,
                                      lexical_retrieval_ms=0, rrf_ms=0, rerank_ms=0, total_retrieval_ms=0))
     monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+
+
+def register_exercises(workspace, chunks):
+    """Provide the persisted document metadata required by document reference resolution."""
+    for item in chunks:
+        doc = Document(id=item.document_id, workspace_id=uuid.UUID(workspace),
+                       user_id=uuid.UUID(headers["Authorization"].split(":")[-1]),
+                       original_filename="Exercises.pdf", status="processed", embedding_status="completed",
+                       created_at=datetime.now(timezone.utc))
+        _IN_MEMORY_DOCUMENTS[doc.id] = doc
+        _IN_MEMORY_CHUNKS.setdefault(doc.id, []).append(DocumentChunk(
+            id=item.chunk_id, document_id=doc.id, workspace_id=doc.workspace_id, user_id=doc.user_id,
+            content=item.content, embedding=[1.0] * 1024, chunk_index=item.chunk_index,
+            page_number_start=item.page_number_start, page_number_end=item.page_number_end))
 
 
 def local_solver(monkeypatch, order=None):
@@ -125,7 +146,8 @@ def test_document_exercise_rag_first_citations_and_full_sse(monkeypatch):
     monkeypatch.setattr(RAGService, "resolve_document_names", names)
     llm = MockLLMProvider(tokens=["Factor the polynomial ", "and solve each factor [Source 1]."])
     set_llm_provider(llm)
-    _, cid = conversation()
+    workspace, cid = conversation()
+    register_exercises(workspace, chunks)
     response = client.post(f"/api/v1/conversations/{cid}/chat", headers=headers,
                            json={"content": "Giải bài 7 trong tài liệu", "chat_mode": "Full Solution"})
     assert response.status_code == 200
@@ -193,10 +215,15 @@ def test_missing_statement_or_invalid_task_never_executes(monkeypatch, query, ch
         raise AssertionError("Incomplete statements must not execute")
     monkeypatch.setattr(MathSolver, "execute", execute)
     set_llm_provider(MockLLMProvider(tokens=["Please provide the complete exercise statement."]))
-    _, cid = conversation()
+    workspace, cid = conversation()
+    register_exercises(workspace, chunks)
     response = client.post(f"/api/v1/conversations/{cid}/chat/sync", headers=headers, json={"content": query})
     assert response.status_code == 200
     assert not called
+    if "tài liệu" in query and not chunks:
+        assert response.json()["solver"] is None
+        assert "chưa có tài liệu" in response.json()["content"]
+        return
     assert response.json()["solver"]["used"] is False
     assert "verification was unavailable" in response.json()["content"]
 

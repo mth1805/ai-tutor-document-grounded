@@ -22,6 +22,8 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional workspace ID verification against parent conversation.",
     )
+    document_id: Optional[uuid.UUID] = Field(default=None, description="Explicitly attached document.")
+    active_document_id: Optional[uuid.UUID] = Field(default=None, description="Document open in the viewer.")
 
     @field_validator("content")
     @classmethod
