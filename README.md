@@ -4,6 +4,10 @@
 
 **A document-grounded AI learning assistant with hybrid RAG, source citations, web fallback, and verified math solving.**
 
+<p align="center">
+  <img src="assets/background.png" alt="AI Tutor Assistant — Document-Grounded RAG Architecture" width="100%" />
+</p>
+
 [**Live Demo**](https://ai-tutor-document-grounded.vercel.app) · [**Source Code**](https://github.com/mth1805/ai-tutor-document-grounded) · [**Deployment Guide**](docs/deployment.md)
 
 <img src="https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
