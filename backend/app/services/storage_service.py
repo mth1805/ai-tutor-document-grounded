@@ -1,11 +1,14 @@
 import re
 import uuid
 import logging
+import unicodedata
+from urllib.parse import quote
 from pathlib import Path
 from typing import Optional, Dict
 import httpx
 from fastapi import HTTPException, status
 from app.core.config import settings
+from app.services.ingestion.telemetry import event
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,7 @@ def sanitize_filename(filename: str) -> str:
         return "document.bin"
 
     # 1. Strip any directory paths (both / and \)
-    base = filename.replace("\\", "/").split("/")[-1].strip()
+    base = unicodedata.normalize("NFC", filename.replace("\\", "/").split("/")[-1])
 
     # 2. Remove null bytes and control characters
     base = re.sub(r"[\x00-\x1f\x7f]", "", base)
@@ -53,18 +56,12 @@ def sanitize_filename(filename: str) -> str:
     # 4. Remove leading dots or hyphens
     base = base.lstrip(".-")
 
-    # 5. Sanitize unsafe characters while preserving alphanumeric, unicode letters, dots, hyphens, and underscores
-    base = re.sub(r'[^a-zA-Z0-9._\- ]', '_', base)
     if not base:
         base = "document.bin"
 
-    # 6. Limit max length to 200 characters while preserving extension
-    if len(base) > 200:
-        parts = base.rsplit(".", 1)
-        if len(parts) == 2:
-            base = f"{parts[0][:190]}.{parts[1][:9]}"
-        else:
-            base = base[:200]
+    # Preserve valid Unicode names; reject overlong names instead of truncating.
+    if len(base) > 255:
+        raise HTTPException(400, "Filename must be at most 255 characters")
 
     return base
 
@@ -152,10 +149,8 @@ def validate_upload_file(filename: str, content: bytes, mime_type: Optional[str]
 
     # 6. Normalize MIME type
     final_mime = EXTENSION_TO_DEFAULT_MIME.get(ext, "application/octet-stream")
-    if mime_type and "/" in mime_type and "octet-stream" not in mime_type:
-        # If client provided a specific valid MIME type, keep it if reasonable
-        if mime_type.startswith("image/") or mime_type.startswith("text/") or "pdf" in mime_type or "word" in mime_type:
-            final_mime = mime_type
+    if mime_type and mime_type.split(";", 1)[0].lower() not in {final_mime, "application/octet-stream"}:
+        raise HTTPException(400, "File MIME type does not match the declared extension")
 
     return clean_name, final_mime, file_size
 
@@ -169,7 +164,7 @@ class StorageService:
     ) -> str:
         """Constructs a deterministic, workspace-scoped storage path."""
         clean_name = sanitize_filename(filename)
-        return f"{workspace_id}/{document_id}/{clean_name}"
+        return f"{workspace_id}/{document_id}/source{Path(clean_name).suffix.lower()}"
 
     @classmethod
     async def upload_file(
@@ -184,12 +179,13 @@ class StorageService:
             The confirmed storage path.
         """
         # If live Supabase Storage credentials exist, upload to Supabase Storage
-        if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
-            url = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/{settings.STORAGE_BUCKET_NAME}/{storage_path}"
+        if cls._use_remote():
+            url = cls._object_url(storage_path)
             headers = {
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
                 "Content-Type": mime_type,
-                "x-upsert": "true",
+                "x-upsert": "false",
+                "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
             }
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
@@ -220,10 +216,11 @@ class StorageService:
     @classmethod
     async def get_file(cls, storage_path: str) -> Optional[bytes]:
         """Retrieves raw file bytes from storage."""
-        if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
-            url = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/{settings.STORAGE_BUCKET_NAME}/{storage_path}"
+        if cls._use_remote():
+            url = cls._object_url(storage_path, "authenticated/")
             headers = {
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
             }
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
@@ -231,12 +228,14 @@ class StorageService:
                     if res.status_code == 200:
                         return res.content
                     elif res.status_code == 404:
+                        event("storage_download", error_category="StorageObjectMissing", error_code="STORAGE_HTTP_404")
                         return None
                     else:
                         logger.warning("Supabase storage get failed (%s)", res.status_code)
+                        event("storage_download", error_category="StorageHTTPError", error_code=f"STORAGE_HTTP_{res.status_code}")
                         return None
             except Exception as e:
-                logger.error("Supabase storage get error: %s", e)
+                logger.error("Supabase storage get error category=%s", type(e).__name__)
                 return None
 
         return _IN_MEMORY_STORAGE.get(storage_path)
@@ -244,17 +243,18 @@ class StorageService:
     @classmethod
     async def delete_file(cls, storage_path: str) -> bool:
         """Deletes a file from storage."""
-        if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
-            url = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/{settings.STORAGE_BUCKET_NAME}/{storage_path}"
+        if cls._use_remote():
+            url = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/{quote(settings.STORAGE_BUCKET_NAME, safe='')}"
             headers = {
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
             }
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
-                    res = await client.delete(url, headers=headers)
+                    res = await client.request("DELETE", url, headers=headers, json={"prefixes": [storage_path]})
                     return res.status_code in (200, 204, 404)
             except Exception as e:
-                logger.error("Supabase storage delete error: %s", e)
+                logger.error("Supabase storage delete error category=%s", type(e).__name__)
                 return False
 
         if storage_path in _IN_MEMORY_STORAGE:
@@ -265,11 +265,12 @@ class StorageService:
     @classmethod
     async def create_signed_url(cls, storage_path: str, expires_in: int = 3600) -> Optional[str]:
         """Generates a time-limited signed URL for private bucket access without making it public."""
-        if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
-            url = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/sign/{settings.STORAGE_BUCKET_NAME}/{storage_path}"
+        if cls._use_remote():
+            url = cls._object_url(storage_path, "sign/")
             headers = {
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
                 "Content-Type": "application/json",
+                "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
             }
             payload = {"expiresIn": expires_in}
             try:
@@ -282,9 +283,23 @@ class StorageService:
                             base = settings.SUPABASE_URL.rstrip('/')
                             return f"{base}/storage/v1{signed_url}"
             except Exception as e:
-                logger.error("Supabase storage signed URL generation error: %s", e)
+                logger.error("Supabase storage signed URL generation error category=%s", type(e).__name__)
 
         # Fallback for local development/testing
         if storage_path in _IN_MEMORY_STORAGE:
             return f"/api/v1/documents/storage-mock/{storage_path}"
         return None
+
+    @staticmethod
+    def _use_remote() -> bool:
+        if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
+            return True
+        if settings.ENVIRONMENT.lower() not in {"development", "test"}:
+            raise HTTPException(503, "Private document storage is not configured")
+        return False
+
+    @staticmethod
+    def _object_url(storage_path: str, operation: str = "") -> str:
+        bucket = quote(settings.STORAGE_BUCKET_NAME, safe="")
+        path = quote(storage_path, safe="/")
+        return f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/{operation}{bucket}/{path}"

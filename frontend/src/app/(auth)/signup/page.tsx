@@ -2,23 +2,24 @@
 
 import React, { useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { GraduationCap, ArrowRight, Loader2, AlertCircle } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
+import { SIGNUP_CONFIRMATION_MESSAGE } from "@/lib/auth-messages";
 
 export default function SignUpPage() {
-  const router = useRouter();
   const { signUp, isLoading: authLoading } = useAuth();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setSuccess(false);
 
     if (!email || !password) {
       setError("Please provide both email and password.");
@@ -42,7 +43,7 @@ export default function SignUpPage() {
     if (res.error) {
       setError(res.error);
     } else {
-      router.push("/");
+      setSuccess(true);
     }
   };
 
@@ -67,6 +68,12 @@ export default function SignUpPage() {
           <div className="mb-5 p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800/60 flex items-start space-x-2.5 text-xs text-rose-600 dark:text-rose-300">
             <AlertCircle className="w-4 h-4 text-rose-500 dark:text-rose-400 shrink-0 mt-0.5" />
             <span>{error}</span>
+          </div>
+        )}
+
+        {success && (
+          <div role="status" className="mb-5 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 text-sm text-emerald-800 dark:text-emerald-200">
+            {SIGNUP_CONFIRMATION_MESSAGE} <Link href="/login" className="underline">Sign in</Link>
           </div>
         )}
 

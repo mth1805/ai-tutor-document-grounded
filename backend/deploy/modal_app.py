@@ -14,6 +14,7 @@ from pathlib import Path
 import os
 import asyncio
 import uuid
+import logging
 
 import modal
 
@@ -27,6 +28,7 @@ MODEL_CACHE_VOLUME = modal.Volume.from_name(
     os.getenv("MODAL_MODEL_CACHE_VOLUME", "ai-tutor-model-cache"), create_if_missing=True
 )
 INGESTION_GPU = os.getenv("MODAL_INGESTION_GPU", "").strip() or None
+USE_INGESTION_GPU = INGESTION_GPU is not None
 CPU_REQUIREMENTS = BACKEND / "requirements.lock.txt"
 GPU_REQUIREMENTS = BACKEND / "requirements-gpu.lock.txt"
 
@@ -56,6 +58,7 @@ gpu_image = (
     .env({"PYTHONPATH": "/root/backend", "HF_HOME": "/models/huggingface"})
     .add_local_dir(str(BACKEND / "app"), remote_path="/root/backend/app")
 )
+ingestion_image = gpu_image if USE_INGESTION_GPU else image
 
 # The persistent volume prevents model downloads on container restarts. It is
 # mounted read/write because first-use cache population may occur in a worker.
@@ -96,7 +99,7 @@ def poll_ingestion_queue():
 
 
 @app.function(
-    image=gpu_image,
+    image=ingestion_image,
     secrets=secrets,
     cpu=float(os.getenv("MODAL_INGESTION_CPU", "4")),
     memory=int(os.getenv("MODAL_INGESTION_MEMORY_MB", "12288")),
@@ -106,7 +109,24 @@ def poll_ingestion_queue():
     scaledown_window=300,
 )
 def process_ingestion_job(job_id: str):
-    """Process a single durable job; GPU is allocated only to this worker function."""
+    """Process a durable job on CPU, or on an explicitly configured worker GPU."""
+    # Set worker-only options before importing Settings; API/poller stay on CPU.
+    os.environ["EMBEDDING_DEVICE"] = "cuda" if USE_INGESTION_GPU else "cpu"
+    # Match HF_HOME's normal hub subdirectory so CPU/GPU workers share weights.
+    os.environ["EMBEDDING_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
+    os.environ["AUTO_EMBED_AFTER_INGESTION"] = "true"
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     from app.workers.ingestion_queue import process_claimed_job
 
-    return asyncio.run(process_claimed_job(uuid.UUID(job_id)))
+    # Reuse the event loop as well as the model singleton in warm containers:
+    # SQLAlchemy's pooled async connections belong to their original loop.
+    global _worker_runner
+    if "_worker_runner" not in globals():
+        _worker_runner = asyncio.Runner()
+    try:
+        return _worker_runner.run(process_claimed_job(uuid.UUID(job_id)))
+    finally:
+        try:
+            MODEL_CACHE_VOLUME.commit()
+        except Exception as exc:
+            logging.getLogger(__name__).error("model_cache_commit_failed job_id=%s category=%s", job_id, type(exc).__name__)

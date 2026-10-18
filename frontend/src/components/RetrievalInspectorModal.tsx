@@ -94,7 +94,7 @@ export function RetrievalInspectorModal({
             </div>
             <div>
               <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center space-x-2">
-                <span>Phase 7 Retrieval Inspector</span>
+                <span>Document Search Inspector</span>
                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-brand-100 dark:bg-brand-950/60 text-brand-700 dark:text-brand-300 border border-brand-200 dark:border-brand-800">
                   Dense + BM25 + RRF + Cross-Encoder
                 </span>

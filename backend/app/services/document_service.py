@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 from app.models.document import Document
 from app.models.ingestion_job import DocumentIngestionJob
 from app.services.workspace_service import WorkspaceService
+from app.services.ingestion.telemetry import event
 from app.services.storage_service import (
     StorageService,
     validate_upload_file,
@@ -83,29 +84,41 @@ class DocumentService:
             try:
                 doc.status = "queued"
                 db.add(doc)
-                db.add(DocumentIngestionJob(
+                job = DocumentIngestionJob(
+                    id=uuid.uuid4(),
                     document_id=doc.id,
                     workspace_id=doc.workspace_id,
                     user_id=doc.user_id,
                     status="queued",
                     attempt_count=0,
                     max_attempts=3,
-                ))
-                await db.commit()
-                await db.refresh(doc)
-                return doc
-            except Exception as e:
-                await db.rollback()
-                logger.error(
-                    "Database insert failed during document upload; rolling back storage file: %s",
-                    e,
                 )
-                # Rollback partial failure: delete the newly uploaded storage file to prevent orphans
-                await StorageService.delete_file(storage_path)
+                db.add(job)
+                await db.commit()
+            except Exception as e:
+                logger.error(
+                    "upload_metadata_failed document_id=%s category=%s",
+                    document_id, type(e).__name__,
+                )
+                # A lost commit acknowledgement is ambiguous. Check for a
+                # committed row before compensation; if the DB is unavailable,
+                # retain the object for reconciliation rather than breaking a job.
+                try:
+                    await db.rollback()
+                    committed = await cls.get_document(db, document_id, user_id)
+                    if committed is None and not await StorageService.delete_file(storage_path):
+                        logger.error("upload_compensation_failed document_id=%s", document_id)
+                except Exception as cleanup_error:
+                    logger.error("upload_compensation_failed document_id=%s category=%s", document_id, type(cleanup_error).__name__)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Failed to record document metadata in database",
                 )
+            # The metadata/job transaction has committed. A refresh failure must
+            # never delete the object now referenced by that committed transaction.
+            await db.refresh(doc)
+            event("queued", document_id=str(document_id), job_id=str(job.id), attempt=0)
+            return doc
 
         # In-memory fallback
         _IN_MEMORY_DOCUMENTS[doc.id] = doc

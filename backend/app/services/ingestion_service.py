@@ -14,6 +14,7 @@ from app.services.document_service import DocumentService
 from app.services.ingestion.pipeline import IngestionPipeline
 from app.services.ingestion.models import ProcessedChunk
 from app.db.session import AsyncSessionLocal
+from app.services.ingestion.telemetry import stage, event
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +122,10 @@ class IngestionService:
 
         # 3. Retrieve raw file bytes from private storage
         try:
-            _, file_bytes = await DocumentService.get_document_file(db, document_id, user_id)
-            if not file_bytes:
-                raise ValueError(f"Original file for document {document_id} was not found in storage.")
+            with stage("storage_download"):
+                _, file_bytes = await DocumentService.get_document_file(db, document_id, user_id)
+                if not file_bytes:
+                    raise ValueError("STORAGE_OBJECT_UNAVAILABLE")
 
             # 4. Run CPU-bound parsing, cleaning, and chunking in threadpool
             active_pipeline = pipeline or IngestionPipeline()
@@ -203,9 +205,13 @@ class IngestionService:
             return True
 
         except Exception as err:
+            event("failed", error_category=type(err).__name__, error_code="DOCUMENT_PROCESSING_FAILED")
             logger.error("document_processing_failed document_id=%s category=%s", document_id, type(err).__name__)
             failed_time = datetime.now(timezone.utc)
-            error_msg = str(err)
+            error_msg = (
+                "Document processing failed. Please retry or upload a new copy."
+                if settings.ENVIRONMENT.lower() in {"production", "prod"} else str(err)
+            )
 
             if db is not None:
                 try:

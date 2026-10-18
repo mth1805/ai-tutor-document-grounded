@@ -8,12 +8,14 @@ import logging
 import os
 import signal
 import uuid
+from time import perf_counter
 from typing import Any
 
 import httpx
 
 from app.core.config import settings
 from app.services.ingestion_service import IngestionService
+from app.services.ingestion.telemetry import context, event
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,10 @@ async def claim_jobs(limit: int = 5) -> list[dict[str, Any]]:
         "claim_document_ingestion_jobs",
         {"p_limit": max(1, min(limit, 10)), "p_lease_seconds": 3600},
     )
-    return result if isinstance(result, list) else []
+    jobs = result if isinstance(result, list) else []
+    for job in jobs:
+        event("claimed", job_id=job.get("job_id"), document_id=job.get("claimed_document_id"), attempt=job.get("claimed_attempt"))
+    return jobs
 
 
 async def load_claimed_job(job_id: uuid.UUID) -> dict[str, Any] | None:
@@ -72,6 +77,27 @@ async def finish_job(job_id: uuid.UUID, *, succeeded: bool) -> None:
 
 
 async def process_claimed_job(job_id: uuid.UUID) -> bool:
+    started = perf_counter()
+    token = context.set({"job_id": str(job_id), "document_id": None, "attempt": None, "metrics": {
+        "OCR_ms": 0, "embedding_count": 0, "chunk_count": 0,
+        "storage_download_ms": 0, "parsing_ms": 0, "chunking_ms": 0,
+        "model_load_ms": 0, "embedding_ms": 0, "vector_store_ms": 0,
+        "embedding_batch_size": settings.EMBEDDING_BATCH_SIZE,
+        "model_device": None,
+    }})
+    succeeded = False
+    try:
+        succeeded = await _process_claimed_job(job_id)
+        return succeeded
+    finally:
+        state = context.get()
+        event("ready" if succeeded else "failed", **state["metrics"],
+              total_ingestion_ms=round((perf_counter() - started) * 1000, 2),
+              final_ingestion_status="ready" if succeeded else "failed")
+        context.reset(token)
+
+
+async def _process_claimed_job(job_id: uuid.UUID) -> bool:
     """Run one claimed job; parser/provider detail is kept out of queue logs."""
     job = await load_claimed_job(job_id)
     if not job:
@@ -80,6 +106,12 @@ async def process_claimed_job(job_id: uuid.UUID) -> bool:
     document_id = uuid.UUID(job["claimed_document_id"])
     user_id = uuid.UUID(job["claimed_user_id"])
     attempt = int(job["claimed_attempt"])
+    context.get().update(document_id=str(document_id), attempt=attempt)
+    import torch
+    available = torch.cuda.is_available()
+    device_name = torch.cuda.get_device_name(0) if available else None
+    context.get()["metrics"].update(cuda_available=available, gpu_device_name=device_name)
+    event("claimed", cuda_available=available, gpu_device_name=device_name)
     logger.info(
         "ingestion_job_claimed job_id=%s document_id=%s attempt=%d",
         job_id, document_id, attempt,

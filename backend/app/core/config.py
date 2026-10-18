@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
     EMBEDDING_DIMENSION: int = 1024
     EMBEDDING_BATCH_SIZE: int = 16
-    EMBEDDING_DEVICE: str = "auto"  # auto | cpu | cuda
+    EMBEDDING_DEVICE: str = "cpu"  # cpu (default) | auto | cuda
     EMBEDDING_MODEL_CACHE_DIR: Path | None = None
     EMBEDDING_NORMALIZE: bool = True
     AUTO_EMBED_AFTER_INGESTION: bool = True
@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     CANDIDATE_POOL_SIZE: int = 30
     RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
     RERANKER_BATCH_SIZE: int = 16
-    RERANKER_DEVICE: str = "auto"  # auto | cpu | cuda
+    RERANKER_DEVICE: str = "cpu"  # cpu (default) | auto | cuda
     RERANKER_MODEL_CACHE_DIR: Path | None = None
     RERANK_TOP_K: int = 5
     RELEVANCE_THRESHOLD: float = 0.35
@@ -122,6 +122,9 @@ class Settings(BaseSettings):
     TAVILY_MAX_RESULTS: int = 5
     # Timeout in seconds for a single Tavily HTTP request
     WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
+
+    # Phase 9.1: terminate symbolic computation rather than blocking chat indefinitely.
+    MATH_SOLVER_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=30)
 
     @model_validator(mode="after")
     def validate_production_configuration(self):

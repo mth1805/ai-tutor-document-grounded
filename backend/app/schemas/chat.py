@@ -2,6 +2,7 @@
 import uuid
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, field_validator
+from app.schemas.math_solver import SolverMetadata
 
 
 class ChatRequest(BaseModel):
@@ -21,6 +22,8 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional workspace ID verification against parent conversation.",
     )
+    document_id: Optional[uuid.UUID] = Field(default=None, description="Explicitly attached document.")
+    active_document_id: Optional[uuid.UUID] = Field(default=None, description="Document open in the viewer.")
 
     @field_validator("content")
     @classmethod
@@ -39,3 +42,4 @@ class ChatResponse(BaseModel):
     content: str
     citations: List[Dict[str, Any]] = Field(default_factory=list)
     has_sufficient_evidence: bool = True
+    solver: Optional[SolverMetadata] = None
