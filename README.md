@@ -1,12 +1,44 @@
 # AI Tutor Assistant
 
+AI Tutor Assistant is an enterprise-grade, document-grounded AI learning assistant designed to help users learn directly from their uploaded documents (PDF/DOCX) organized into private workspaces.
+
 For frontend deployment preparation and manual Vercel settings, see [Vercel deployment guide](docs/vercel-deployment.md). FastAPI remains on Modal; use `frontend/.env.example` for browser-safe configuration.
 
 For verified symbolic mathematics, see [Phase 9.1 — Verified Math Solver](docs/phase9_1_verified_math_solver.md).
 
 For Word equation extraction, readable preview fallback, and the collapsible navigation sidebar, see [DOCX equations and sidebar controls](docs/docx-equations-sidebar.md).
 
-AI Tutor Assistant is an enterprise-grade, document-grounded AI learning assistant designed to help users learn directly from their uploaded documents (PDF/DOCX) organized into private workspaces.
+<!-- Core stack -->
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&amp;logo=python&amp;logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&amp;logo=fastapi&amp;logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Next.js-000000?style=for-the-badge&amp;logo=nextdotjs&amp;logoColor=white" alt="Next.js" />
+  <img src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&amp;logo=typescript&amp;logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Supabase-3FCF8E?style=for-the-badge&amp;logo=supabase&amp;logoColor=black" alt="Supabase" />
+  <img src="https://img.shields.io/badge/PostgreSQL%20%2B%20pgvector-4169E1?style=for-the-badge&amp;logo=postgresql&amp;logoColor=white" alt="PostgreSQL + pgvector" />
+</p>
+
+<!-- AI and RAG -->
+<p align="center">
+  <img src="https://img.shields.io/badge/Gemini%20API-8E75B2?style=for-the-badge&amp;logo=googlegemini&amp;logoColor=white" alt="Gemini API" />
+  <img src="https://img.shields.io/badge/BGE--M3-6366F1?style=for-the-badge" alt="BGE-M3" />
+  <img src="https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&amp;logo=pytorch&amp;logoColor=white" alt="PyTorch" />
+  <img src="https://img.shields.io/badge/Hugging%20Face-FFD21E?style=for-the-badge&amp;logo=huggingface&amp;logoColor=black" alt="Hugging Face" />
+  <img src="https://img.shields.io/badge/Cross--Encoder%20Reranking-7C3AED?style=for-the-badge" alt="Cross-Encoder Reranking" />
+  <img src="https://img.shields.io/badge/SymPy-3B5526?style=for-the-badge&amp;logo=sympy&amp;logoColor=white" alt="SymPy" />
+  <img src="https://img.shields.io/badge/Tavily%20Web%20Search-0D9488?style=for-the-badge" alt="Tavily Web Search" />
+  <img src="https://img.shields.io/badge/RAGAS%20Evaluation-0891B2?style=for-the-badge" alt="RAGAS Evaluation (optional tooling)" />
+</p>
+
+<!-- Infrastructure; the status badge tracks the keep-alive workflow, not CI tests. -->
+<p align="center">
+  <img src="https://img.shields.io/badge/Docker%20Compose-2496ED?style=for-the-badge&amp;logo=docker&amp;logoColor=white" alt="Docker Compose" />
+  <img src="https://img.shields.io/badge/Modal-7FEE64?style=for-the-badge&amp;logo=modal&amp;logoColor=black" alt="Modal" />
+  <img src="https://img.shields.io/badge/Vercel-000000?style=for-the-badge&amp;logo=vercel&amp;logoColor=white" alt="Vercel" />
+  <a href="https://github.com/mth1805/AI-Tutor-Assistant---Document-Grounded-Learning-Assistant/actions/workflows/supabase-keepalive.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/mth1805/AI-Tutor-Assistant---Document-Grounded-Learning-Assistant/supabase-keepalive.yml?style=for-the-badge&amp;label=Supabase%20Keep--Alive&amp;logo=githubactions&amp;logoColor=white" alt="GitHub Actions: Supabase development keep-alive workflow status" />
+  </a>
+</p>
 
 ---
 
@@ -176,19 +208,19 @@ For local development, install the system executables and OCR language data befo
 > **Phase 6 Status:** BGE-M3 Dense Embedding, pgvector HNSW indexing, embedding lifecycle tracking, and non-blocking batch execution are fully implemented. Chunks generated in Phase 5 are embedded into 1024-dimensional normalized vectors and persisted atomically in PostgreSQL. Model loading is centralized as a thread-safe singleton, with local weight caching and safe CPU fallback.
 
 ### Development Phases
-- [x] **Phase 1: Foundation** — Scaffolding, agent governance, clean Next.js UI, FastAPI health probes, decoupled DB layer.
-- [x] **Phase 2: Authentication + Workspace** — Supabase auth, user workspaces, workspace switcher, CRUD APIs with RLS.
-- [x] **Phase 3: Conversation Persistence** — Multi-conversation threads per workspace, message history schema & persistence.
-- [x] **Phase 4: Document Upload + Storage** — PDF/DOCX/TXT/Image file uploads, Supabase private storage bucket, file validation, document metadata persistence, and workspace isolation.
-- [x] **Phase 5: Document Ingestion** — Text extraction, cleaning, structure-aware chunking, page-number tracking.
-- [x] **Phase 6: Embedding + Vector Database** — BGE-M3 integration, local weight caching, batch embedding, pgvector storage with HNSW index.
-- [ ] **Phase 7: Hybrid Retrieval + Reranking** — Dense vector search + BM25 lexical search, RRF fusion, Cross-Encoder reranking.
-- [ ] **Phase 8: RAG Generation** — Prompt assembly, grounded LLM generation via Gemini API, prompt injection guards.
-- [ ] **Phase 9: Document-First + Web Fallback** — Relevance gating, automated web search fallback when document evidence is insufficient.
-- [ ] **Phase 10: Citation + Streaming** — Token streaming over SSE, inline document citations (`[Doc: file.pdf, p. 3]`), web source cards.
-- [ ] **Phase 11: Background Processing + Performance** — Asynchronous task queues for ingestion, query optimization.
-- [ ] **Phase 12: Evaluation** — RAG metrics benchmark (Recall@K, MRR, Faithfulness, Answer Relevance).
-- [ ] **Phase 13: UI Polish + Deployment** — Production build audits, responsive UI refinement, Dockerization.
+- **Phase 1: Foundation** — Scaffolding, agent governance, clean Next.js UI, FastAPI health probes, decoupled DB layer.
+- **Phase 2: Authentication + Workspace** — Supabase auth, user workspaces, workspace switcher, CRUD APIs with RLS.
+- **Phase 3: Conversation Persistence** — Multi-conversation threads per workspace, message history schema & persistence.
+- **Phase 4: Document Upload + Storage** — PDF/DOCX/TXT/Image file uploads, Supabase private storage bucket, file validation, document metadata persistence, and workspace isolation.
+- **Phase 5: Document Ingestion** — Text extraction, cleaning, structure-aware chunking, page-number tracking.
+- **Phase 6: Embedding + Vector Database** — BGE-M3 integration, local weight caching, batch embedding, pgvector storage with HNSW index.
+- **Phase 7: Hybrid Retrieval + Reranking** — Dense vector search + BM25 lexical search, RRF fusion, Cross-Encoder reranking.
+- **Phase 8: RAG Generation** — Prompt assembly, grounded LLM generation via Gemini API, prompt injection guards.
+- **Phase 9: Document-First + Web Fallback** — Relevance gating, automated web search fallback when document evidence is insufficient.
+- **Phase 10: Citation + Streaming** — Token streaming over SSE, inline document citations (`[Doc: file.pdf, p. 3]`), web source cards.
+- **Phase 11: Background Processing + Performance** — Asynchronous task queues for ingestion, query optimization.
+- **Phase 12: Evaluation** — RAG metrics benchmark (Recall@K, MRR, Faithfulness, Answer Relevance).
+- **Phase 13: UI Polish + Deployment** — Production build audits, responsive UI refinement, Dockerization.
 
 ---
 
