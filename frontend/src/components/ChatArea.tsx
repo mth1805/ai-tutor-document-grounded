@@ -41,7 +41,7 @@ export function ChatArea() {
   const conversationId = (params?.conversationId as string) || null;
 
   const { user, token } = useAuth();
-  const { setSelectedDocument, setIsViewerCollapsed } = useDocument();
+  const { selectedDocument, setSelectedDocument, setIsViewerCollapsed } = useDocument();
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
@@ -139,6 +139,8 @@ export function ChatArea() {
           content,
           chat_mode: chatMode,
           workspace_id: workspaceId || undefined,
+          active_document_id: selectedDocument?.workspace_id === workspaceId
+            ? selectedDocument.id : undefined,
         },
         token,
         {
@@ -252,7 +254,7 @@ export function ChatArea() {
   };
 
   return (
-    <main className="flex-1 flex flex-col h-full bg-slate-50/50 dark:bg-slate-900/60 relative overflow-hidden transition-colors">
+    <main className="flex-1 min-w-0 flex flex-col h-full bg-slate-50/50 dark:bg-slate-900/60 relative overflow-hidden transition-colors">
       {/* Workspace / Conversation Sub-header */}
       {workspaceId && (
         <div className="h-10 border-b border-slate-200 dark:border-slate-800/80 bg-white/80 dark:bg-slate-950/40 px-4 flex items-center justify-between text-xs text-slate-600 dark:text-slate-300 shrink-0">
@@ -279,7 +281,7 @@ export function ChatArea() {
 
           <span className="text-[11px] text-brand-600 dark:text-brand-400 font-medium hidden sm:inline flex items-center space-x-1">
             <Sparkles className="w-3 h-3 inline mr-1" />
-            Phase 9: Document-Grounded AI Tutor + Web Fallback Active
+            Document-grounded AI Tutor with Web Fallback
           </span>
         </div>
       )}
@@ -538,7 +540,7 @@ export function ChatArea() {
                 <div className="flex items-center space-x-2 pt-2 border-t border-slate-200 dark:border-slate-800/80 text-[11px] text-slate-500 dark:text-slate-400">
                   <Sparkles className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400 shrink-0" />
                   <span>
-                    Phase 8 Active: Grounded LLM generation with streaming tokens, citation attribution, and relevance gating.
+                    Answers stream with source citations from relevant evidence.
                   </span>
                 </div>
               </div>
@@ -598,7 +600,7 @@ export function ChatArea() {
               <div className="inline-flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
                 <Sparkles className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400 shrink-0" />
                 <span>
-                  Phase 8 Active: Grounded RAG token streaming with verifiable document citations.
+                  Answers stream with verifiable document citations.
                 </span>
               </div>
             </div>

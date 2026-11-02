@@ -270,7 +270,7 @@ def test_filename_sanitization_and_path_traversal_defense():
     assert doc["original_filename"] == "passwd.txt"
 
     # Storage path must be correctly scoped to the workspace and document UUID
-    assert doc["storage_path"] == f"{ws_id}/{doc['id']}/passwd.txt"
+    assert doc["storage_path"] == f"{ws_id}/{doc['id']}/source.txt"
 
 
 def test_partial_failure_rollback_cleans_up_storage():

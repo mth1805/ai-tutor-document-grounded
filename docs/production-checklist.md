@@ -2,6 +2,8 @@
 
 Items are checked only when verified from repository code or locally run validation. Deployment-specific items remain pending.
 
+Local Compose now includes the existing CPU ingestion worker and persistent model cache. The manual Dev migration and end-to-end queue verification are tracked separately in [local Docker runtime](local-docker-runtime.md); local success must not be treated as production verification.
+
 ## Security
 
 - [x] Secrets are read through backend environment settings; frontend client code does not reference server keys.
@@ -92,3 +94,28 @@ Items are checked only when verified from repository code or locally run validat
 
 - [x] Deployment documentation describes code and frontend rollback without destructive database actions.
 - [ ] Record target Modal/Vercel revisions and operational owner before launch.
+
+## Vercel frontend
+
+See [Vercel deployment guide](vercel-deployment.md) for settings, environment contract, and manual order. Live checks remain pending until an authorized deployment.
+
+- [ ] Modal backend deployed.
+- [ ] Supported patched Next.js major approved and validated before production release.
+- [ ] Modal `/health` PASS.
+- [ ] Modal `/ready` PASS.
+- [ ] Final HTTPS Modal API URL recorded.
+- [ ] Production Supabase schema/RLS/private Storage/Auth configured.
+- [ ] Frontend browser-safe Supabase URL and anon/publishable key configured.
+- [ ] `NEXT_PUBLIC_API_BASE_URL` configured at build time.
+- [ ] Production Vercel origin added to Modal `BACKEND_CORS_ORIGINS`; backend restarted.
+- [ ] Supabase Site URL and trusted auth redirects configured.
+- [ ] Frontend production build PASS for final production values.
+- [ ] Vercel deployment PASS.
+- [ ] Auth and session refresh PASS.
+- [ ] Upload and document viewer PASS.
+- [ ] RAG PASS.
+- [ ] SSE, Stop Generation, and disconnect handling PASS through Modal.
+- [ ] Citations PASS.
+- [ ] Reload and logout/login persistence PASS.
+- [ ] No backend secrets in final browser bundle.
+- [ ] Browser console free of critical errors.

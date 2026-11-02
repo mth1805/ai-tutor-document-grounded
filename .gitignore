@@ -31,6 +31,7 @@ secrets/
 # Next.js build output
 frontend/.next/
 frontend/out/
+.vercel/
 build/
 dist/
 

@@ -11,6 +11,7 @@ from app.db.session import get_db
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.conversation_service import ConversationService
 from app.services.rag_service import RAGService
+from app.services.document_reference import DocumentReferenceResolver
 from app.rag.prompt_builder import ChatMode
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,10 @@ async def stream_chat_message(
             detail=str(ve),
         )
 
+    selected_id = payload.document_id or payload.active_document_id
+    if selected_id:
+        await DocumentReferenceResolver.validate_id(db, selected_id, conversation.workspace_id, current_user.id)
+
     stream_generator = RAGService.stream_chat(
         db=db,
         conversation_id=conversation_id,
@@ -64,6 +69,8 @@ async def stream_chat_message(
         query=payload.content,
         chat_mode_str=payload.chat_mode,
         workspace_id=payload.workspace_id,
+        document_id=payload.document_id,
+        active_document_id=payload.active_document_id,
     )
 
     return StreamingResponse(
@@ -111,6 +118,10 @@ async def sync_chat_message(
             detail=str(ve),
         )
 
+    selected_id = payload.document_id or payload.active_document_id
+    if selected_id:
+        await DocumentReferenceResolver.validate_id(db, selected_id, conversation.workspace_id, current_user.id)
+
     result = await RAGService.generate_chat(
         db=db,
         conversation_id=conversation_id,
@@ -118,6 +129,8 @@ async def sync_chat_message(
         query=payload.content,
         chat_mode_str=payload.chat_mode,
         workspace_id=payload.workspace_id,
+        document_id=payload.document_id,
+        active_document_id=payload.active_document_id,
     )
 
     return ChatResponse(
@@ -126,4 +139,5 @@ async def sync_chat_message(
         content=result.get("content", ""),
         citations=result.get("citations", []),
         has_sufficient_evidence=result.get("has_sufficient_evidence", True),
+        solver=result.get("solver"),
     )

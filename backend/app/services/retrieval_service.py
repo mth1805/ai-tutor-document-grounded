@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any, Set, Tuple
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.concurrency import run_in_threadpool
+from app.ml.local_runtime import infer
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
@@ -62,6 +63,7 @@ class RetrievalService:
         user_id: uuid.UUID,
         query_vector: List[float],
         top_k: int,
+        document_id: Optional[uuid.UUID] = None,
     ) -> List[RetrievalCandidate]:
         """Performs semantic vector search against document_chunks.embedding using cosine similarity."""
         if db is not None:
@@ -74,6 +76,8 @@ class RetrievalService:
                 FROM public.document_chunks
                 WHERE workspace_id = :workspace_id
                   AND user_id = :user_id
+                  AND (CAST(:document_id AS uuid) IS NULL OR document_id = CAST(:document_id AS uuid))
+                  AND length(trim(content)) > 0
                   AND embedding IS NOT NULL
                 ORDER BY embedding <=> CAST(:vec_literal AS vector) ASC
                 LIMIT :top_k
@@ -85,6 +89,7 @@ class RetrievalService:
                         "workspace_id": workspace_id,
                         "user_id": user_id,
                         "vec_literal": vec_literal,
+                        "document_id": str(document_id) if document_id else None,
                         "top_k": top_k,
                     },
                 )
@@ -121,6 +126,8 @@ class RetrievalService:
                     chunk.workspace_id == workspace_id
                     and chunk.user_id == user_id
                     and chunk.embedding is not None
+                    and (document_id is None or chunk.document_id == document_id)
+                    and chunk.content.strip()
                 ):
                     # Compute cosine similarity between chunk.embedding and query_vector
                     c_vec = chunk.embedding
@@ -158,6 +165,7 @@ class RetrievalService:
         user_id: uuid.UUID,
         query: str,
         top_k: int,
+        document_id: Optional[uuid.UUID] = None,
     ) -> List[RetrievalCandidate]:
         """Performs PostgreSQL full-text search with cover-density ranking (ts_rank_cd).
 
@@ -182,6 +190,8 @@ class RetrievalService:
                 FROM public.document_chunks
                 WHERE workspace_id = :workspace_id
                   AND user_id = :user_id
+                  AND (CAST(:document_id AS uuid) IS NULL OR document_id = CAST(:document_id AS uuid))
+                  AND length(trim(content)) > 0
                   AND (
                       tsv @@ websearch_to_tsquery('simple', :query)
                       OR tsv @@ websearch_to_tsquery('english', :query)
@@ -196,6 +206,7 @@ class RetrievalService:
                         "workspace_id": workspace_id,
                         "user_id": user_id,
                         "query": cleaned_query,
+                        "document_id": str(document_id) if document_id else None,
                         "top_k": top_k,
                     },
                 )
@@ -213,6 +224,8 @@ class RetrievalService:
                         FROM public.document_chunks
                         WHERE workspace_id = :workspace_id
                           AND user_id = :user_id
+                          AND (CAST(:document_id AS uuid) IS NULL OR document_id = CAST(:document_id AS uuid))
+                          AND length(trim(content)) > 0
                           AND (
                               tsv @@ plainto_tsquery('simple', :query)
                               OR tsv @@ plainto_tsquery('english', :query)
@@ -226,6 +239,7 @@ class RetrievalService:
                             "workspace_id": workspace_id,
                             "user_id": user_id,
                             "query": cleaned_query,
+                            "document_id": str(document_id) if document_id else None,
                             "top_k": top_k,
                         },
                     )
@@ -264,7 +278,8 @@ class RetrievalService:
 
         for chunks in _IN_MEMORY_CHUNKS.values():
             for chunk in chunks:
-                if chunk.workspace_id == workspace_id and chunk.user_id == user_id:
+                if (chunk.workspace_id == workspace_id and chunk.user_id == user_id
+                        and (document_id is None or chunk.document_id == document_id)):
                     content_words = [w.lower() for w in re.findall(r"\w+", chunk.content)]
                     if not content_words:
                         continue
@@ -394,11 +409,12 @@ class RetrievalService:
         pairs = [(query, c.content) for c in candidates]
 
         # Execute blocking model inference in threadpool to keep the asyncio event loop responsive
-        scores: List[float] = await run_in_threadpool(
-            reranker.predict,
-            pairs,
-            batch_size=batch_size,
-        )
+        scores: List[float] = []
+        if settings.LOCAL_SHARED_MODELS:
+            for pair in pairs:
+                scores.extend(await infer(reranker.predict, [pair], batch_size=1))
+        else:
+            scores = await infer(reranker.predict, pairs, batch_size=batch_size)
 
         for candidate, score in zip(candidates, scores):
             candidate.rerank_score = round(float(score), 4)
@@ -464,6 +480,11 @@ class RetrievalService:
             else settings.RELEVANCE_THRESHOLD
         )
 
+        # Avoid waiting on the loading singleton inside a local request.
+        if settings.LOCAL_SHARED_MODELS:
+            from app.ml.local_runtime import ready
+            if not ready.is_set():
+                raise ValueError("Local models are warming up or unavailable; retry shortly")
         # Model providers (reused singletons)
         emb_provider = embedding_provider or get_embedding_provider()
         rerank_provider = reranker_provider or get_reranker_provider()
@@ -473,7 +494,7 @@ class RetrievalService:
         # Step 1 & 2: Concurrent Dense and Lexical Retrieval
         async def _execute_dense() -> Tuple[List[RetrievalCandidate], float, float]:
             t_d0 = time.perf_counter()
-            query_vectors = await run_in_threadpool(
+            query_vectors = await infer(
                 emb_provider.encode_batch,
                 [query_str],
                 normalize=settings.EMBEDDING_NORMALIZE,
@@ -492,6 +513,7 @@ class RetrievalService:
                         user_id=user_id,
                         query_vector=q_vec,
                         top_k=dense_k,
+                        **({"document_id": request.document_id} if request.document_id else {}),
                     )
             else:
                 cands = await cls.dense_retrieve(
@@ -500,6 +522,7 @@ class RetrievalService:
                     user_id=user_id,
                     query_vector=q_vec,
                     top_k=dense_k,
+                    **({"document_id": request.document_id} if request.document_id else {}),
                 )
             t_dense = (time.perf_counter() - t_d_search) * 1000
             return cands, t_embed, t_dense
@@ -515,6 +538,7 @@ class RetrievalService:
                         user_id=user_id,
                         query=query_str,
                         top_k=lexical_k,
+                        **({"document_id": request.document_id} if request.document_id else {}),
                     )
             else:
                 cands = await cls.lexical_retrieve(
@@ -523,6 +547,7 @@ class RetrievalService:
                     user_id=user_id,
                     query=query_str,
                     top_k=lexical_k,
+                    **({"document_id": request.document_id} if request.document_id else {}),
                 )
             t_lex = (time.perf_counter() - t_l0) * 1000
             return cands, t_lex
