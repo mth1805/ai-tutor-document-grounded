@@ -232,11 +232,10 @@ export function MarkdownRenderer({
                         onOpenCitation?.(parsed);
                       }}
                       aria-label={`${parsed.document_name}, ${tooltipPage}`}
+                      title={`${parsed.document_name}, ${tooltipPage}`}
                       className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded text-[10px] font-mono text-slate-500 hover:text-brand-600 dark:text-slate-400 dark:hover:text-brand-300 bg-slate-100/90 hover:bg-brand-50/90 dark:bg-slate-800/80 dark:hover:bg-brand-950/70 border border-slate-200/80 hover:border-brand-300 dark:border-slate-700/70 dark:hover:border-brand-700/70 transition-all cursor-pointer align-baseline focus:outline-none focus-visible:ring-1 focus-visible:ring-brand-500 leading-none"
                     >
-                      <span className="text-[10px] leading-none" aria-hidden="true">
-                        📄
-                      </span>
+                      <FileText className="w-2.5 h-2.5" aria-hidden="true" />
                       <span className="font-medium tracking-tight">{pageBadge}</span>
                     </button>
 

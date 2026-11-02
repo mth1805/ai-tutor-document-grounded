@@ -21,6 +21,7 @@ export function WorkspaceSplitView() {
 
   const {
     selectedDocument,
+    selectedPage,
     setSelectedDocument,
     isViewerCollapsed,
     setIsViewerCollapsed,
@@ -136,6 +137,7 @@ export function WorkspaceSplitView() {
           <DocumentViewer
             workspaceId={workspaceId}
             document={selectedDocument}
+            page={selectedPage}
             onClose={() => setSelectedDocument(null)}
             onSelectDocument={(doc) => setSelectedDocument(doc)}
           />

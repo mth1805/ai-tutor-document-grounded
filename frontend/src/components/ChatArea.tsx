@@ -213,13 +213,11 @@ export function ChatArea() {
         try {
           const docs = await apiClient.listDocuments(workspaceId, token);
           const targetName = citation.document_name.toLowerCase().trim();
-          const match = docs.find(
+          const matches = docs.filter(
             (d) =>
-              d.original_filename.toLowerCase().trim() === targetName ||
-              targetName.includes(d.original_filename.toLowerCase().trim()) ||
-              d.original_filename.toLowerCase().trim().includes(targetName)
+              d.original_filename.normalize("NFC").toLowerCase().trim() === targetName.normalize("NFC")
           );
-          if (match) docId = match.id;
+          if (matches.length === 1) docId = matches[0].id;
         } catch (fetchErr) {
           console.warn("Could not resolve document list for citation name lookup", fetchErr);
         }
@@ -227,7 +225,7 @@ export function ChatArea() {
 
       if (docId) {
         const doc = await apiClient.getDocument(docId, token);
-        setSelectedDocument(doc);
+        setSelectedDocument(doc, citation.page_start);
       }
     } catch (err) {
       console.error("Failed to open cited document in viewer", err);
