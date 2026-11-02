@@ -23,15 +23,17 @@ def test_unauthenticated_request_rejected():
 
 def test_development_test_token_is_rejected_outside_development(monkeypatch):
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "SUPABASE_URL", None)
     response = client.get("/api/v1/workspaces", headers=USER_1_HEADERS)
     assert response.status_code == 401
 
 
-def test_unsigned_jwt_is_rejected():
+def test_unsigned_jwt_is_rejected(monkeypatch):
     unsigned_token = (
         "eyJhbGciOiJub25lIn0."
         "eyJzdWIiOiIxMTExMTExMS0xMTExLTExMTEtMTExMS0xMTExMTExMTExMTEifQ."
     )
+    monkeypatch.setattr(settings, "SUPABASE_URL", None)
     response = client.get(
         "/api/v1/workspaces",
         headers={"Authorization": f"Bearer {unsigned_token}"},

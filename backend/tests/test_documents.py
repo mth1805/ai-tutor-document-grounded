@@ -232,15 +232,15 @@ def test_file_validation_rules():
     assert spoofed_res.status_code == 400
     assert "magic bytes" in spoofed_res.json()["detail"].lower() or "match" in spoofed_res.json()["detail"].lower()
 
-    # 4. Oversized file rejected (400)
+    # 4. Oversized file rejected before the route buffers it (413)
     oversized_content = b"%PDF-" + b"0" * (27 * 1024 * 1024)
     oversized_res = client.post(
         f"/api/v1/workspaces/{ws_id}/documents",
         headers=HEADERS_A,
         files={"file": ("huge.pdf", oversized_content, "application/pdf")},
     )
-    assert oversized_res.status_code == 400
-    assert "maximum" in oversized_res.json()["detail"].lower()
+    assert oversized_res.status_code == 413
+    assert oversized_res.json()["error"]["code"] == "REQUEST_TOO_LARGE"
 
 
 def test_filename_sanitization_and_path_traversal_defense():
@@ -270,7 +270,7 @@ def test_filename_sanitization_and_path_traversal_defense():
     assert doc["original_filename"] == "passwd.txt"
 
     # Storage path must be correctly scoped to the workspace and document UUID
-    assert doc["storage_path"] == f"{ws_id}/{doc['id']}/passwd.txt"
+    assert doc["storage_path"] == f"{ws_id}/{doc['id']}/source.txt"
 
 
 def test_partial_failure_rollback_cleans_up_storage():

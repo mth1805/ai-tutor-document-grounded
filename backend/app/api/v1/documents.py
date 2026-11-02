@@ -1,4 +1,5 @@
 import uuid
+from urllib.parse import quote
 from typing import List
 from fastapi import (
     APIRouter,
@@ -26,8 +27,33 @@ from app.services.document_service import DocumentService
 from app.services.storage_service import StorageService
 from app.services.ingestion_service import IngestionService
 from app.services.embedding_service import EmbeddingService
+from app.services.document_preview import get_preview_content
+from app.core.config import settings
 
 router = APIRouter(tags=["documents"])
+
+
+def content_disposition(filename: str, disposition: str = "attachment") -> str:
+    from app.services.storage_service import sanitize_filename
+    name = sanitize_filename(filename)
+    fallback = name.encode("ascii", "ignore").decode().replace('"', "_").replace("\\", "_") or "document"
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+
+
+@router.get("/documents/{document_id}/preview", summary="Preview Private Document")
+async def preview_document(
+    document_id: uuid.UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    preview = await get_preview_content(db, document_id, current_user.id)
+    if preview is None:
+        raise HTTPException(404, "Document file not found or unauthorized")
+    content, mime, name = preview
+    return Response(content, media_type=mime, headers={
+        "Content-Disposition": content_disposition(name, "inline"),
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.post(
@@ -44,7 +70,14 @@ async def upload_document(
     db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
     """Uploads a document to private storage, records its metadata, and schedules background ingestion."""
-    content = await file.read()
+    # Read at most one byte beyond the configured maximum so oversized uploads
+    # are rejected without buffering an unbounded body in application memory.
+    content = await file.read(settings.MAX_FILE_SIZE_BYTES + 1)
+    if len(content) > settings.MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Uploaded file exceeds the configured size limit.",
+        )
     filename = file.filename or "document.bin"
     mime_type = file.content_type
 
@@ -63,12 +96,14 @@ async def upload_document(
             detail="Workspace not found or unauthorized",
         )
 
-    # Schedule asynchronous ingestion processing
-    background_tasks.add_task(
-        IngestionService.process_document_background,
-        doc.id,
-        current_user.id,
-    )
+    # Database-backed deployments rely on the durable job row committed with
+    # the document; only the in-memory development adapter uses BackgroundTasks.
+    if db is None:
+        background_tasks.add_task(
+            IngestionService.process_document_background,
+            doc.id,
+            current_user.id,
+        )
 
     return DocumentResponse.model_validate(doc)
 
@@ -158,8 +193,9 @@ async def download_document(
         content=content,
         media_type=doc.mime_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{doc.original_filename}"',
-            "Cache-Control": "private, max-age=3600",
+            "Content-Disposition": content_disposition(doc.original_filename),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -210,26 +246,29 @@ async def process_document(
             detail="Document not found or unauthorized",
         )
 
-    # Immediately mark as processing in the record
-    doc.status = "processing"
     if db is not None:
         try:
-            await db.commit()
-            await db.refresh(doc)
+            enqueued = await IngestionService.enqueue_document(db, doc, current_user.id)
+            if enqueued:
+                await db.commit()
+                await db.refresh(doc)
         except Exception:
             await db.rollback()
-
-    # Enqueue background task
-    background_tasks.add_task(
-        IngestionService.process_document_background,
-        document_id,
-        current_user.id,
-    )
+            raise
+        response_status = doc.status
+    else:
+        doc.status = "processing"
+        response_status = "processing"
+        background_tasks.add_task(
+            IngestionService.process_document_background,
+            document_id,
+            current_user.id,
+        )
 
     return DocumentProcessResponse(
         document_id=document_id,
-        status="processing",
-        message="Document ingestion scheduled successfully.",
+        status=response_status,
+        message="Document ingestion queued." if response_status == "queued" else "Document ingestion is already running.",
     )
 
 
@@ -283,6 +322,11 @@ async def embed_document(
         )
 
     # Immediately mark embedding_status as processing
+    from app.core.config import settings
+    if settings.LOCAL_SHARED_MODELS:
+        from app.ml.local_runtime import ready
+        if not ready.is_set():
+            raise HTTPException(503, "Local models are warming up; retry shortly")
     doc.embedding_status = "processing"
     if db is not None:
         try:
@@ -326,4 +370,3 @@ async def get_document_embedding_status(
         )
 
     return DocumentEmbeddingStatusResponse.model_validate(status_info)
-

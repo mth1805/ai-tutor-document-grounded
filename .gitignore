@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+frontend/node_modules/
 .pnp
 .pnp.js
 __pycache__/
@@ -18,10 +19,19 @@ ENV/
 .env.development.local
 .env.test.local
 .env.production.local
+.env.*
+!.env.example
+!**/.env.example
+*.log
+*.pem
+*.key
+*.secret
+secrets/
 
 # Next.js build output
 frontend/.next/
 frontend/out/
+.vercel/
 build/
 dist/
 
@@ -29,11 +39,29 @@ dist/
 cache/
 .cache/
 hf_cache/
+**/model_cache/
+backend/.models/
+backend/models/
+models/
+*.safetensors
+*.pth
+*.pt
 
 # Testing & coverage
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Benchmark captures are reproducible runtime inputs, not committed results.
+backend/benchmarks/results/captured_runs.json
+backend/benchmarks/results/captured_answer_runs.json
+backend/benchmarks/results/captured_runs.jsonl
+backend/benchmarks/results/captured_answer_runs.jsonl
+backend/benchmarks/results/captured_runs_pretty.json
+backend/benchmarks/results/captured_answer_runs_pretty.json
+backend/benchmarks/results/smoke_answer_runs.jsonl
+backend/benchmarks/results/captured_runs_summary.md
+backend/benchmarks/results/captured_answer_summary.md
 
 # IDE & OS
 .vscode/
