@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import time
 from typing import AsyncGenerator
@@ -27,7 +28,11 @@ logger = logging.getLogger("app.http")
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan context manager for startup and shutdown events."""
     # Startup: Pre-warm embedding and reranker models if configured
-    if settings.PREWARM_MODELS:
+    model_task = None
+    if settings.LOCAL_SHARED_MODELS:
+        from app.ml.local_runtime import serve_models
+        model_task = asyncio.create_task(serve_models())
+    elif settings.PREWARM_MODELS:
         from fastapi.concurrency import run_in_threadpool
         from app.ml.loader import warmup_embedding_model, warmup_reranker_model
 
@@ -36,6 +41,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
+        if model_task is not None:
+            model_task.cancel()
+            await asyncio.gather(model_task, return_exceptions=True)
         if engine is not None:
             await engine.dispose()
 
@@ -126,3 +134,6 @@ app.add_api_route("/ready", readiness_check, methods=["GET"], response_model=Hea
 
 # Include Versioned API Routers
 app.include_router(api_v1_router, prefix=settings.API_V1_STR)
+if settings.LOCAL_SHARED_MODELS:
+    from app.api.v1.local_models import router as local_models_router
+    app.include_router(local_models_router, include_in_schema=False)

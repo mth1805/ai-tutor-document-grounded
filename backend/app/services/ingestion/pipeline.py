@@ -8,6 +8,7 @@ from app.services.ingestion.chunker import StructureAwareChunker
 from app.services.ingestion.parsers.factory import get_parser_for_mime_or_filename
 from app.services.ingestion.ocr.base import OCRProvider
 from app.services.ingestion.ocr.tesseract import TesseractOCRProvider
+from app.services.ingestion.telemetry import stage, TimedOCR, metric
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +52,13 @@ class IngestionPipeline:
         parser = get_parser_for_mime_or_filename(
             mime_type=mime_type,
             filename=filename,
-            ocr_provider=self.ocr_provider,
+            ocr_provider=TimedOCR(self.ocr_provider),
             min_text_chars=self.ocr_min_chars,
         )
 
         # 2. Parse file into pages
-        pages = parser.parse(content=content, filename=filename)
+        with stage("parsing"):
+            pages = parser.parse(content=content, filename=filename)
 
         # 3. Clean page text
         cleaned_pages: List[DocumentPage] = []
@@ -73,5 +75,7 @@ class IngestionPipeline:
                 )
 
         # 4. Chunk cleaned pages
-        chunks = self.chunker.chunk_pages(cleaned_pages)
+        with stage("chunking"):
+            chunks = self.chunker.chunk_pages(cleaned_pages)
+        metric(chunk_count=len(chunks))
         return chunks

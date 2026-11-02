@@ -23,6 +23,7 @@ import { apiClient, Workspace, Conversation } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { DocumentManager } from "@/components/DocumentManager";
 import { useDocument } from "@/lib/document-context";
+import { CollapsibleSidebar } from "@/components/CollapsibleSidebar";
 
 export function Sidebar() {
   const router = useRouter();
@@ -252,10 +253,11 @@ export function Sidebar() {
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId);
 
   return (
-    <aside className="w-64 bg-white dark:bg-slate-950 border-r border-slate-200 dark:border-slate-800 flex flex-col h-full select-none shrink-0 transition-colors">
+    <CollapsibleSidebar>
+    <aside aria-label="Workspace navigation" className="w-full bg-white dark:bg-slate-950 border-r border-slate-200 dark:border-slate-800 flex flex-col h-full select-none shrink-0 transition-colors">
       {/* 1. Workspaces Section Header */}
       <div className="p-3 border-b border-slate-200 dark:border-slate-800/80">
-        <div className="flex items-center justify-between px-1 mb-1.5">
+        <div className="flex items-center justify-between pl-1 pr-10 mb-1.5">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
             Workspace
           </span>
@@ -662,5 +664,6 @@ export function Sidebar() {
         </div>
       </div>
     </aside>
+    </CollapsibleSidebar>
   );
 }
