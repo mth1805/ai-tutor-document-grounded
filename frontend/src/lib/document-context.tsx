@@ -13,7 +13,8 @@ import { useAuth } from "@/lib/auth-context";
 
 interface DocumentContextType {
   selectedDocument: DocumentItem | null;
-  setSelectedDocument: (doc: DocumentItem | null) => void;
+  selectedPage: number | null;
+  setSelectedDocument: (doc: DocumentItem | null, page?: number) => void;
   isViewerCollapsed: boolean;
   setIsViewerCollapsed: (collapsed: boolean | ((prev: boolean) => boolean)) => void;
   splitRatio: number; // percentage width of left pane (20 to 80)
@@ -27,6 +28,8 @@ export function DocumentProvider({ children }: { children: React.ReactNode }) {
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
+  const pageParam = Number(searchParams.get("page"));
+  const selectedPage = Number.isSafeInteger(pageParam) && pageParam > 0 ? pageParam : null;
 
   const [selectedDocument, setSelectedDocumentState] = useState<DocumentItem | null>(null);
   const [isViewerCollapsed, setIsViewerCollapsed] = useState<boolean>(false);
@@ -55,7 +58,7 @@ export function DocumentProvider({ children }: { children: React.ReactNode }) {
 
   // Sync selected document state with URL search param ?doc=
   const setSelectedDocument = useCallback(
-    (doc: DocumentItem | null) => {
+    (doc: DocumentItem | null, page?: number) => {
       setSelectedDocumentState(doc);
       if (typeof window !== "undefined") {
         const params = new URLSearchParams(window.location.search);
@@ -63,6 +66,11 @@ export function DocumentProvider({ children }: { children: React.ReactNode }) {
           params.set("doc", doc.id);
         } else {
           params.delete("doc");
+        }
+        if (doc && page && Number.isSafeInteger(page) && page > 0) {
+          params.set("page", String(page));
+        } else {
+          params.delete("page");
         }
         const newSearch = params.toString();
         const newUrl = `${pathname}${newSearch ? `?${newSearch}` : ""}`;
@@ -101,6 +109,7 @@ export function DocumentProvider({ children }: { children: React.ReactNode }) {
     <DocumentContext.Provider
       value={{
         selectedDocument,
+        selectedPage,
         setSelectedDocument,
         isViewerCollapsed,
         setIsViewerCollapsed,
@@ -118,6 +127,7 @@ export function useDocument() {
   if (!context) {
     return {
       selectedDocument: null,
+      selectedPage: null,
       setSelectedDocument: () => {},
       isViewerCollapsed: false,
       setIsViewerCollapsed: () => {},

@@ -27,6 +27,7 @@ import { downloadOriginalDocument } from "@/lib/document-download";
 interface DocumentViewerProps {
   workspaceId: string;
   document: DocumentItem | null;
+  page?: number | null;
   onClose: () => void;
   onSelectDocument: (doc: DocumentItem | null) => void;
 }
@@ -34,6 +35,7 @@ interface DocumentViewerProps {
 export function DocumentViewer({
   workspaceId,
   document,
+  page,
   onClose,
   onSelectDocument,
 }: DocumentViewerProps) {
@@ -328,7 +330,8 @@ export function DocumentViewer({
           /* PDF Preview: Embedded Sandbox Viewer (Preserving native document legibility) */
           <div className="w-full h-full rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-inner">
             <iframe
-              src={objectUrl}
+              key={`${objectUrl}:${page || 1}`}
+              src={`${objectUrl}${page && Number.isSafeInteger(page) && page > 0 ? `#page=${page}` : ""}`}
               className="w-full h-full border-0 rounded-lg"
               title={document.original_filename}
             />

@@ -117,13 +117,15 @@ describe('1. Markdown Rendering', () => {
     assert.ok(html.includes('<td>Markdown</td>'));
   });
 
-  it('keeps table citations out of cells and renders a single compact marker after the table', () => {
+  it('keeps repeated table citations in their original cells', () => {
     const md = '| Topic | Evidence |\n|---|---|\n| Attention | [doc: lecture.pdf p.20] |\n| Heads | [doc: lecture.pdf p.20] |';
     const html = renderMarkdown(md);
     assert.ok(html.includes('<table>'));
     assert.ok(!html.includes('[doc: lecture.pdf p.20]'));
-    assert.equal((html.match(/data-testid="citation-badge"/g) || []).length, 1);
-    assert.ok(html.indexOf('</table>') < html.indexOf('data-testid="citation-badge"'));
+    assert.equal((html.match(/data-testid="citation-badge"/g) || []).length, 2);
+    const cells = [...html.matchAll(/<td>([\s\S]*?)<\/td>/g)].map(m => m[1]);
+    assert.ok(cells[1].includes('data-testid="citation-badge"'));
+    assert.ok(cells[3].includes('data-testid="citation-badge"'));
     assert.ok(html.includes('p.20'));
   });
 
@@ -245,7 +247,7 @@ describe('3. Citation Rendering', () => {
     assert.equal((twoPageHtml.match(/data-testid="citation-badge"/g) || []).length, 2);
   });
 
-  it('resolves grouped source markers in tables and places compact citations after the table', () => {
+  it('resolves grouped source markers inside their table cell', () => {
     const structured = [
       { document_id: 'doc-1', document_name: 'Lecture.pdf', chunk_id: 'c1', page_start: 20, page_end: 20 },
       { document_id: 'doc-2', document_name: 'Lecture.pdf', chunk_id: 'c2', page_start: 21, page_end: 21 },
@@ -255,7 +257,8 @@ describe('3. Citation Rendering', () => {
       structured
     );
     assert.ok(!html.includes('[Source 1, Source 2]'));
-    assert.ok(html.indexOf('</table>') < html.indexOf('data-testid="citation-badge"'));
+    const sourceCell = [...html.matchAll(/<td>([\s\S]*?)<\/td>/g)][1][1];
+    assert.equal((sourceCell.match(/data-testid="citation-badge"/g) || []).length, 2);
     assert.ok(html.includes('p.20'));
     assert.ok(html.includes('p.21'));
   });
@@ -279,17 +282,15 @@ describe('4. Citation Deduplication & Density Reduction', () => {
     );
   });
 
-  it('reduces citation density: shows citation at end of paragraph and reuses one citation for repeated claims', () => {
+  it('keeps repeated citations near each separate claim', () => {
     const md =
       'Sentence A [Doc: Paper.pdf, p. 2]. Sentence B [Doc: Paper.pdf, p. 2]. Sentence C [Doc: Paper.pdf, p. 2].';
     const html = renderMarkdown(md);
-    // Intermediate sentence citations stripped
-    assert.ok(html.includes('Sentence A.'));
-    assert.ok(html.includes('Sentence B.'));
-    assert.ok(html.includes('Sentence C.'));
-    // Exactly ONE compact citation rendered at end
+    for (const claim of ['A', 'B', 'C']) {
+      assert.match(html, new RegExp(`Sentence ${claim} <span[^>]*class="citation-wrapper"`));
+    }
     const badgeMatches = html.match(/data-testid="citation-badge"/g) || [];
-    assert.equal(badgeMatches.length, 1);
+    assert.equal(badgeMatches.length, 3);
     assert.ok(html.includes('📄 p.2'));
   });
 

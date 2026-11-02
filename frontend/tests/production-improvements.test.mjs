@@ -172,7 +172,7 @@ test('viewer renders Word PDF/text responses and preserves PDF/image loading rou
       });
       const props = { workspaceId: 'workspace-id', document: {
         id: 'document-id', original_filename: filename, mime_type: originalMime, file_size: 100,
-      }, onClose() {}, onSelectDocument() {} };
+      }, page: 37, onClose() {}, onSelectDocument() {} };
       harness.render(() => DocumentViewer(props));
       const cleanup = effects[0]();
       await new Promise(resolve => setImmediate(resolve));
@@ -181,7 +181,48 @@ test('viewer renders Word PDF/text responses and preserves PDF/image loading rou
       assert.ok(preview, `${filename} should render ${previewMime} as ${tag}`);
       if (tag === 'pre') assert.equal(preview.props.children, body);
       else assert.match(preview.props.src, /^blob:/);
+      if (tag === 'iframe') {
+        assert.match(preview.props.src, /#page=37$/);
+        const nextTree = harness.render(() => DocumentViewer({ ...props, page: 38 }));
+        const nextPreview = find(nextTree, node => node.type === 'iframe');
+        assert.match(nextPreview.props.src, /#page=38$/);
+        assert.notEqual(nextPreview.key, preview.key);
+        const noPageTree = harness.render(() => DocumentViewer({ ...props, page: -1 }));
+        assert.doesNotMatch(find(noPageTree, node => node.type === 'iframe').props.src, /#page=/);
+      }
       cleanup();
     }
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test('citation page selection persists with the selected document and clears when switching documents', () => {
+  const originalWindow = globalThis.window;
+  const harness = hooks();
+  harness.react.useCallback = fn => fn;
+  const routes = [];
+  let params = new URLSearchParams('doc=document-id&page=37');
+  const { DocumentProvider } = load('../src/lib/document-context.tsx', {
+    react: harness.react,
+    'next/navigation': {
+      useSearchParams: () => params,
+      useRouter: () => ({ replace: (...args) => routes.push(args) }),
+      usePathname: () => '/workspace/w/c/thread',
+    },
+    '@/lib/api': { apiClient: {} },
+    '@/lib/auth-context': { useAuth: () => ({ token: 'test-token' }) },
+  });
+  try {
+    globalThis.window = { location: { search: '?doc=document-id&page=37' } };
+    let tree = harness.render(() => DocumentProvider({ children: null }));
+    assert.equal(tree.props.value.selectedPage, 37);
+    tree.props.value.setSelectedDocument({ id: 'document-id' }, 38);
+    assert.deepEqual(routes.pop(), ['/workspace/w/c/thread?doc=document-id&page=38', { scroll: false }]);
+    tree.props.value.setSelectedDocument({ id: 'other-document' });
+    assert.deepEqual(routes.pop(), ['/workspace/w/c/thread?doc=other-document', { scroll: false }]);
+    tree.props.value.setSelectedDocument(null);
+    assert.deepEqual(routes.pop(), ['/workspace/w/c/thread', { scroll: false }]);
+    params = new URLSearchParams('doc=document-id&page=invalid');
+    tree = harness.render(() => DocumentProvider({ children: null }));
+    assert.equal(tree.props.value.selectedPage, null);
+  } finally { globalThis.window = originalWindow; }
 });

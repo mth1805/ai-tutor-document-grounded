@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import React from 'react';
 import ts from 'typescript';
+import * as citationUtils from '../src/lib/citation-utils.ts';
 
 function compile(path, dependencies) {
   const source = readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -72,4 +73,48 @@ test('streaming request serializes explicit and active document IDs with auth', 
   assert.equal(JSON.parse(request.body).document_id, 'attached');
   assert.equal(JSON.parse(request.body).active_document_id, 'viewer');
   assert.equal(done.content, 'Which document?');
+});
+
+test('chat citation handler opens the verified document and page, with unambiguous exact filename fallback', async () => {
+  const filename = 'Bài 5. LSTM, GRU, Encoder decoder.pdf';
+  const doc = { id: 'document-id', workspace_id: 'workspace', original_filename: filename };
+  for (const scenario of [
+    { citation: { document_id: doc.id, document_name: filename, page_start: 37, page_end: 38 }, docs: [], expected: true },
+    { citation: { document_name: filename, page_start: 20, page_end: 20 }, docs: [doc], expected: true },
+    { citation: { document_name: 'LSTM', page_start: 20, page_end: 20 }, docs: [doc], expected: false },
+    { citation: { document_name: filename, page_start: 20, page_end: 20 }, docs: [doc, { ...doc, id: 'duplicate-name' }], expected: false },
+  ]) {
+    const states = [];
+    let index = 0;
+    let selected;
+    const fetched = [];
+    const MarkdownRenderer = () => null;
+    const react = { ...React, useState: initial => {
+      const current = index++;
+      if (!(current in states)) states[current] = current === 0
+        ? [{ id: 'answer', role: 'assistant', content: 'Claim', citations: [] }] : initial;
+      return [states[current], next => { states[current] = next; }];
+    }, useEffect() {}, useCallback: fn => fn, useRef: () => ({ current: null }) };
+    const { ChatArea } = compile('../src/components/ChatArea.tsx', name => {
+      if (name === 'react') return react;
+      if (name === 'next/navigation') return { useRouter: () => ({}), useParams: () => ({ workspaceId: 'workspace', conversationId: 'thread' }) };
+      if (name === '@/lib/auth-context') return { useAuth: () => ({ user: { id: 'user' }, token: 'test-token' }) };
+      if (name === '@/lib/citation-utils') return citationUtils;
+      if (name === '@/components/MarkdownRenderer') return { MarkdownRenderer };
+      if (name === '@/lib/document-context') return { useDocument: () => ({ selectedDocument: null,
+        setIsViewerCollapsed() {}, setSelectedDocument: (...args) => { selected = args; } }) };
+      if (name === '@/lib/api') return { apiClient: {
+        listDocuments: async (workspace, token) => {
+          assert.equal(workspace, 'workspace'); assert.equal(token, 'test-token'); return scenario.docs;
+        },
+        getDocument: async (id, token) => { fetched.push(id); assert.equal(token, 'test-token'); return doc; },
+      } };
+      if (name === 'lucide-react') return new Proxy({}, { get: () => () => null });
+      return {};
+    });
+    const tree = ChatArea();
+    await find(tree, MarkdownRenderer).props.onOpenCitation(scenario.citation);
+    assert.deepEqual(fetched, scenario.expected ? [doc.id] : []);
+    assert.deepEqual(selected, scenario.expected ? [doc, scenario.citation.page_start] : undefined);
+  }
 });
