@@ -23,7 +23,12 @@ from app.services.document_service import DocumentService, _IN_MEMORY_DOCUMENTS
 from app.services.document_reference import DocumentReferenceResolver
 from fastapi import HTTPException
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
-from app.rag.prompt_builder import PromptBuilder, ChatMode, SourceEvidence
+from app.rag.prompt_builder import (
+    PromptBuilder,
+    ChatMode,
+    SourceEvidence,
+    response_language_instruction,
+)
 from app.rag.citation_service import CitationService, Citation, WebCitation
 from app.web_search import get_web_search_provider, WebSearchProvider
 from app.web_search.base import WebSearchResult
@@ -51,6 +56,11 @@ WEB_FALLBACK_SYSTEM_INSTRUCTION = (
     "Do NOT include [Web Source X] markers in your final answer — write natural prose only. "
     "Structure your response with headings and bullet points where helpful."
 )
+
+
+def web_fallback_system_instruction(query: str) -> str:
+    """Apply the same latest-message language policy used by document RAG."""
+    return f"{WEB_FALLBACK_SYSTEM_INSTRUCTION}\n\n{response_language_instruction(query)}"
 
 
 class RAGService:
@@ -409,7 +419,7 @@ class RAGService:
                 try:
                     async for token in provider.generate_stream(
                         prompt=web_prompt,
-                        system_instruction=WEB_FALLBACK_SYSTEM_INSTRUCTION,
+                        system_instruction=web_fallback_system_instruction(query),
                     ):
                         if token:
                             if llm_ttft_ms is None:

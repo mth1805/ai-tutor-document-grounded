@@ -37,6 +37,7 @@ from app.ml.mock_provider import MockEmbeddingProvider
 from app.ml.reranker_mock import MockRerankerProvider
 from app.llm import set_llm_provider, reset_llm_provider, MockLLMProvider, LLMProviderError
 from app.rag.citation_service import WebCitation
+from app.services.rag_service import web_fallback_system_instruction
 from app.web_search import set_web_search_provider, reset_web_search_provider
 from app.web_search.mock_provider import MockWebSearchProvider
 from app.web_search.exceptions import WebSearchAuthError, WebSearchTimeoutError, WebSearchRateLimitError
@@ -45,6 +46,13 @@ client = TestClient(app)
 
 USER_A_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 HEADERS_A = {"Authorization": f"Bearer test-token:{USER_A_ID}"}
+
+
+def test_web_fallback_uses_latest_message_language():
+    instruction = web_fallback_system_instruction("Gi\u1ea3i th\u00edch RAG")
+    assert "respond in Vietnamese" in instruction
+    assert "ONLY the information inside <WEB_EVIDENCE>" in instruction
+    assert "language of retrieved documents" in instruction
 
 
 # ---------------------------------------------------------------------------

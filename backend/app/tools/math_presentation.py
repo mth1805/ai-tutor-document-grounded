@@ -2,12 +2,11 @@
 import json
 
 from app.schemas.math_solver import MathSolverResult
-from app.rag.prompt_builder import ChatMode
-from app.tools.solver_router import fold
+from app.rag.prompt_builder import ChatMode, detect_response_language
 
 
 def guidance_steps(result: MathSolverResult, query: str = "") -> list[str]:
-    if any(word in fold(query) for word in ("giai", "tinh", "rut gon", "dao ham", "nguyen ham")):
+    if detect_response_language(query) == "Vietnamese":
         vietnamese_steps = {
             "solve_equation": [
                 "Chuyển các hạng tử về một vế rồi thu gọn các hạng tử đồng dạng.",
