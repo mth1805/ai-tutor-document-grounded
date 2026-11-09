@@ -211,6 +211,40 @@ def test_insufficient_evidence_triggers_tavily_web_fallback(monkeypatch):
     assert mock_llm.call_count == 1         # generate_stream (doc-free, Tavily-grounded)
 
 
+def test_web_stream_hides_split_internal_heading_and_matches_done_content(monkeypatch):
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    _, conv_id = _create_workspace_and_conversation()
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "Reference", "url": "https://example.com/reference",
+         "content": "A relevant educational reference.", "domain": "example.com"},
+    ])
+    set_web_search_provider(mock_web)
+    set_llm_provider(MockLLMProvider(tokens=[
+        "PEDAGOGICAL ", "MODE: DETAILED ", "GUIDANCE\n", "Leaked instruction.",
+    ]))
+
+    response = client.post(
+        f"/api/v1/conversations/{conv_id}/chat", headers=HEADERS_A,
+        json={"content": "Explain an obscure topic not in my documents."},
+    )
+    assert response.status_code == 200
+    events = []
+    for block in response.text.strip().split("\n\n"):
+        event_name = next((line[7:] for line in block.splitlines() if line.startswith("event: ")), None)
+        data_line = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if event_name and data_line:
+            events.append((event_name, json.loads(data_line)))
+    tokens = [data["token"] for name, data in events if name == "token"]
+    done = next(data for name, data in events if name == "done")
+
+    assert done["used_web_fallback"] is True
+    assert len(tokens) >= 2
+    assert "PEDAGOGICAL MODE" not in "".join(tokens)
+    assert "".join(tokens) == done["content"]
+    assert done["content"] == "I couldn't produce a safe response to that request. Please try again."
+    assert done["web_sources"][0]["url"] == "https://example.com/reference"
+
+
 # ---------------------------------------------------------------------------
 # Test 3: Tavily result parsing — title/url/content/domain preserved
 # ---------------------------------------------------------------------------

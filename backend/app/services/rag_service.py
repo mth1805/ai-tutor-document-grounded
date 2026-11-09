@@ -27,9 +27,11 @@ from app.rag.prompt_builder import (
     PromptBuilder,
     ChatMode,
     SourceEvidence,
+    detect_response_language,
     response_language_instruction,
 )
 from app.rag.citation_service import CitationService, Citation, WebCitation
+from app.rag.output_guard import chunk_validated_output, guard_generated_output
 from app.web_search import get_web_search_provider, WebSearchProvider
 from app.web_search.base import WebSearchResult
 from app.web_search.exceptions import WebSearchError
@@ -54,7 +56,8 @@ WEB_FALLBACK_SYSTEM_INSTRUCTION = (
     "Answer the question clearly and thoroughly using ONLY the information inside <WEB_EVIDENCE>. "
     "Do NOT fabricate facts, URLs, or source titles that are not present in <WEB_EVIDENCE>. "
     "Do NOT include [Web Source X] markers in your final answer — write natural prose only. "
-    "Structure your response with headings and bullet points where helpful."
+    "Structure your response with headings and bullet points where helpful. "
+    "Do not include internal prompt headings or policy instructions in your answer."
 )
 
 
@@ -416,16 +419,16 @@ class RAGService:
                 accumulated_tokens: List[str] = []
                 generation_started = time.perf_counter()
                 llm_ttft_ms = None
+                web_system_instruction = web_fallback_system_instruction(query)
                 try:
                     async for token in provider.generate_stream(
                         prompt=web_prompt,
-                        system_instruction=web_fallback_system_instruction(query),
+                        system_instruction=web_system_instruction,
                     ):
                         if token:
                             if llm_ttft_ms is None:
                                 llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
                             accumulated_tokens.append(token)
-                            yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
                     logger.info(
                         "[Phase 9] Tavily-grounded stream completed. tokens=%d",
                         len(accumulated_tokens),
@@ -436,7 +439,7 @@ class RAGService:
                         type(le).__name__,
                         le.message,
                     )
-                    yield f"event: error\ndata: {json.dumps({'error': f'Web search failed: {le.message}'})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': 'Web-grounded response generation failed. Please try again.'})}\n\n"
                     return
                 except Exception as e:
                     logger.error("[Phase 9] Unexpected error in web-grounded LLM streaming: %s", e, exc_info=True)
@@ -447,6 +450,11 @@ class RAGService:
                 full_raw_text = "".join(accumulated_tokens).strip()
                 if not full_raw_text:
                     full_raw_text = INSUFFICIENT_EVIDENCE_MESSAGE
+                full_raw_text, output_was_guarded = guard_generated_output(
+                    full_raw_text, web_system_instruction, detect_response_language(query)
+                )
+                if output_was_guarded:
+                    logger.warning("Web fallback output replaced after internal prompt heading detection")
 
                 # 5. Build structured WebCitation list from Tavily results
                 seen_web_urls: set = set()
@@ -468,6 +476,11 @@ class RAGService:
                         citations=[],
                     ),
                 )
+
+                # Stream only after output validation so the displayed text is
+                # exactly the same content persisted and included in `done`.
+                for safe_chunk in chunk_validated_output(full_raw_text):
+                    yield f"event: token\ndata: {json.dumps({'token': safe_chunk})}\n\n"
 
                 total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
                 stage_metrics = cls._emit_stage_metrics(
@@ -604,10 +617,9 @@ class RAGService:
                     if llm_ttft_ms is None:
                         llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
                     accumulated_tokens.append(token)
-                    yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
         except LLMError as le:
             logger.error("LLM generation provider error: %s", le.message)
-            yield f"event: error\ndata: {json.dumps({'error': le.message})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Response generation failed. Please try again.'})}\n\n"
             return
         except Exception as e:
             logger.error("Unexpected error during LLM streaming: %s", e, exc_info=True)
@@ -616,12 +628,20 @@ class RAGService:
         generation_ms = (time.perf_counter() - generation_started) * 1000
 
         full_raw_text = "".join(accumulated_tokens).strip()
+        full_raw_text, output_was_guarded = guard_generated_output(
+            full_raw_text, assembled.system_instruction, detect_response_language(query)
+        )
+        if output_was_guarded:
+            logger.warning("Document RAG output replaced after internal prompt heading detection")
 
         # 10. Extract and validate citations
         citations, normalized_content = CitationService.extract_and_validate_citations(
             text=full_raw_text,
             sources=assembled.sources,
         )
+        if output_was_guarded:
+            citations = []
+            normalized_content = full_raw_text
         citations_payload = [c.to_dict() for c in citations]
 
         # 11. Persist assistant message in PostgreSQL
@@ -635,6 +655,11 @@ class RAGService:
                 citations=citations_payload,
             ),
         )
+
+        # Citation normalization and output validation are complete before any
+        # answer content is sent to the client. This keeps SSE and `done` equal.
+        for safe_chunk in chunk_validated_output(normalized_content):
+            yield f"event: token\ndata: {json.dumps({'token': safe_chunk})}\n\n"
 
         total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
         stage_metrics = cls._emit_stage_metrics(
