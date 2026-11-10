@@ -37,6 +37,12 @@ _ENGLISH_MARKERS = {
 }
 
 
+def sanitize_prompt_section_content(content: str, section_name: str) -> str:
+    """Neutralize closing tags that could escape a prompt section's boundary."""
+    closing_tag = re.compile(rf"</\s*{re.escape(section_name)}\s*>", re.IGNORECASE)
+    return closing_tag.sub(lambda match: match.group(0).replace("</", "&lt;/", 1), content)
+
+
 def _normalize_language_text(text: str) -> str:
     """Fold Vietnamese accents for lightweight language and request detection."""
     decomposed = unicodedata.normalize("NFD", text.casefold().replace("\u0111", "d"))
@@ -265,7 +271,7 @@ class PromptBuilder:
 
         for idx, chunk in enumerate(evidence_chunks, start=1):
             doc_name = document_names.get(chunk.document_id, f"Document-{str(chunk.document_id)[:8]}")
-            safe_content = chunk.content.replace("</DOCUMENT_EVIDENCE>", "")
+            safe_content = sanitize_prompt_section_content(chunk.content, "DOCUMENT_EVIDENCE")
             source = SourceEvidence(
                 source_index=idx,
                 document_id=chunk.document_id,

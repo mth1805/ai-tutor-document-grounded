@@ -13,6 +13,7 @@ from app.models.document import Document
 from app.models.message import Message
 from app.services.document_service import DocumentService
 from app.services.ingestion_service import _IN_MEMORY_CHUNKS
+from app.rag.summary_intent import classify_summary_intent
 from app.tools.solver_router import fold
 
 
@@ -36,6 +37,10 @@ class DocumentResolution:
 
 
 class DocumentReferenceResolver:
+    @staticmethod
+    def has_explicit_filename(query: str) -> bool:
+        return bool(re.search(r"\.(?:pdf|docx)\b", fold(query)))
+
     @staticmethod
     async def validate_id(db: AsyncSession | None, document_id: uuid.UUID,
                           workspace_id: uuid.UUID, user_id: uuid.UUID) -> Document:
@@ -72,8 +77,16 @@ class DocumentReferenceResolver:
                       active_document_id: uuid.UUID | None = None,
                       history: Sequence[Message] = ()) -> DocumentResolution:
         text = fold(query)
-        referential = bool(REFERENCE.search(text) or re.search(r"\.(?:pdf|docx)\b", text))
-        selected_id = document_id or active_document_id
+        explicit_filename = cls.has_explicit_filename(query)
+        summary_intent = classify_summary_intent(query)
+        referential = bool(
+            REFERENCE.search(text)
+            or explicit_filename
+            or summary_intent.whole_document
+        )
+        # An explicit API document ID wins. A filename in the user's message
+        # wins over the viewer selection; the active document is only a fallback.
+        selected_id = document_id or (active_document_id if not explicit_filename else None)
         if not selected_id and not referential:
             return DocumentResolution()
         vietnamese = bool(re.search(r"\b(?:tom tat|tai lieu|nay|giai|file nay)\b", text))

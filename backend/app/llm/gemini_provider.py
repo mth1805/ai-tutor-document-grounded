@@ -11,7 +11,7 @@ from google.genai import types
 from google.genai import errors
 
 from app.core.config import settings
-from app.llm.base import BaseLLMProvider
+from app.llm.base import BaseLLMProvider, GenerationResult
 from app.llm.exceptions import (
     LLMAuthenticationError,
     LLMConfigurationError,
@@ -204,6 +204,36 @@ class GeminiProvider(BaseLLMProvider):
         **kwargs,
     ) -> str:
         """Synchronously or asynchronously produces non-streamed text completion."""
+        response = await self._generate_response(prompt, system_instruction, **kwargs)
+        return response.text or ""
+
+    async def generate_with_metadata(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """Generate text while preserving Gemini's candidate finish reason."""
+        response = await self._generate_response(prompt, system_instruction, **kwargs)
+        candidates = getattr(response, "candidates", None) or []
+        finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+        if finish_reason is None:
+            reason_name = None
+        else:
+            reason_name = getattr(finish_reason, "name", None) or str(finish_reason).rsplit(".", 1)[-1]
+            reason_name = str(reason_name).upper()
+        return GenerationResult(
+            text=response.text or "",
+            completed=reason_name == "STOP",
+            finish_reason=reason_name,
+        )
+
+    async def _generate_response(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ):
         config = self._build_config(system_instruction=system_instruction, **kwargs)
         try:
             async with asyncio.timeout(settings.LLM_STREAMING_TIMEOUT_SECONDS):
@@ -212,7 +242,7 @@ class GeminiProvider(BaseLLMProvider):
                     contents=prompt,
                     config=config,
                 )
-            return response.text or ""
+            return response
         except Exception as e:
             self._log_failure("non-streaming generation", e)
             raise self._map_error(e) from e

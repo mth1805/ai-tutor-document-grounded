@@ -21,6 +21,7 @@ from app.services.conversation_service import ConversationService
 from app.services.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService, _IN_MEMORY_DOCUMENTS
 from app.services.document_reference import DocumentReferenceResolver
+from app.services.document_summary_service import DocumentSummaryError, DocumentSummaryService
 from fastapi import HTTPException
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
 from app.rag.prompt_builder import (
@@ -32,6 +33,7 @@ from app.rag.prompt_builder import (
 )
 from app.rag.citation_service import CitationService, Citation, WebCitation
 from app.rag.output_guard import chunk_validated_output, guard_generated_output
+from app.rag.summary_intent import classify_summary_intent
 from app.web_search import get_web_search_provider, WebSearchProvider
 from app.web_search.base import WebSearchResult
 from app.web_search.exceptions import WebSearchError
@@ -169,6 +171,7 @@ class RAGService:
         - `event: error` -> failure information
         """
         t_start = time.perf_counter()
+        summary_intent = classify_summary_intent(query)
 
         # 1. Validate chat mode
         try:
@@ -231,6 +234,72 @@ class RAGService:
             )
             yield f"event: token\ndata: {json.dumps({'token': resolution.message})}\n\n"
             yield f"event: done\ndata: {json.dumps({'message_id': str(asst_msg.id), 'content': resolution.message, 'citations': [], 'has_sufficient_evidence': False})}\n\n"
+            return
+
+        if summary_intent.is_summary and summary_intent.whole_document and resolution.document:
+            yield f"event: status\ndata: {json.dumps({'status': 'summarizing_document', 'message': 'Summarizing all indexed document sections...'})}\n\n"
+            provider = llm_provider or get_llm_provider()
+            try:
+                summary_result = await DocumentSummaryService.summarize_document(
+                    db=db,
+                    document=resolution.document,
+                    workspace_id=conv_workspace_id,
+                    user_id=user_id,
+                    query=query,
+                    provider=provider,
+                )
+            except DocumentSummaryError as exc:
+                logger.warning(
+                    "Whole-document summary did not complete document_id=%s reason=%s",
+                    resolution.document.id,
+                    str(exc),
+                )
+                yield f"event: error\ndata: {json.dumps({'error': 'The complete document summary could not be produced. Please try a narrower request or retry later.'})}\n\n"
+                return
+
+            summary_text, output_was_guarded = guard_generated_output(
+                summary_result.raw_content,
+                summary_result.system_instruction,
+                detect_response_language(query),
+            )
+            citations, normalized_content = CitationService.extract_and_validate_citations(
+                text=summary_text,
+                sources=summary_result.sources,
+            )
+            if output_was_guarded:
+                citations = []
+                normalized_content = summary_text
+                logger.warning("Whole-document summary replaced after output guard detection")
+            citations_payload = [citation.to_dict() for citation in citations]
+            assistant_message = await ConversationService.create_message(
+                db=db,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                data=MessageCreate(
+                    role="assistant",
+                    content=normalized_content,
+                    citations=citations_payload,
+                ),
+            )
+
+            for safe_chunk in chunk_validated_output(normalized_content):
+                yield f"event: token\ndata: {json.dumps({'token': safe_chunk})}\n\n"
+            done_payload = {
+                "message_id": str(assistant_message.id),
+                "content": normalized_content,
+                "citations": citations_payload,
+                "has_sufficient_evidence": True,
+                "summary": {
+                    "scope": "whole_document",
+                    "document_id": str(resolution.document.id),
+                    "chunks_processed": summary_result.chunk_count,
+                    "input_coverage_complete": True,
+                    "generation_complete": True,
+                    "summary_returned": not output_was_guarded,
+                    "output_guarded": output_was_guarded,
+                },
+            }
+            yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
             return
 
         # 5. Execute Phase 7 hybrid retrieval and reranking
@@ -579,6 +648,11 @@ class RAGService:
             solver_operation=solver_result.problem_type if solver_result else None,
             solver_verified=solver_result.success if solver_result else False,
         )
+        if summary_intent.is_summary:
+            assembled.system_instruction += (
+                "\n\nFOCUSED SUMMARY POLICY: Summarize only retrieved evidence that matches the requested topic or section. "
+                "Do not present this as a summary of the entire document. Preserve source citations for supported claims."
+            )
         if resolution.document:
             assembled.system_instruction += (
                 "\nDOCUMENT REFERENCE: Document selection has been resolved for this request. "

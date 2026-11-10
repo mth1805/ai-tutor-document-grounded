@@ -1,5 +1,5 @@
 """LLM Provider abstraction package."""
-from app.llm.base import BaseLLMProvider
+from app.llm.base import BaseLLMProvider, GenerationResult
 from app.llm.gemini_provider import GeminiProvider
 from app.llm.mock_provider import MockLLMProvider
 from app.llm.factory import get_llm_provider, set_llm_provider, reset_llm_provider
@@ -14,6 +14,7 @@ from app.llm.exceptions import (
 
 __all__ = [
     "BaseLLMProvider",
+    "GenerationResult",
     "GeminiProvider",
     "MockLLMProvider",
     "get_llm_provider",

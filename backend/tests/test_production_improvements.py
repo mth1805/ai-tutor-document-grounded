@@ -455,6 +455,10 @@ def test_existing_legacy_doc_preview_uses_persisted_text_on_conversion_failure(m
     monkeypatch.setattr(IngestionService, "process_document_background", AsyncMock(return_value=True))
     client, record = upload("ĐỀ CƯƠNG.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + bytes(32), "application/msword")
     _IN_MEMORY_CHUNKS[uuid.UUID(record["id"])] = [SimpleNamespace(content="Văn bản đã xử lý", chunk_index=0)]
+    stored_doc = _IN_MEMORY_DOCUMENTS[uuid.UUID(record["id"])]
+    _IN_MEMORY_CHUNKS[stored_doc.id][0].document_id = stored_doc.id
+    _IN_MEMORY_CHUNKS[stored_doc.id][0].user_id = stored_doc.user_id
+    _IN_MEMORY_CHUNKS[stored_doc.id][0].workspace_id = stored_doc.workspace_id
     response = client.get(f'/api/v1/documents/{record["id"]}/preview', headers=HEADERS)
     assert response.status_code == 200
     assert response.text == "Văn bản đã xử lý"

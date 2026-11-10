@@ -262,11 +262,12 @@ class IngestionService:
         db: Optional[AsyncSession],
         document_id: uuid.UUID,
         user_id: uuid.UUID,
+        workspace_id: uuid.UUID | None = None,
     ) -> Optional[List[DocumentChunk]]:
         """Lists all chunks for an authorized document in sequential order."""
         # 1. Verify document ownership
         doc = await DocumentService.get_document(db, document_id, user_id)
-        if not doc:
+        if not doc or (workspace_id is not None and doc.workspace_id != workspace_id):
             return None
 
         # 2. Retrieve chunks
@@ -276,6 +277,7 @@ class IngestionService:
                 .where(
                     DocumentChunk.document_id == document_id,
                     DocumentChunk.user_id == user_id,
+                    *([DocumentChunk.workspace_id == workspace_id] if workspace_id is not None else []),
                 )
                 .order_by(DocumentChunk.chunk_index.asc())
             )
@@ -283,6 +285,11 @@ class IngestionService:
             return list(res.scalars().all())
 
         return sorted(
-            _IN_MEMORY_CHUNKS.get(document_id, []),
+            (
+                chunk for chunk in _IN_MEMORY_CHUNKS.get(document_id, [])
+                if chunk.document_id == document_id
+                and chunk.user_id == user_id
+                and (workspace_id is None or chunk.workspace_id == workspace_id)
+            ),
             key=lambda c: c.chunk_index,
         )
