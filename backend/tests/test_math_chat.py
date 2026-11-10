@@ -15,6 +15,7 @@ from app.services.rag_service import RAGService
 from app.services.retrieval_service import RetrievalService
 from app.tools.math_solver import MathSolver
 from app.rag.prompt_builder import ChatMode, PromptBuilder
+from app.tools.math_presentation import guidance_steps
 from app.services.workspace_service import _IN_MEMORY_WORKSPACES
 from app.services.document_service import _IN_MEMORY_DOCUMENTS
 from app.services.ingestion_service import _IN_MEMORY_CHUNKS
@@ -261,3 +262,30 @@ def test_vietnamese_guidance_retains_hint_policy(monkeypatch):
     assert response.status_code == 200
     assert "Chuyển các hạng tử" in response.json()["content"]
     assert "2, 3" not in response.text
+
+
+@pytest.mark.parametrize(("query", "expected_prefix"), [
+    ("Solve the equation x^2-5x+6=0", "Move all terms"),
+    ("Giai phuong trinh x^2-5x+6=0", "Chuy"),
+    ("Giải phương trình x^2-5x+6=0", "Chuy"),
+    ("Gi\u1ea3i ph\u01b0\u01a1ng tr\u00ecnh x^2-5x+6=0", "Chuy"),
+    ("Solve x^2-5x+6=0 in Vietnamese", "Chuy"),
+    ("Giải phương trình x^2-5x+6=0 bằng tiếng Anh", "Move all terms"),
+])
+def test_math_guidance_uses_response_language(query, expected_prefix):
+    result = MathSolver.solve(MathTask(operation="solve_equation", left="x^2-5*x+6", right="0"))
+    assert guidance_steps(result, query)[0].startswith(expected_prefix)
+
+
+@pytest.mark.parametrize(("operation", "task_fields"), [
+    ("calculate", {"expression": "sqrt(16)+2"}),
+    ("solve_equation", {"left": "x^2-4", "right": "0"}),
+    ("differentiate", {"expression": "x^2"}),
+    ("integrate", {"expression": "x^2"}),
+    ("simplify", {"expression": "(x*x-1)/(x-1)"}),
+])
+def test_response_language_selection_preserves_math_operations(operation, task_fields):
+    result = MathSolver.solve(MathTask(operation=operation, **task_fields))
+    assert result.success
+    assert len(guidance_steps(result, "Giải bài này")) == 3
+    assert len(guidance_steps(result, "Solve this problem")) == 3

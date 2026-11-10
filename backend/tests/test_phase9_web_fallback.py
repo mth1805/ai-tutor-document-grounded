@@ -37,6 +37,7 @@ from app.ml.mock_provider import MockEmbeddingProvider
 from app.ml.reranker_mock import MockRerankerProvider
 from app.llm import set_llm_provider, reset_llm_provider, MockLLMProvider, LLMProviderError
 from app.rag.citation_service import WebCitation
+from app.services.rag_service import web_fallback_system_instruction
 from app.web_search import set_web_search_provider, reset_web_search_provider
 from app.web_search.mock_provider import MockWebSearchProvider
 from app.web_search.exceptions import WebSearchAuthError, WebSearchTimeoutError, WebSearchRateLimitError
@@ -45,6 +46,13 @@ client = TestClient(app)
 
 USER_A_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 HEADERS_A = {"Authorization": f"Bearer test-token:{USER_A_ID}"}
+
+
+def test_web_fallback_uses_latest_message_language():
+    instruction = web_fallback_system_instruction("Gi\u1ea3i th\u00edch RAG")
+    assert "respond in Vietnamese" in instruction
+    assert "ONLY the information inside <WEB_EVIDENCE>" in instruction
+    assert "language of retrieved documents" in instruction
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +209,40 @@ def test_insufficient_evidence_triggers_tavily_web_fallback(monkeypatch):
     assert data["has_sufficient_evidence"] is False
     assert mock_web.call_count == 1         # Tavily WAS called exactly once
     assert mock_llm.call_count == 1         # generate_stream (doc-free, Tavily-grounded)
+
+
+def test_web_stream_hides_split_internal_heading_and_matches_done_content(monkeypatch):
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    _, conv_id = _create_workspace_and_conversation()
+    mock_web = MockWebSearchProvider(results=[
+        {"title": "Reference", "url": "https://example.com/reference",
+         "content": "A relevant educational reference.", "domain": "example.com"},
+    ])
+    set_web_search_provider(mock_web)
+    set_llm_provider(MockLLMProvider(tokens=[
+        "PEDAGOGICAL ", "MODE: DETAILED ", "GUIDANCE\n", "Leaked instruction.",
+    ]))
+
+    response = client.post(
+        f"/api/v1/conversations/{conv_id}/chat", headers=HEADERS_A,
+        json={"content": "Explain an obscure topic not in my documents."},
+    )
+    assert response.status_code == 200
+    events = []
+    for block in response.text.strip().split("\n\n"):
+        event_name = next((line[7:] for line in block.splitlines() if line.startswith("event: ")), None)
+        data_line = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if event_name and data_line:
+            events.append((event_name, json.loads(data_line)))
+    tokens = [data["token"] for name, data in events if name == "token"]
+    done = next(data for name, data in events if name == "done")
+
+    assert done["used_web_fallback"] is True
+    assert len(tokens) >= 2
+    assert "PEDAGOGICAL MODE" not in "".join(tokens)
+    assert "".join(tokens) == done["content"]
+    assert done["content"] == "I couldn't produce a safe response to that request. Please try again."
+    assert done["web_sources"][0]["url"] == "https://example.com/reference"
 
 
 # ---------------------------------------------------------------------------
