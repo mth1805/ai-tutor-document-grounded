@@ -49,7 +49,8 @@ Local Compose now includes the existing CPU ingestion worker and persistent mode
 - [x] Embedding and reranker providers are process-level singletons with configurable device selection.
 - [x] Optional startup warmup runs off the event loop; model inference does not occur in readiness checks.
 - [ ] Measure Modal cold start, warm inference, GPU memory, and CPU fallback.
-- [x] API Modal function remains CPU-only; only the independent ingestion worker can request `MODAL_INGESTION_GPU`.
+- [x] API, poller, and durable ingestion job runner remain CPU-only; a separate inference-only worker requests `MODAL_INFERENCE_GPU` (T4 default).
+- [ ] Preload both model checkpoints with `prepare_model_cache` before routing traffic; verify read-only runtime mounts in a staged Modal deployment.
 - [ ] Isolate chat query embedding and reranking from the CPU API if production latency requires GPU inference.
 
 ## SSE

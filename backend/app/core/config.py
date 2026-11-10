@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     LIBREOFFICE_TIMEOUT_SECONDS: int = 60
 
     # Phase 6: BGE-M3 Embedding and pgvector configuration
+    DEVICE_MODE: str = "auto"  # auto | cuda | cpu; auto uses Modal GPU when configured, then local CPU
+    GPU_FALLBACK_ENABLED: bool = True
+    MODAL_INFERENCE_URL: str | None = None
+    MODAL_INFERENCE_TOKEN: str | None = None
+    GPU_WORKER_TIMEOUT_SECONDS: float = Field(default=20.0, gt=0, le=120)
+    CPU_FALLBACK_TIMEOUT_SECONDS: float = Field(default=180.0, gt=0, le=600)
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
     EMBEDDING_DIMENSION: int = 1024
     EMBEDDING_BATCH_SIZE: int = 16
