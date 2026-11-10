@@ -268,14 +268,19 @@ def _modal_implementation(handle):
 def test_modal_worker_resource_and_cpu_function_configuration():
     pytest.importorskip("modal")
     import deploy.modal_app as deployment
-    assert deployment.USE_INGESTION_GPU == (deployment.INGESTION_GPU is not None)
-    assert deployment.process_ingestion_job._spec_.gpus == deployment.INGESTION_GPU
-    expected_image = deployment.gpu_image if deployment.USE_INGESTION_GPU else deployment.image
-    assert deployment.ingestion_image is expected_image
-    assert deployment.process_ingestion_job._spec_.image is _modal_implementation(expected_image)
+    assert deployment.process_ingestion_job._spec_.gpus is None
+    assert deployment.process_ingestion_job._spec_.image is _modal_implementation(deployment.image)
+    assert deployment.gpu_inference._spec_.gpus == "T4"
+    assert deployment.gpu_inference._spec_.image is _modal_implementation(deployment.gpu_image)
     assert deployment.fastapi_app._spec_.gpus is None
     assert deployment.poll_ingestion_queue._spec_.gpus is None
-    assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.MODEL_CACHE_VOLUME)
+    assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
+    assert deployment.gpu_inference._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
+    assert deployment.fastapi_app._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
+    assert deployment.READ_ONLY_MODEL_CACHE_VOLUME._mount_options.read_only is True
+    assert deployment.prepare_model_cache._spec_.gpus is None
+    assert deployment.prepare_model_cache._spec_.max_containers == 1
+    assert deployment.prepare_model_cache._spec_.volumes["/models"] is _modal_implementation(deployment.MODEL_CACHE_VOLUME)
 
 
 @pytest.fixture
@@ -289,12 +294,17 @@ def load_modal_configuration(monkeypatch):
     import importlib.util
     import sys
 
-    def load(gpu):
+    def load(gpu=None, *, legacy=None):
         with monkeypatch.context() as isolated:
+            isolated.delenv("MODAL_INFERENCE_GPU", raising=False)
             if gpu is None:
+                pass
+            else:
+                isolated.setenv("MODAL_INFERENCE_GPU", gpu)
+            if legacy is None:
                 isolated.delenv("MODAL_INGESTION_GPU", raising=False)
             else:
-                isolated.setenv("MODAL_INGESTION_GPU", gpu)
+                isolated.setenv("MODAL_INGESTION_GPU", legacy)
             name = f"deploy._device_test_{uuid.uuid4().hex}"
             path = Path(__file__).resolve().parents[1] / "deploy" / "modal_app.py"
             spec = importlib.util.spec_from_file_location(name, path)
@@ -311,26 +321,91 @@ def load_modal_configuration(monkeypatch):
 ])
 def test_modal_cpu_and_explicit_gpu_configuration(load_modal_configuration, configured_gpu, expected_gpu):
     import os
+    before_inference = os.environ.get("MODAL_INFERENCE_GPU")
     before = os.environ.get("MODAL_INGESTION_GPU")
     deployment = load_modal_configuration(configured_gpu)
     assert os.environ.get("MODAL_INGESTION_GPU") == before
-    assert deployment.INGESTION_GPU == expected_gpu
-    assert deployment.USE_INGESTION_GPU == (expected_gpu is not None)
-    expected_image = deployment.gpu_image if expected_gpu else deployment.image
-    assert deployment.ingestion_image is expected_image
-    assert deployment.process_ingestion_job._spec_.image is _modal_implementation(expected_image)
-    assert deployment.process_ingestion_job._spec_.gpus == expected_gpu
+    assert os.environ.get("MODAL_INFERENCE_GPU") == before_inference
+    assert deployment.INFERENCE_GPU == (expected_gpu or "T4")
+    assert deployment.process_ingestion_job._spec_.image is _modal_implementation(deployment.image)
+    assert deployment.process_ingestion_job._spec_.gpus is None
+    assert deployment.gpu_inference._spec_.image is _modal_implementation(deployment.gpu_image)
+    assert deployment.gpu_inference._spec_.gpus == (expected_gpu or "T4")
     assert deployment.fastapi_app._spec_.gpus is None
     assert deployment.fastapi_app._spec_.image is _modal_implementation(deployment.image)
     assert deployment.poll_ingestion_queue._spec_.gpus is None
     assert deployment.poll_ingestion_queue._spec_.image is _modal_implementation(deployment.image)
-    assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.MODEL_CACHE_VOLUME)
+    assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
 
 
-@pytest.mark.parametrize("gpu,expected_device", [(None, "cpu"), ("", "cpu"), ("T4", "cuda"), ("L4", "cuda")])
+def test_modal_inference_gpu_setting_precedes_deprecated_legacy_alias(load_modal_configuration, caplog):
+    deployment = load_modal_configuration("L4", legacy="T4")
+    assert deployment.INFERENCE_GPU == "L4"
+    assert deployment.process_ingestion_job._spec_.gpus is None
+
+
+def test_modal_legacy_gpu_alias_warns_and_never_allocates_ingestion_gpu(load_modal_configuration, caplog):
+    deployment = load_modal_configuration(None, legacy=" L4 ")
+    assert deployment.INFERENCE_GPU == "L4"
+    assert deployment.process_ingestion_job._spec_.gpus is None
+    assert "MODAL_INGESTION_GPU is deprecated" in caplog.text
+
+
+@pytest.mark.parametrize("expected,authorization,expected_status", [
+    ("endpoint-secret", None, 401),
+    ("endpoint-secret", "Bearer wrong-secret", 401),
+    ("", "Bearer endpoint-secret", 401),
+    ("endpoint-secret", "Bearer endpoint-secret", 422),
+])
+@pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
+def test_gpu_inference_endpoint_enforces_bearer_auth(monkeypatch, load_modal_configuration,
+                                                      expected, authorization, expected_status, caplog):
+    import asyncio
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    deployment = load_modal_configuration()
+    if expected:
+        monkeypatch.setenv("MODAL_INFERENCE_TOKEN", expected)
+    else:
+        monkeypatch.delenv("MODAL_INFERENCE_TOKEN", raising=False)
+    called = []
+    async def body():
+        called.append(True)
+        return {"operation": "invalid", "values": []}
+    request = SimpleNamespace(headers=({"authorization": authorization} if authorization else {}), json=body)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(deployment.gpu_inference.local(request))
+    assert exc.value.status_code == expected_status
+    assert bool(called) is (expected_status == 422)
+    assert expected not in caplog.text if expected else True
+
+
+@pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
+def test_gpu_endpoint_success_reports_cuda_and_gpu_metadata(monkeypatch, load_modal_configuration):
+    import asyncio
+    from types import SimpleNamespace
+    import torch
+    from app.ml import loader
+    deployment = load_modal_configuration()
+    monkeypatch.setenv("MODAL_INFERENCE_TOKEN", "gpu-test-secret")
+    provider = SimpleNamespace(device="cuda", encode_batch=lambda *a, **k: [[0.0] * 1024])
+    monkeypatch.setattr(loader, "get_embedding_provider", lambda: provider)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA T4")
+    async def body():
+        return {"operation": "embed", "values": ["x"], "batch_size": 1}
+    request = SimpleNamespace(headers={"authorization": "Bearer gpu-test-secret"}, json=body)
+    result = asyncio.run(deployment.gpu_inference.local(request))
+    assert result["ok"] is True
+    assert result["device"] == "cuda"
+    assert result["gpu"] == "NVIDIA T4"
+    assert len(result["outputs"][0]) == 1024
+
+
+@pytest.mark.parametrize("gpu", [None, "", "T4", "L4"])
 @pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
 def test_modal_worker_sets_device_before_processing_and_reuses_loop(
-    monkeypatch, load_modal_configuration, gpu, expected_device,
+    monkeypatch, load_modal_configuration, gpu,
 ):
     import os
     import asyncio
@@ -341,13 +416,14 @@ def test_modal_worker_sets_device_before_processing_and_reuses_loop(
     deployment = load_modal_configuration(gpu)
     # Register original env values with monkeypatch so direct worker mutations
     # are undone even when these keys were initially absent from the process.
-    for key in ("EMBEDDING_DEVICE", "EMBEDDING_MODEL_CACHE_DIR", "AUTO_EMBED_AFTER_INGESTION"):
+    for key in ("DEVICE_MODE", "EMBEDDING_DEVICE", "RERANKER_DEVICE", "EMBEDDING_MODEL_CACHE_DIR", "RERANKER_MODEL_CACHE_DIR", "AUTO_EMBED_AFTER_INGESTION", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         monkeypatch.setenv(key, os.environ.get(key, "test-original"))
     calls = []
     async def process(job_id):
         configured = Settings(_env_file=None, ENVIRONMENT="development")
         calls.append((job_id, asyncio.get_running_loop()))
-        assert configured.EMBEDDING_DEVICE == expected_device
+        assert configured.DEVICE_MODE == "auto"
+        assert configured.EMBEDDING_DEVICE == "auto"
         assert str(configured.EMBEDDING_MODEL_CACHE_DIR).replace("\\", "/") == "/models/huggingface/hub"
         assert configured.AUTO_EMBED_AFTER_INGESTION
         return True
@@ -360,7 +436,9 @@ def test_modal_worker_sets_device_before_processing_and_reuses_loop(
         assert deployment.process_ingestion_job.local(str(job_id)) is True
         assert calls[0][0] == calls[1][0] == job_id
         assert calls[0][1] is calls[1][1]
-        assert commit.call_count == 2
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+        assert commit.call_count == 0
     finally:
         if hasattr(deployment, "_worker_runner"):
             deployment._worker_runner.close()
@@ -382,6 +460,29 @@ def test_local_device_defaults_ignore_modal_gpu_configuration(monkeypatch):
     assert CrossEncoderRerankerProvider._resolve_device(configured.RERANKER_DEVICE) == "cpu"
 
 
+@pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
+def test_model_cache_preparation_loads_both_models_and_commits_once(monkeypatch, load_modal_configuration):
+    from unittest.mock import Mock
+    from app.ml import loader
+    deployment = load_modal_configuration()
+    calls = []
+    class Provider:
+        model_name = "test-model"
+        def encode_batch(self, *args, **kwargs):
+            calls.append(("embed", args, kwargs))
+        def predict(self, *args, **kwargs):
+            calls.append(("rerank", args, kwargs))
+    embedding = Provider()
+    reranker = Provider()
+    monkeypatch.setattr(loader, "get_embedding_provider", lambda: embedding)
+    monkeypatch.setattr(loader, "get_reranker_provider", lambda: reranker)
+    commit = Mock()
+    monkeypatch.setattr(deployment, "MODEL_CACHE_VOLUME", SimpleNamespace(commit=commit))
+    assert deployment.prepare_model_cache.local() is True
+    assert [call[0] for call in calls] == ["embed", "rerank"]
+    commit.assert_called_once_with()
+
+
 def test_bge_cuda_cache_and_warm_singleton_reuse(monkeypatch, tmp_path):
     import sys
     import torch
@@ -392,6 +493,15 @@ def test_bge_cuda_cache_and_warm_singleton_reuse(monkeypatch, tmp_path):
             calls.append((name, kwargs))
         def eval(self):
             pass
+    class TensorProbe:
+        def sum(self):
+            return self
+        def item(self):
+            return 0
+    real_zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *args, **kwargs:
+                        TensorProbe() if str(kwargs.get("device", "")).startswith("cuda") else real_zeros(*args, **kwargs))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "mock-gpu")
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")

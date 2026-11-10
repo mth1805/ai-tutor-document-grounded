@@ -9,7 +9,7 @@ For the CPU-only three-service local Compose demo and manual Dev queue migration
 - Next.js 14 frontend on Vercel.
 - Existing FastAPI application exposed as an ASGI app on Modal (`backend/deploy/modal_app.py`). The wrapper returns `app.main:app`; REST and SSE route paths stay the same.
 - Supabase provides Auth, PostgreSQL/pgvector, and private Storage. Gemini generates responses and Tavily is used only by the existing web fallback.
-- The API is CPU-only and currently invokes query-time embedding/reranking inside the API worker. Database-backed ingestion is queued durably; a scheduled CPU poller claims jobs and dispatches one job per separate ingestion worker. Set `MODAL_INGESTION_GPU` only when the ingestion worker should use a GPU. Query-time retrieval inference has not been isolated and may remain slower on CPU.
+- The API and durable ingestion worker are CPU-only. Database-backed ingestion is queued durably; a scheduled CPU poller claims jobs and dispatches one job per worker. A separate authenticated GPU inference endpoint handles embeddings and reranking when configured; bounded requests fall back to the process-local CPU model.
 
 ## B. Environment variables
 
@@ -51,40 +51,39 @@ Set `TAVILY_API_KEY`; `TAVILY_MAX_RESULTS` is bounded by the application's sourc
 ## F. Modal backend setup
 
 1. Install and authenticate the Modal CLI locally (`pip install modal`, then `modal setup`).
-2. Create a Modal Secret named `ai-tutor-production` containing the production backend variables above. Or set `MODAL_SECRET_NAME` to a secret you created.
-3. From the repository root, deploy manually with `modal deploy backend/deploy/modal_app.py`.
-4. Modal uses `backend/requirements.lock.txt` for the CPU API, poller, and default CPU ingestion worker. Only explicitly GPU-configured ingestion workers use `backend/requirements-gpu.lock.txt`. Both are exact Python 3.11/Linux x86_64 locks. Their source inputs are `requirements-cpu.in` (PyTorch CPU index and `torch==2.14.1+cpu`) and `requirements-gpu.in` (`torch==2.14.1` from PyPI); both keep the same Sentence Transformers, BGE-M3, and CrossEncoder dependencies. The API lock excludes CUDA/NVIDIA runtime packages, while the GPU worker lock retains them. Both images install Tesseract with English/Vietnamese language data and LibreOffice Writer for scanned-PDF/image OCR and legacy `.doc` uploads. The root Dockerfile installs the CPU lock. Validate clean Linux image builds before rollout.
+2. Create a Modal Secret named `ai-tutor-production` containing the production backend variables above and a random server-only `MODAL_INFERENCE_TOKEN`. Or set `MODAL_SECRET_NAME` to a secret you created.
+3. From the repository root, set `MODAL_INFERENCE_GPU=T4` (or another supported Modal GPU) in the deployment shell, then run `modal deploy backend/deploy/modal_app.py`. Copy the `gpu_inference` endpoint URL from deployment output into `MODAL_INFERENCE_URL` in the backend Modal Secret, then redeploy the callers with the same command. The first deployment without the URL safely uses CPU fallback.
+4. Modal uses `backend/requirements.lock.txt` for the CPU API, poller, and durable ingestion worker. The dedicated inference endpoint uses `backend/requirements-gpu.lock.txt`. Both are exact Python 3.11/Linux x86_64 locks. Their source inputs are `requirements-cpu.in` (PyTorch CPU index and `torch==2.14.1+cpu`) and `requirements-gpu.in` (`torch==2.14.1` from PyPI); both keep the same Sentence Transformers, BGE-M3, and CrossEncoder dependencies. The API lock excludes CUDA/NVIDIA runtime packages, while the GPU endpoint lock retains them. The CPU image includes Tesseract with English/Vietnamese language data and LibreOffice Writer for scanned-PDF/image OCR and legacy `.doc` uploads; the smaller inference image does not include those ingestion tools. The root Dockerfile installs the CPU lock. Validate clean Linux image builds before rollout.
 5. Apply the durable ingestion migration using the normal reviewed Supabase migration workflow before deploying this application version. Do not apply ad-hoc production DDL. The worker queue requires `SUPABASE_URL` and backend-only `SUPABASE_SERVICE_ROLE_KEY`; only the narrowly scoped queue RPCs use that key. Document content processing continues through the authenticated per-user database session.
-6. The wrapper uses a persistent Modal Volume named `ai-tutor-model-cache` (override with `MODAL_MODEL_CACHE_VOLUME`) mounted at `/models`; Hugging Face uses `/models/huggingface`.
-7. API and worker CPU/memory are configurable with `MODAL_API_CPU`, `MODAL_API_MEMORY_MB`, `MODAL_INGESTION_CPU`, and `MODAL_INGESTION_MEMORY_MB`. `MODAL_MAX_CONCURRENT_INPUTS` bounds ASGI concurrency per container. Set this with SQLAlchemy pool settings and Supabase connection limits in mind. `MODAL_INGESTION_GPU` defaults to no GPU: an absent, empty, or whitespace-only value selects CPU. An explicit GPU name allocates that GPU only to per-job ingestion workers. API and poller stay CPU-only. The scheduled poller runs every 15 seconds, claims up to 10 due jobs with a 60-minute lease, and workers retry failures up to three attempts with backoff. The worker timeout is 30 minutes; expired leases are reclaimed by the database RPC.
+6. The wrapper uses a persistent Modal Volume named `ai-tutor-model-cache` (override with `MODAL_MODEL_CACHE_VOLUME`) mounted at `/models`. After deploying the wrapper but before routing traffic, run `modal run backend/deploy/modal_app.py::prepare_model_cache`; it downloads both model checkpoints and commits the cache. Runtime API, ingestion, and inference containers mount that volume read-only and run Hugging Face in offline mode. Repeat cache preparation before deploying changes to either model checkpoint. Model-file cache compatibility must be validated in a staged deployment.
+7. API and worker CPU/memory are configurable with `MODAL_API_CPU`, `MODAL_API_MEMORY_MB`, `MODAL_INGESTION_CPU`, and `MODAL_INGESTION_MEMORY_MB`. `MODAL_MAX_CONCURRENT_INPUTS` bounds ASGI concurrency per container. The API, poller, and durable ingestion job runner remain CPU-only. Only `gpu_inference` owns CUDA; it performs embedding/reranking inference and never accesses the ingestion queue or database. The scheduled poller runs every 15 seconds, claims up to 10 due jobs with a 60-minute lease, and workers retry failures up to three attempts with backoff. The worker timeout is 30 minutes; expired leases are reclaimed by the database RPC.
 
 `modal deploy` provisions public API and scheduled worker functions, and may incur charges. Do not run it until you intend to create those resources. The repository does not deploy automatically.
 
 ## G. Model configuration and queue operation
 
-`EMBEDDING_DEVICE` and `RERANKER_DEVICE` default to `cpu`. Explicit `auto` settings still select CUDA when available and otherwise CPU; explicit `cuda` retains the existing CPU fallback when CUDA is unavailable. The API image contains CPU-only PyTorch and serves query-time embedding/reranking on CPU. The ingestion worker selects the CPU image by default, or the CUDA-enabled image when a GPU is explicitly configured. It sets its own embedding device to match that selection before importing worker Settings, keeps the cache at `/models/huggingface/hub` (the normal HF_HOME hub directory), and enables automatic embedding. The model providers remain process singletons and receive configured Hugging Face cache paths; models are not downloaded on every request. `PREWARM_MODELS=true` loads both models at startup, increasing cold start and startup memory. With prewarming off, first retrieval incurs lazy model initialization. Database access, auth, API orchestration, Gemini, Tavily, and the SymPy math solver do not require a GPU.
+`DEVICE_MODE=auto|cuda|cpu` controls model inference, and `GPU_FALLBACK_ENABLED=true` enables CPU fallback. Configure `MODAL_INFERENCE_URL` and `MODAL_INFERENCE_TOKEN` in the server-side Modal Secret. The endpoint URL is printed by `modal deploy` or shown in the Modal dashboard; set it in the secret before deploying the API/worker callers. The inference worker validates CUDA with an actual tensor operation, caches separate BGE and Cross-Encoder singletons, retries an OOM once with half the batch size, and validates numeric outputs. A bounded `GPU_WORKER_TIMEOUT_SECONDS` covers endpoint scheduling and execution; timeouts, scheduling errors, other failures, or invalid output use the existing CPU model when fallback is enabled. CPU fallback has a configurable `CPU_FALLBACK_TIMEOUT_SECONDS`. The API and ingestion job runner use the CPU-only PyTorch lock and initialize their CPU model only if needed for fallback. Local CPU development requires no Modal GPU or credential.
 
 ### Compute-device modes
 
-- **Local CPU:** `EMBEDDING_DEVICE=cpu` and `RERANKER_DEVICE=cpu`. These are the
-  shared defaults, and Compose explicitly overrides both devices to CPU for the
+- **Local CPU:** `DEVICE_MODE=cpu` (the `.env.example` setting). Compose explicitly overrides both devices to CPU for the
   backend and local worker. Local Docker installs the CPU dependency lock and
-  requires no NVIDIA runtime. A Modal GPU setting never changes this profile.
-- **Modal CPU:** Leave `MODAL_INGESTION_GPU` unset or use `MODAL_INGESTION_GPU=`.
-  The worker uses `image`, requests `gpu=None`, and sets `EMBEDDING_DEVICE=cpu`.
-- **Modal GPU:** Use `MODAL_INGESTION_GPU=T4`, `MODAL_INGESTION_GPU=L4`, or another
-  GPU supported by your Modal account. The worker uses `gpu_image`, requests that
-  exact trimmed GPU name, and sets `EMBEDDING_DEVICE=cuda`. FastAPI and the poller
-  continue to use the CPU image with no GPU allocation in every mode.
+  requires no NVIDIA runtime. Start the stack from the repository root with
+  `docker compose up --build`; a Modal GPU setting never changes this profile.
+- **Modal CPU fallback:** Set `DEVICE_MODE=cpu`. No inference URL/token is required.
+- **Modal GPU-first:** Set `DEVICE_MODE=auto`, `GPU_FALLBACK_ENABLED=true`,
+  `MODAL_INFERENCE_GPU=T4` or another
+  GPU supported by your account. Only `gpu_inference` receives CUDA. API and
+  ingestion callers wait up to `GPU_WORKER_TIMEOUT_SECONDS`, then use CPU.
 
-`MODAL_INGESTION_GPU` is read from the deployment launcher's environment when the
-wrapper is imported and resources are registered. Set it in that environment
-before a future manual deployment; putting it only in runtime Modal Secret values
-does not select deployment resources. The wrapper does not load the local `.env`
-to allocate GPUs. Actual GPU provisioning still requires account access to the
-requested hardware; missing or blank configuration selects CPU, while unavailable
-explicit allocations must be resolved in the deployment environment. No remote
-GPU build or execution is implied by local configuration tests.
+`MODAL_INFERENCE_GPU` is read by the deploy launcher when resources are
+registered. Set it there before deployment; putting it only in runtime Secret
+values does not select hardware. The old `MODAL_INGESTION_GPU` variable is
+temporarily accepted as a deprecated alias only when `MODAL_INFERENCE_GPU` is
+unset; it never allocates a GPU to ingestion. `MODAL_INFERENCE_URL` and
+`MODAL_INFERENCE_TOKEN` are runtime server-side secret values. The GPU endpoint
+uses bearer-token authentication and does not expose Modal credentials to the
+frontend. No live GPU build or execution is implied by local tests.
 
 See [ingestion and document preview changes](production-ingestion-preview.md) for storage compensation, preview lifecycle, validation limits, and manual rollout commands.
 
