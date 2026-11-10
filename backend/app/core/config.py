@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     GEMINI_THINKING_LEVEL: str = "medium"
     LLM_MAX_OUTPUT_TOKENS: int = 2048
     LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
+    DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET: int = Field(default=12000, ge=1000, le=100000)
+    DOCUMENT_SUMMARY_MAP_OUTPUT_TOKENS: int = Field(default=512, ge=128, le=2048)
 
     # Phase 9: Web Search Fallback via Tavily Search API
     WEB_SEARCH_FALLBACK_ENABLED: bool = True

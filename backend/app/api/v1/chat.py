@@ -58,7 +58,10 @@ async def stream_chat_message(
             detail=str(ve),
         )
 
-    selected_id = payload.document_id or payload.active_document_id
+    selected_id = payload.document_id or (
+        None if DocumentReferenceResolver.has_explicit_filename(payload.content)
+        else payload.active_document_id
+    )
     if selected_id:
         await DocumentReferenceResolver.validate_id(db, selected_id, conversation.workspace_id, current_user.id)
 
@@ -118,7 +121,10 @@ async def sync_chat_message(
             detail=str(ve),
         )
 
-    selected_id = payload.document_id or payload.active_document_id
+    selected_id = payload.document_id or (
+        None if DocumentReferenceResolver.has_explicit_filename(payload.content)
+        else payload.active_document_id
+    )
     if selected_id:
         await DocumentReferenceResolver.validate_id(db, selected_id, conversation.workspace_id, current_user.id)
 

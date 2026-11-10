@@ -1,6 +1,7 @@
 """Unit tests for Phase 8 LLM provider abstractions."""
 import pytest
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 from google.genai.errors import APIError
 from google.genai import types
 
@@ -55,6 +56,43 @@ async def test_mock_llm_provider_simulated_error():
     with pytest.raises(LLMProviderError):
         async for _ in provider.generate_stream("Should fail"):
             pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("finish_reason", "expected_complete"), [
+    (types.FinishReason.STOP, True),
+    (types.FinishReason.MAX_TOKENS, False),
+    (types.FinishReason.SAFETY, False),
+    (None, False),
+])
+async def test_gemini_provider_preserves_candidate_completion_metadata(
+    monkeypatch, finish_reason, expected_complete,
+):
+    provider = GeminiProvider(api_key="test-dummy-key")
+
+    async def fake_generate_response(*args, **kwargs):
+        return SimpleNamespace(
+            text="generated response",
+            candidates=[SimpleNamespace(finish_reason=finish_reason)],
+        )
+
+    monkeypatch.setattr(provider, "_generate_response", fake_generate_response)
+    result = await provider.generate_with_metadata("summary prompt")
+
+    assert result.text == "generated response"
+    assert result.completed is expected_complete
+    assert result.finish_reason == (finish_reason.name if finish_reason is not None else None)
+
+
+@pytest.mark.asyncio
+async def test_gemini_generate_keeps_legacy_string_return_contract(monkeypatch):
+    provider = GeminiProvider(api_key="test-dummy-key")
+
+    async def fake_generate_response(*args, **kwargs):
+        return SimpleNamespace(text="legacy response", candidates=[])
+
+    monkeypatch.setattr(provider, "_generate_response", fake_generate_response)
+    assert await provider.generate("normal RAG prompt") == "legacy response"
 
 
 def test_gemini_provider_missing_api_key(monkeypatch):

@@ -10,6 +10,8 @@ from app.models.document import Document
 from app.ml.mock_provider import MockEmbeddingProvider
 from app.ml.reranker_mock import MockRerankerProvider
 from app.services.document_service import _IN_MEMORY_DOCUMENTS
+from app.services.document_summary_service import DocumentSummaryService
+from app.rag.summary_intent import classify_summary_intent
 from app.services.document_reference import DocumentReferenceResolver
 from app.services.ingestion_service import _IN_MEMORY_CHUNKS
 from app.services.retrieval_service import RetrievalService
@@ -39,14 +41,23 @@ def document(workspace, name="Bài 6. Tranformer Ver2.pdf", *, user=USER_A_ID,
 
 @pytest.fixture
 def pipeline(monkeypatch):
-    # Exercise the full retrieval pipeline with a deterministic high-confidence model double.
+    # Capture both the regular retrieval route and the Phase 15 whole-summary route.
     monkeypatch.setattr(MockRerankerProvider, "predict", lambda self, pairs, **kw: [0.95] * len(pairs))
     original = RetrievalService.retrieve
-    requests = []
+    class CapturedRoutes(list):
+        def __init__(self):
+            super().__init__()
+            self.summaries = []
+    requests = CapturedRoutes()
     async def capture(**kwargs):
         requests.append(kwargs["request"])
         return await original(**kwargs)
     monkeypatch.setattr(RetrievalService, "retrieve", capture)
+    original_summary = DocumentSummaryService.summarize_document
+    async def capture_summary(cls, db, document, *args, **kwargs):
+        requests.summaries.append(document)
+        return await original_summary(db, document, *args, **kwargs)
+    monkeypatch.setattr(DocumentSummaryService, "summarize_document", classmethod(capture_summary))
     monkeypatch.setattr("app.services.rag_service.get_web_search_provider",
                         lambda: pytest.fail("Resolved/ambiguous requests must not search web"))
     return requests
@@ -65,8 +76,11 @@ def test_single_embedded_document(query, pipeline):
     ws, cid = create_user_workspace_and_conversation()
     doc = document(ws)
     result = chat(cid, query)
-    assert pipeline[0].document_id == doc.id
-    assert doc.original_filename in pipeline[0].query
+    if classify_summary_intent(query).whole_document:
+        assert pipeline.summaries[-1].id == doc.id
+    else:
+        assert pipeline[0].document_id == doc.id
+        assert doc.original_filename in pipeline[0].query
     assert result["has_sufficient_evidence"]
     assert result["citations"][0]["document_id"] == str(doc.id)
     assert result["citations"][0]["page_start"] == 3
@@ -78,10 +92,10 @@ def test_explicit_filename_and_persisted_followup(pipeline):
     second = document(ws, "Attention.pdf")
     query = "Tóm tắt Transformer.pdf"
     chat(cid, query)
-    assert pipeline[-1].query == query
+    assert pipeline.summaries[-1].id == first.id
     chat(cid, "Giải thích kỹ hơn phần 2 của tài liệu này")
     assert pipeline[-1].document_id == first.id
-    chat(cid, "summarize this document", active_document_id=str(second.id))
+    chat(cid, "explain this document", active_document_id=str(second.id))
     chat(cid, "explain this document")
     assert pipeline[-1].document_id == second.id
     # Another conversation in the same workspace cannot inherit this conversation's reference.
@@ -99,18 +113,18 @@ def test_selected_id(pipeline, field, multiple):
     if multiple:
         document(ws, "Other.pdf")
     chat(cid, "summarize this document", **{field: str(selected.id)})
-    assert pipeline[-1].document_id == selected.id
+    assert pipeline.summaries[-1].id == selected.id
 
 
 def test_priority_attachment_viewer_filename_then_history(pipeline):
     ws, cid = create_user_workspace_and_conversation()
     first, second = document(ws, "First.pdf"), document(ws, "Second.pdf")
     chat(cid, "summarize First.pdf", document_id=str(second.id), active_document_id=str(first.id))
-    assert pipeline[-1].document_id == second.id
+    assert pipeline.summaries[-1].id == second.id
     chat(cid, "summarize Second.pdf", active_document_id=str(first.id))
-    assert pipeline[-1].document_id == first.id
+    assert pipeline.summaries[-1].id == second.id
     chat(cid, "summarize Second.pdf")
-    assert pipeline[-1].document_id == second.id
+    assert pipeline.summaries[-1].id == second.id
 
 
 def test_ambiguous_clarification_streams_and_persists(pipeline):
@@ -186,7 +200,7 @@ def test_removed_history_document_does_not_switch_to_remaining_document(pipeline
     ws, cid = create_user_workspace_and_conversation()
     previous = document(ws, "Previous.pdf")
     document(ws, "Unrelated.pdf")
-    chat(cid, "summarize Previous.pdf")
+    chat(cid, "explain Previous.pdf")
     del _IN_MEMORY_DOCUMENTS[previous.id]
     result = chat(cid, "explain this document")
     assert "no longer" in result["content"]
@@ -198,9 +212,9 @@ def test_only_eligible_document_ignores_other_users_and_processing_documents(pip
     eligible = document(ws)
     document(ws, "Private.pdf", user=USER_B_ID)
     processing = document(ws, "Pending.pdf", status="processing", embedding_status="pending")
-    chat(cid, "summarize this document")
+    chat(cid, "explain this document")
     assert pipeline[-1].document_id == eligible.id
-    result = chat(cid, "summarize this document", active_document_id=str(processing.id))
+    result = chat(cid, "explain this document", active_document_id=str(processing.id))
     assert "processing" in result["content"]
     assert len(pipeline) == 1
 
