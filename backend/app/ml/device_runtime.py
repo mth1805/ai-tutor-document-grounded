@@ -2,6 +2,7 @@
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 import hmac
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -87,13 +88,26 @@ def local_cuda_available() -> bool:
 
 
 def should_call_modal(legacy_device: str = "cpu") -> bool:
-    # In CPU mode a Modal URL or token is irrelevant and is never validated or
-    # transmitted. Missing credentials likewise leave the provider on local CPU.
-    return (
-        selected_mode(legacy_device) != "cpu"
-        and not local_cuda_available()
-        and bool(settings.MODAL_INFERENCE_URL and settings.MODAL_INFERENCE_TOKEN)
+    # The explicit Modal role takes precedence over CUDA availability so the GPU
+    # endpoint cannot recursively call itself when its CUDA runtime is broken.
+    worker_role = os.getenv("MODAL_INFERENCE_WORKER_ROLE", "").strip().lower()
+    if worker_role == "gpu_inference":
+        return False
+
+    # Production API/queue/ingestion processes always route model inference to
+    # the dedicated GPU worker. Missing endpoint settings fail at call time.
+    # Development retains local CPU behavior when Modal is not configured.
+    mode = selected_mode(legacy_device)
+    if settings.ENVIRONMENT.lower() in {"production", "prod"}:
+        return True
+    return mode != "cpu" and not local_cuda_available() and bool(
+        settings.MODAL_INFERENCE_URL and settings.MODAL_INFERENCE_TOKEN
     )
+
+
+def cpu_fallback_enabled() -> bool:
+    """Production inference must fail clearly rather than run the large CPU models."""
+    return settings.GPU_FALLBACK_ENABLED and settings.ENVIRONMENT.lower() not in {"production", "prod"}
 
 
 def _release_when_done(
@@ -161,6 +175,20 @@ def _validate_remote_response(result: Any) -> Any:
 
 
 def infer_remote(operation: str, values: list, *, normalize: bool = True, batch_size: int = 16) -> Any:
+    """Split large input lists into bounded requests and preserve output order."""
+    if batch_size < 1:
+        raise ValueError("Modal inference batch size must be positive")
+    request_size = min(batch_size, 128)
+    outputs = []
+    for offset in range(0, len(values), request_size):
+        outputs.extend(_infer_remote_batch(
+            operation, values[offset:offset + request_size], normalize=normalize,
+            batch_size=request_size,
+        ))
+    return outputs
+
+
+def _infer_remote_batch(operation: str, values: list, *, normalize: bool, batch_size: int) -> Any:
     """Call Modal with bounded admission and an end-to-end caller deadline.
 
     Timing out cancels a request only if it has not started in the local

@@ -56,6 +56,18 @@ def test_remote_request_uses_bounded_timeout_and_server_token(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer never-log-this-token"
 
 
+def test_remote_embedding_splits_inputs_into_bounded_ordered_requests(monkeypatch):
+    _remote_settings(monkeypatch)
+    posted = []
+    def post(url, **kwargs):
+        values = kwargs["json"]["values"]
+        posted.extend(values)
+        return _response({"ok": True, "outputs": [[value] for value in values], "device": "cuda", "gpu": "NVIDIA T4"})
+    monkeypatch.setattr(device_runtime.httpx, "post", post)
+    assert device_runtime.infer_remote("embed", [1, 2, 3, 4, 5], batch_size=2) == [[1], [2], [3], [4], [5]]
+    assert posted == [1, 2, 3, 4, 5]
+
+
 def test_remote_scheduling_wait_has_an_outer_deadline(monkeypatch):
     _remote_settings(monkeypatch)
     monkeypatch.setattr(settings, "GPU_WORKER_TIMEOUT_SECONDS", 0.01)
@@ -303,6 +315,181 @@ def test_cpu_mode_does_not_require_or_validate_modal_url_or_token(monkeypatch):
     monkeypatch.setattr(settings, "MODAL_INFERENCE_TOKEN", None)
     monkeypatch.setattr(device_runtime, "local_cuda_available", lambda: False)
     assert not device_runtime.should_call_modal()
+
+
+@pytest.mark.parametrize("provider_name,operation,input_value", [
+    ("BGEEmbeddingProvider", "embed", "x"),
+    ("CrossEncoderRerankerProvider", "rerank", ("q", "p")),
+])
+def test_production_requires_remote_gpu_and_never_falls_back_without_credentials(
+    monkeypatch, provider_name, operation, input_value,
+):
+    import torch
+    from app.ml.bge_provider import BGEEmbeddingProvider
+    from app.ml.reranker_provider import CrossEncoderRerankerProvider
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "DEVICE_MODE", "auto")
+    monkeypatch.setattr(settings, "EMBEDDING_DEVICE", "auto")
+    monkeypatch.setattr(settings, "RERANKER_DEVICE", "auto")
+    monkeypatch.setattr(settings, "MODAL_INFERENCE_URL", None)
+    monkeypatch.setattr(settings, "MODAL_INFERENCE_TOKEN", None)
+    monkeypatch.setattr(settings, "GPU_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    provider_type = BGEEmbeddingProvider if provider_name == "BGEEmbeddingProvider" else CrossEncoderRerankerProvider
+    provider = provider_type()
+    local_calls = []
+    if operation == "embed":
+        monkeypatch.setattr(provider, "_encode_cpu", lambda *args, **kwargs: local_calls.append(True))
+        with pytest.raises(device_runtime.InferenceUnavailable, match="fallback is disabled"):
+            provider.encode_batch([input_value])
+    else:
+        monkeypatch.setattr(provider, "_predict_cpu", lambda *args, **kwargs: local_calls.append(True))
+        with pytest.raises(device_runtime.InferenceUnavailable, match="fallback is disabled"):
+            provider.predict([input_value])
+    assert provider.device == "modal_gpu"
+    assert local_calls == []
+
+
+@pytest.mark.parametrize("mode", ["auto", "cpu"])
+def test_production_cpu_orchestrator_always_routes_remotely(monkeypatch, mode):
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "DEVICE_MODE", mode)
+    monkeypatch.setenv("MODAL_INFERENCE_WORKER_ROLE", "cpu_orchestrator")
+    monkeypatch.setattr(device_runtime, "local_cuda_available", lambda: False)
+    assert device_runtime.should_call_modal()
+
+
+def test_gpu_worker_with_cuda_available_uses_local_inference(monkeypatch):
+    import torch
+    from app.ml.bge_provider import BGEEmbeddingProvider
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "DEVICE_MODE", "cuda")
+    monkeypatch.setattr(settings, "EMBEDDING_DEVICE", "cuda")
+    monkeypatch.setenv("MODAL_INFERENCE_WORKER_ROLE", "gpu_inference")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    provider = BGEEmbeddingProvider.__new__(BGEEmbeddingProvider)
+    provider._requested_mode = "cuda"
+    provider._remote_only = device_runtime.should_call_modal("cuda")
+    provider._device = "cuda"
+    provider._dimension = settings.EMBEDDING_DIMENSION
+    local_result = [[0.0] * settings.EMBEDDING_DIMENSION]
+    local_calls = []
+    monkeypatch.setattr(provider, "_encode_local", lambda *args, **kwargs: local_calls.append(True) or local_result)
+    monkeypatch.setattr(provider, "_log_inference", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runtime, "infer_remote", lambda *args, **kwargs: pytest.fail("GPU worker recursed to Modal"))
+
+    assert provider.encode_batch(["text"]) == local_result
+    assert local_calls == [True]
+
+
+@pytest.mark.parametrize("provider_name", ["BGEEmbeddingProvider", "CrossEncoderRerankerProvider"])
+def test_gpu_worker_without_cuda_fails_without_remote_recursion(monkeypatch, provider_name):
+    import torch
+    from app.ml.bge_provider import BGEEmbeddingProvider
+    from app.ml.reranker_provider import CrossEncoderRerankerProvider
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "DEVICE_MODE", "cuda")
+    monkeypatch.setattr(settings, "EMBEDDING_DEVICE", "cuda")
+    monkeypatch.setattr(settings, "RERANKER_DEVICE", "cuda")
+    monkeypatch.setattr(settings, "GPU_FALLBACK_ENABLED", False)
+    monkeypatch.setenv("MODAL_INFERENCE_WORKER_ROLE", "gpu_inference")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    remote_calls = []
+    monkeypatch.setattr(device_runtime, "infer_remote", lambda *args, **kwargs: remote_calls.append(True))
+    provider_type = BGEEmbeddingProvider if provider_name == "BGEEmbeddingProvider" else CrossEncoderRerankerProvider
+
+    with pytest.raises(device_runtime.InferenceUnavailable, match="CUDA was explicitly requested"):
+        provider_type()
+    assert not device_runtime.should_call_modal("cuda")
+    assert remote_calls == []
+
+
+@pytest.mark.parametrize("provider_name", ["BGEEmbeddingProvider", "CrossEncoderRerankerProvider"])
+def test_production_gpu_oom_never_falls_back_to_cpu(monkeypatch, provider_name):
+    import torch
+    from app.ml.bge_provider import BGEEmbeddingProvider
+    from app.ml.reranker_provider import CrossEncoderRerankerProvider
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "DEVICE_MODE", "cuda")
+    monkeypatch.setattr(settings, "GPU_FALLBACK_ENABLED", True)
+    monkeypatch.setenv("MODAL_INFERENCE_WORKER_ROLE", "gpu_inference")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(device_runtime, "infer_remote", lambda *args, **kwargs: pytest.fail("GPU worker recursed to Modal"))
+    monkeypatch.setattr(device_runtime, "run_cpu_fallback", lambda *args, **kwargs: pytest.fail("Production GPU fell back to CPU"))
+    provider_type = BGEEmbeddingProvider if provider_name == "BGEEmbeddingProvider" else CrossEncoderRerankerProvider
+    provider = provider_type.__new__(provider_type)
+    provider._requested_mode = "cuda"
+    provider._remote_only = False
+    provider._device = "cuda"
+    if provider_name == "BGEEmbeddingProvider":
+        provider._dimension = settings.EMBEDDING_DIMENSION
+        monkeypatch.setattr(provider, "_encode_local", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("CUDA out of memory")))
+        monkeypatch.setattr(provider, "_log_inference", lambda *args, **kwargs: None)
+        invoke = lambda: provider.encode_batch(["text"], batch_size=8)
+    else:
+        monkeypatch.setattr(provider, "_predict_local", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("CUDA out of memory")))
+        monkeypatch.setattr(provider, "_log_inference", lambda *args, **kwargs: None)
+        invoke = lambda: provider.predict([("query", "text")], batch_size=8)
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        invoke()
+
+
+@pytest.mark.parametrize("provider_name,operation,input_value", [
+    ("BGEEmbeddingProvider", "embed", "x"),
+    ("CrossEncoderRerankerProvider", "rerank", ("q", "p")),
+])
+def test_production_remote_auth_failure_does_not_fall_back(
+    monkeypatch, provider_name, operation, input_value,
+):
+    import torch
+    from app.ml.bge_provider import BGEEmbeddingProvider
+    from app.ml.reranker_provider import CrossEncoderRerankerProvider
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "DEVICE_MODE", "auto")
+    monkeypatch.setattr(settings, "EMBEDDING_DEVICE", "auto")
+    monkeypatch.setattr(settings, "RERANKER_DEVICE", "auto")
+    monkeypatch.setattr(settings, "MODAL_INFERENCE_URL", MODAL_URL)
+    monkeypatch.setattr(settings, "MODAL_INFERENCE_TOKEN", "token")
+    monkeypatch.setattr(settings, "GPU_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    provider_type = BGEEmbeddingProvider if provider_name == "BGEEmbeddingProvider" else CrossEncoderRerankerProvider
+    provider = provider_type()
+    local_calls = []
+    if operation == "embed":
+        monkeypatch.setattr(provider, "_encode_cpu", lambda *args, **kwargs: local_calls.append(True))
+        invoke = lambda: provider.encode_batch([input_value])
+    else:
+        monkeypatch.setattr(provider, "_predict_cpu", lambda *args, **kwargs: local_calls.append(True))
+        invoke = lambda: provider.predict([input_value])
+    monkeypatch.setattr(device_runtime.httpx, "post", lambda *args, **kwargs: _response({}, status=401))
+    with pytest.raises(device_runtime.InferenceUnavailable, match="fallback is disabled"):
+        invoke()
+    assert local_calls == []
+
+
+def test_local_development_auto_mode_keeps_cpu_inference_without_modal_credentials(monkeypatch):
+    import torch
+    from app.ml.bge_provider import BGEEmbeddingProvider
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
+    monkeypatch.setattr(settings, "DEVICE_MODE", "auto")
+    monkeypatch.setattr(settings, "EMBEDDING_DEVICE", "auto")
+    monkeypatch.setattr(settings, "MODAL_INFERENCE_URL", None)
+    monkeypatch.setattr(settings, "MODAL_INFERENCE_TOKEN", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    provider = BGEEmbeddingProvider()
+    expected = [[0.0] * settings.EMBEDDING_DIMENSION]
+    monkeypatch.setattr(provider, "_encode_local", lambda *args, **kwargs: expected)
+    assert provider.device == "cpu"
+    assert provider.encode_batch(["local input"]) == expected
 
 
 def test_missing_token_does_not_send_remote_request(monkeypatch):
