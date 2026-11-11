@@ -63,7 +63,8 @@ class BGEEmbeddingProvider(BaseEmbeddingProvider):
         elif req.startswith("cuda"):
             if not cuda_available:
                 if not settings.GPU_FALLBACK_ENABLED:
-                    raise RuntimeError("CUDA was explicitly requested but is unavailable and fallback is disabled")
+                    from app.ml.device_runtime import InferenceUnavailable
+                    raise InferenceUnavailable("CUDA was explicitly requested but is unavailable and fallback is disabled")
                 logger.warning(
                     "CUDA device '%s' requested but not available. Safely falling back to CPU.",
                     requested_device,
@@ -140,7 +141,7 @@ class BGEEmbeddingProvider(BaseEmbeddingProvider):
 
         bs = batch_size or settings.EMBEDDING_BATCH_SIZE
 
-        from app.ml.device_runtime import InferenceUnavailable, infer_remote, run_cpu_fallback, should_call_modal
+        from app.ml.device_runtime import InferenceUnavailable, cpu_fallback_enabled, infer_remote, run_cpu_fallback, should_call_modal
         started = time.perf_counter()
         if self._remote_only or should_call_modal(self._requested_mode):
             try:
@@ -150,19 +151,19 @@ class BGEEmbeddingProvider(BaseEmbeddingProvider):
                             len(texts), bs, (time.perf_counter() - started) * 1000)
                 return vectors
             except Exception as exc:
-                if not settings.GPU_FALLBACK_ENABLED:
+                if not cpu_fallback_enabled():
                     raise InferenceUnavailable("GPU embedding failed and fallback is disabled") from exc
                 logger.warning("inference_gpu_fallback operation=embed reason=%s", type(exc).__name__)
                 return run_cpu_fallback("embed", self._encode_cpu, texts, normalize, bs,
                                         reason=type(exc).__name__)
-        if self._requested_mode == "cuda" and self._device == "cpu" and not settings.GPU_FALLBACK_ENABLED:
+        if self._requested_mode == "cuda" and self._device == "cpu" and not cpu_fallback_enabled():
             raise InferenceUnavailable("CUDA is unavailable and CPU fallback is disabled")
         try:
             result = self._encode_local(texts, normalize, bs)
             self._log_inference("embed", len(texts), bs, started)
             return self._validate_vectors(result, len(texts))
         except Exception as exc:
-            if not self._device.startswith("cuda") or not settings.GPU_FALLBACK_ENABLED:
+            if not self._device.startswith("cuda") or not cpu_fallback_enabled():
                 raise
             if self._is_oom(exc):
                 retry_bs = max(1, bs // 2)

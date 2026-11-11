@@ -130,8 +130,12 @@ def poll_ingestion_queue():
 def process_ingestion_job(job_id: str):
     """Process parsing and persistence on CPU; embeddings use bounded GPU inference."""
     # Set worker-only options before importing Settings; the inference endpoint
-    # is the only CUDA resource and the worker can fall back to local CPU.
+    # is the only CUDA resource and the CPU worker requires remote inference.
     os.environ["DEVICE_MODE"] = "auto"
+    # The production worker must not substitute local CPU model inference when
+    # the private T4 endpoint is misconfigured or unavailable.
+    os.environ["MODAL_INFERENCE_WORKER_ROLE"] = "cpu_orchestrator"
+    os.environ["GPU_FALLBACK_ENABLED"] = "false"
     os.environ["EMBEDDING_DEVICE"] = "auto"
     os.environ["RERANKER_DEVICE"] = "auto"
     # Match HF_HOME's normal hub subdirectory so CPU/GPU workers share weights.
@@ -201,7 +205,20 @@ def prepare_model_cache():
 async def gpu_inference(request: Request):
     """Private GPU inference endpoint. Inputs are data only; it never writes jobs."""
     import os
+    import time
+    # Mark this process before importing any application module that may load
+    # Settings or an ML provider. Role, not CUDA detection, keeps it local.
+    os.environ["MODAL_INFERENCE_WORKER_ROLE"] = "gpu_inference"
+    os.environ["DEVICE_MODE"] = "cuda"
+    os.environ["GPU_FALLBACK_ENABLED"] = "false"
+    os.environ["EMBEDDING_DEVICE"] = "cuda"
+    os.environ["RERANKER_DEVICE"] = "cuda"
+    os.environ["EMBEDDING_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
+    os.environ["RERANKER_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
     from app.ml.device_runtime import is_valid_bearer_token
+    request_started = time.perf_counter()
     expected = os.getenv("MODAL_INFERENCE_TOKEN", "")
     supplied = request.headers.get("authorization", "")
     if not is_valid_bearer_token(expected, supplied):
@@ -221,38 +238,79 @@ async def gpu_inference(request: Request):
         for pair in values
     ):
         raise HTTPException(status_code=422, detail="Invalid inference input")
-    os.environ["DEVICE_MODE"] = "cuda"
-    # Fail the remote request if CUDA cannot run; the CPU-only caller owns the
-    # bounded fallback, so the GPU worker never silently computes on CPU.
-    os.environ["GPU_FALLBACK_ENABLED"] = "false"
-    os.environ["EMBEDDING_DEVICE"] = "cuda"
-    os.environ["RERANKER_DEVICE"] = "cuda"
-    os.environ["EMBEDDING_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
-    os.environ["RERANKER_MODEL_CACHE_DIR"] = "/models/huggingface/hub"
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
     try:
         if operation == "embed" and isinstance(values, list) and all(isinstance(v, str) for v in values):
             from app.ml.loader import get_embedding_provider
             provider = get_embedding_provider()
             import torch
-            outputs = provider.encode_batch(values, normalize=bool(payload.get("normalize", True)), batch_size=int(batch_size))
+            outputs = None
+            active_batch_size = int(batch_size)
+            while outputs is None:
+                inference_started = time.perf_counter()
+                try:
+                    outputs = provider.encode_batch(values, normalize=bool(payload.get("normalize", True)), batch_size=active_batch_size)
+                except Exception as exc:
+                    if not _is_cuda_oom(exc) or active_batch_size <= 1:
+                        raise
+                    previous_batch_size = active_batch_size
+                    active_batch_size = max(1, active_batch_size // 2)
+                    torch.cuda.empty_cache()
+                    logging.getLogger(__name__).warning(
+                        "gpu_inference_oom_retry operation=embed original_batch=%d retry_batch=%d",
+                        previous_batch_size, active_batch_size,
+                    )
+                else:
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
         elif operation == "rerank" and isinstance(values, list):
             from app.ml.loader import get_reranker_provider
             if not all(isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(x, str) for x in v) for v in values):
                 raise HTTPException(status_code=422, detail="Invalid inference input")
             provider = get_reranker_provider()
             import torch
-            outputs = provider.predict(values, batch_size=int(batch_size))
+            outputs = None
+            active_batch_size = int(batch_size)
+            while outputs is None:
+                inference_started = time.perf_counter()
+                try:
+                    outputs = provider.predict(values, batch_size=active_batch_size)
+                except Exception as exc:
+                    if not _is_cuda_oom(exc) or active_batch_size <= 1:
+                        raise
+                    previous_batch_size = active_batch_size
+                    active_batch_size = max(1, active_batch_size // 2)
+                    torch.cuda.empty_cache()
+                    logging.getLogger(__name__).warning(
+                        "gpu_inference_oom_retry operation=rerank original_batch=%d retry_batch=%d",
+                        previous_batch_size, active_batch_size,
+                    )
+                else:
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
         else:
             raise HTTPException(status_code=422, detail="Invalid inference operation or input")
         device = provider.device
         gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
         if device != "cuda" or not isinstance(gpu, str) or not gpu.strip():
             raise RuntimeError("GPU inference did not confirm CUDA execution")
+        logging.getLogger(__name__).info(
+            "gpu_inference_complete operation=%s device=%s gpu=%s input_count=%d batch_size=%d inference_ms=%.2f request_ms=%.2f",
+            operation, device, gpu.strip(), len(values), active_batch_size,
+            inference_ms, (time.perf_counter() - request_started) * 1000,
+        )
         return {"ok": True, "outputs": outputs, "device": device, "gpu": gpu}
     except HTTPException:
         raise
     except Exception as exc:
         logging.getLogger(__name__).error("gpu_inference_failed operation=%s category=%s", operation, type(exc).__name__)
         raise HTTPException(status_code=503, detail="GPU inference failed") from exc
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    """Recognize PyTorch CUDA OOM without treating other failures as retryable."""
+    try:
+        import torch
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "cuda oom" in message

@@ -383,13 +383,18 @@ def test_gpu_inference_endpoint_enforces_bearer_auth(monkeypatch, load_modal_con
 @pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
 def test_gpu_endpoint_success_reports_cuda_and_gpu_metadata(monkeypatch, load_modal_configuration):
     import asyncio
+    import os
     from types import SimpleNamespace
     import torch
     from app.ml import loader
     deployment = load_modal_configuration()
+    monkeypatch.setenv("MODAL_INFERENCE_WORKER_ROLE", "test-original")
     monkeypatch.setenv("MODAL_INFERENCE_TOKEN", "gpu-test-secret")
     provider = SimpleNamespace(device="cuda", encode_batch=lambda *a, **k: [[0.0] * 1024])
-    monkeypatch.setattr(loader, "get_embedding_provider", lambda: provider)
+    def get_provider():
+        assert os.environ["MODAL_INFERENCE_WORKER_ROLE"] == "gpu_inference"
+        return provider
+    monkeypatch.setattr(loader, "get_embedding_provider", get_provider)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA T4")
     async def body():
@@ -400,6 +405,44 @@ def test_gpu_endpoint_success_reports_cuda_and_gpu_metadata(monkeypatch, load_mo
     assert result["device"] == "cuda"
     assert result["gpu"] == "NVIDIA T4"
     assert len(result["outputs"][0]) == 1024
+
+
+@pytest.mark.parametrize("operation,values,method,expected", [
+    ("embed", ["x", "y"], "encode_batch", [[0.0] * 1024, [0.0] * 1024]),
+    ("rerank", [["q", "x"], ["q", "y"]], "predict", [0.2, 0.8]),
+])
+@pytest.mark.filterwarnings("ignore:.*function is executing locally.*:UserWarning")
+def test_gpu_endpoint_retries_oom_with_smaller_bounded_batch(
+    monkeypatch, load_modal_configuration, operation, values, method, expected,
+):
+    import asyncio
+    from types import SimpleNamespace
+    import torch
+    from app.ml import loader
+
+    deployment = load_modal_configuration()
+    monkeypatch.setenv("MODAL_INFERENCE_TOKEN", "gpu-test-secret")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA T4")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    calls = []
+    def infer(*args, **kwargs):
+        calls.append(kwargs["batch_size"])
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory")
+        return expected
+    provider = SimpleNamespace(device="cuda", **{method: infer})
+    if operation == "embed":
+        monkeypatch.setattr(loader, "get_embedding_provider", lambda: provider)
+    else:
+        monkeypatch.setattr(loader, "get_reranker_provider", lambda: provider)
+
+    async def body():
+        return {"operation": operation, "values": values, "batch_size": 8}
+    request = SimpleNamespace(headers={"authorization": "Bearer gpu-test-secret"}, json=body)
+    result = asyncio.run(deployment.gpu_inference.local(request))
+    assert result["outputs"] == expected
+    assert calls == [8, 4]
 
 
 @pytest.mark.parametrize("gpu", [None, "", "T4", "L4"])
@@ -416,13 +459,15 @@ def test_modal_worker_sets_device_before_processing_and_reuses_loop(
     deployment = load_modal_configuration(gpu)
     # Register original env values with monkeypatch so direct worker mutations
     # are undone even when these keys were initially absent from the process.
-    for key in ("DEVICE_MODE", "EMBEDDING_DEVICE", "RERANKER_DEVICE", "EMBEDDING_MODEL_CACHE_DIR", "RERANKER_MODEL_CACHE_DIR", "AUTO_EMBED_AFTER_INGESTION", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for key in ("DEVICE_MODE", "GPU_FALLBACK_ENABLED", "MODAL_INFERENCE_WORKER_ROLE", "EMBEDDING_DEVICE", "RERANKER_DEVICE", "EMBEDDING_MODEL_CACHE_DIR", "RERANKER_MODEL_CACHE_DIR", "AUTO_EMBED_AFTER_INGESTION", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         monkeypatch.setenv(key, os.environ.get(key, "test-original"))
     calls = []
     async def process(job_id):
         configured = Settings(_env_file=None, ENVIRONMENT="development")
         calls.append((job_id, asyncio.get_running_loop()))
         assert configured.DEVICE_MODE == "auto"
+        assert configured.GPU_FALLBACK_ENABLED is False
+        assert os.environ["MODAL_INFERENCE_WORKER_ROLE"] == "cpu_orchestrator"
         assert configured.EMBEDDING_DEVICE == "auto"
         assert str(configured.EMBEDDING_MODEL_CACHE_DIR).replace("\\", "/") == "/models/huggingface/hub"
         assert configured.AUTO_EMBED_AFTER_INGESTION
