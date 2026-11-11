@@ -14,6 +14,7 @@ from app.services.document_service import DocumentService
 from app.services.ingestion.pipeline import IngestionPipeline
 from app.services.ingestion.models import ProcessedChunk
 from app.db.session import AsyncSessionLocal
+from app.services.ingestion.telemetry import stage, event
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +33,24 @@ class IngestionService:
         user_id: uuid.UUID,
     ) -> bool:
         """Persist/re-arm one owner-scoped job; a unique document key prevents duplicates."""
+        # Serialize reprocessing on the parent row, whose owner already has
+        # UPDATE access. FOR UPDATE on jobs would require queue UPDATE privileges
+        # and an UPDATE RLS policy, both deliberately reserved for worker RPCs.
+        locked = await db.execute(
+            select(Document.id).where(
+                Document.id == document.id,
+                Document.user_id == user_id,
+                Document.workspace_id == document.workspace_id,
+            ).with_for_update()
+        )
+        if locked.scalar_one_or_none() is None:
+            raise ValueError("Document not found or unauthorized")
         result = await db.execute(
             select(DocumentIngestionJob)
             .where(
                 DocumentIngestionJob.document_id == document.id,
                 DocumentIngestionJob.user_id == user_id,
             )
-            .with_for_update()
         )
         existing = result.scalar_one_or_none()
         if existing and existing.status in {"queued", "processing"}:
@@ -69,6 +81,7 @@ class IngestionService:
         document_id: uuid.UUID,
         user_id: uuid.UUID,
         pipeline: Optional[IngestionPipeline] = None,
+        defer_failure_to_queue: bool = False,
     ) -> bool:
         """Processes an uploaded document, parses text, produces chunks, and commits them atomically.
 
@@ -92,29 +105,38 @@ class IngestionService:
         doc.status = "processing"
         doc.processing_started_at = now
         doc.processing_error = None
+        from app.core.config import settings
+        if settings.LOCAL_SHARED_MODELS:
+            # Parsing replaces canonical chunks: never reuse a prior completed flag.
+            doc.embedding_status = "pending"
+            doc.embedded_at = None
+            doc.embedding_error = None
 
         if db is not None:
             try:
                 await db.commit()
                 await db.refresh(doc)
             except Exception as e:
-                logger.error("Failed to update document status to 'processing': %s", e)
+                logger.error("document_status_update_failed document_id=%s category=%s", document_id, type(e).__name__)
                 await db.rollback()
 
         # 3. Retrieve raw file bytes from private storage
         try:
-            _, file_bytes = await DocumentService.get_document_file(db, document_id, user_id)
-            if not file_bytes:
-                raise ValueError(f"Original file for document {document_id} was not found in storage.")
+            with stage("storage_download"):
+                _, file_bytes = await DocumentService.get_document_file(db, document_id, user_id)
+                if not file_bytes:
+                    raise ValueError("STORAGE_OBJECT_UNAVAILABLE")
 
             # 4. Run CPU-bound parsing, cleaning, and chunking in threadpool
             active_pipeline = pipeline or IngestionPipeline()
+            logger.info("document_parse_started document_id=%s", document_id)
             chunks: List[ProcessedChunk] = await run_in_threadpool(
                 active_pipeline.process,
                 file_bytes,
                 doc.original_filename,
                 doc.mime_type,
             )
+            logger.info("document_parse_completed document_id=%s", document_id)
 
             # 5. Atomic persistence: delete previous chunks & insert new chunks in a single transaction
             processed_time = datetime.now(timezone.utc)
@@ -170,12 +192,7 @@ class IngestionService:
                 doc.processed_at = processed_time
                 doc.processing_error = None
 
-            logger.info(
-                "Document %s (%s) successfully processed with %d chunks.",
-                doc.id,
-                doc.original_filename,
-                len(chunks),
-            )
+            logger.info("chunks_created document_id=%s count=%d", doc.id, len(chunks))
 
             # Phase 6 Integration: Automatically trigger embedding for processed document
             from app.core.config import settings
@@ -188,9 +205,13 @@ class IngestionService:
             return True
 
         except Exception as err:
-            logger.error("Processing failed for document %s: %s", document_id, err, exc_info=True)
+            event("failed", error_category=type(err).__name__, error_code="DOCUMENT_PROCESSING_FAILED")
+            logger.error("document_processing_failed document_id=%s category=%s", document_id, type(err).__name__)
             failed_time = datetime.now(timezone.utc)
-            error_msg = str(err)
+            error_msg = (
+                "Document processing failed. Please retry or upload a new copy."
+                if settings.ENVIRONMENT.lower() in {"production", "prod"} else str(err)
+            )
 
             if db is not None:
                 try:
@@ -198,12 +219,12 @@ class IngestionService:
                     # Re-fetch document and mark as failed
                     doc = await DocumentService.get_document(db, document_id, user_id)
                     if doc:
-                        doc.status = "failed"
+                        doc.status = "processing" if defer_failure_to_queue else "failed"
                         doc.processing_error = error_msg
-                        doc.processed_at = failed_time
+                        doc.processed_at = None if defer_failure_to_queue else failed_time
                         await db.commit()
                 except Exception as db_err:
-                    logger.critical("Failed to record error state for document %s: %s", document_id, db_err)
+                    logger.critical("document_failure_record_failed document_id=%s category=%s", document_id, type(db_err).__name__)
             else:
                 doc.status = "failed"
                 doc.processing_error = error_msg
@@ -217,22 +238,23 @@ class IngestionService:
         document_id: uuid.UUID,
         user_id: uuid.UUID,
         pipeline: Optional[IngestionPipeline] = None,
+        defer_failure_to_queue: bool = False,
     ) -> bool:
         """Asynchronous background worker execution for document ingestion."""
         if AsyncSessionLocal is None:
-            return await cls.process_document(None, document_id, user_id, pipeline=pipeline)
+            return await cls.process_document(None, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue)
 
         try:
             from app.db.session import get_db
             from app.main import app
             if get_db in app.dependency_overrides:
-                return await cls.process_document(None, document_id, user_id, pipeline=pipeline)
+                return await cls.process_document(None, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue)
         except Exception:
             pass
 
         async with AsyncSessionLocal() as session:
             session.info["rls_user_id"] = user_id
-            return await cls.process_document(session, document_id, user_id, pipeline=pipeline)
+            return await cls.process_document(session, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue)
 
     @classmethod
     async def list_document_chunks(
@@ -240,11 +262,12 @@ class IngestionService:
         db: Optional[AsyncSession],
         document_id: uuid.UUID,
         user_id: uuid.UUID,
+        workspace_id: uuid.UUID | None = None,
     ) -> Optional[List[DocumentChunk]]:
         """Lists all chunks for an authorized document in sequential order."""
         # 1. Verify document ownership
         doc = await DocumentService.get_document(db, document_id, user_id)
-        if not doc:
+        if not doc or (workspace_id is not None and doc.workspace_id != workspace_id):
             return None
 
         # 2. Retrieve chunks
@@ -254,6 +277,7 @@ class IngestionService:
                 .where(
                     DocumentChunk.document_id == document_id,
                     DocumentChunk.user_id == user_id,
+                    *([DocumentChunk.workspace_id == workspace_id] if workspace_id is not None else []),
                 )
                 .order_by(DocumentChunk.chunk_index.asc())
             )
@@ -261,6 +285,11 @@ class IngestionService:
             return list(res.scalars().all())
 
         return sorted(
-            _IN_MEMORY_CHUNKS.get(document_id, []),
+            (
+                chunk for chunk in _IN_MEMORY_CHUNKS.get(document_id, [])
+                if chunk.document_id == document_id
+                and chunk.user_id == user_id
+                and (workspace_id is None or chunk.workspace_id == workspace_id)
+            ),
             key=lambda c: c.chunk_index,
         )

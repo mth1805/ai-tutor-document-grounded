@@ -1,4 +1,8 @@
 import type { Citation } from "./api";
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
 /**
  * Generates a deduplication key for a citation based on:
@@ -53,19 +57,23 @@ export interface ParsedCitationLink {
  */
 export function parseCitationUrl(url: string): ParsedCitationLink | null {
   try {
-    if (!url.startsWith("citation://")) return null;
+    if (!url.startsWith("citation://open?")) return null;
     const queryString = url.slice("citation://open?".length);
     const params = new URLSearchParams(queryString);
 
-    const docName = params.get("name") || "Document";
-    const pageStart = parseInt(params.get("pageStart") || "1", 10);
-    const pageEnd = parseInt(params.get("pageEnd") || String(pageStart), 10);
+    const docName = params.get("name")?.trim();
+    const start = params.get("pageStart") || "";
+    const end = params.get("pageEnd") || start;
+    if (!docName || !/^\d+$/.test(start) || !/^\d+$/.test(end)) return null;
+    const pageStart = Number(start);
+    const pageEnd = Number(end);
+    if (!validPages(pageStart, pageEnd)) return null;
 
     return {
       document_id: params.get("docId") || undefined,
       document_name: docName,
-      page_start: isNaN(pageStart) ? 1 : pageStart,
-      page_end: isNaN(pageEnd) ? pageStart : pageEnd,
+      page_start: pageStart,
+      page_end: pageEnd,
       chunk_id: params.get("chunkId") || undefined,
       snippet: params.get("snippet") || undefined,
     };
@@ -74,180 +82,119 @@ export function parseCitationUrl(url: string): ParsedCitationLink | null {
   }
 }
 
+function validPages(start: number, end: number): boolean {
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start > 0 && end >= start;
+}
+
+const markdownParser = unified().use(remarkParse).use(remarkGfm).use(remarkMath);
+const normalizeName = (name: string) => name.normalize("NFC").trim().toLowerCase();
+
+interface MarkdownNode {
+  type: string;
+  position?: { start: { offset?: number }; end: { offset?: number } };
+  children?: MarkdownNode[];
+}
+
 /**
- * Preprocesses markdown text containing raw citation patterns like:
- * - [Doc: filename.pdf, p. 9]
- * - [Doc: filename.pdf, pp. 9-11]
- * - [Source 1]
- * 
- * 1. Reduces citation density by aggregating citations at the end of paragraphs/claim groups.
- * 2. Deduplicates repeated citations in the same paragraph/claim group.
- * 3. Formats citations as compact inline source markers: [📄 p.9] or [📄 pp.9–10].
- * 4. Tracks all inline citation keys for parent deduplication against bottom evidence cards.
+ * Replace citations at their original source offsets. Parsing is used only to
+ * protect code, math, links and other non-prose nodes; Markdown is never
+ * serialized again, so table cells, whitespace and formatting stay intact.
+ * Only adjacent duplicate markers are collapsed: separate claims keep evidence.
  */
 export function preprocessMarkdownWithCitations(
   rawText: string,
   structuredCitations: Citation[] = []
 ): { processedText: string; inlineCitationKeys: Set<string> } {
-  if (!rawText) return { processedText: "", inlineCitationKeys: new Set() };
-
   const inlineCitationKeys = new Set<string>();
-  let processed = rawText;
+  if (!rawText) return { processedText: "", inlineCitationKeys };
 
-  // 1. Resolve [Source X] references to structured sources if available
-  const SOURCE_GROUP_REGEX =
-    /\[((?:Source|Doc)\s*[:\-]?\s*\d+(?:\s*,\s*(?:(?:Source|Doc)\s*[:\-]?\s*)?\d+)*)\]/gi;
-  const SOURCE_INDEX_REGEX = /(?:Source|Doc)?\s*[:\-]?\s*(\d+)/gi;
-  processed = processed.replace(SOURCE_GROUP_REGEX, (_match, sourceGroup: string) => {
-    const seen = new Set<string>();
-    const markers: string[] = [];
-    for (const sourceMatch of Array.from(sourceGroup.matchAll(SOURCE_INDEX_REGEX))) {
-      const citation = structuredCitations[Number(sourceMatch[1]) - 1];
-      if (!citation) continue;
-      const key = getCitationKey(citation);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const pageLabel =
-        citation.page_start === citation.page_end
-          ? `p. ${citation.page_start}`
-          : `pp. ${citation.page_start}-${citation.page_end}`;
-      markers.push(`[Doc: ${citation.document_name}, ${pageLabel}]`);
+  const protectedRanges: Array<[number, number]> = [];
+  const protectedTypes = new Set([
+    "code", "inlineCode", "math", "inlineMath", "link", "linkReference",
+    "image", "imageReference", "definition", "html",
+  ]);
+  const collectProtected = (node: MarkdownNode) => {
+    if (protectedTypes.has(node.type)) {
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start !== undefined && end !== undefined) protectedRanges.push([start, end]);
+      return;
     }
-    // Unresolved or hallucinated source IDs are suppressed instead of shown raw.
-    return markers.join(" ");
-  });
+    node.children?.forEach(collectProtected);
+  };
+  collectProtected(markdownParser.parse(rawText));
 
-  const DOC_PAGE_REGEX =
-    /\[(?:Doc:\s*)?([^,\]]+?)(?:,\s*|\s+)pp?\.?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]/gi;
+  // The page suffix delimits the filename, which may itself contain commas,
+  // Unicode, Markdown punctuation or bracketed qualifiers.
+  const markerPattern = /\[(?:Doc:\s*)?((?:[^\[\]\r\n]|\[[^\]\r\n]*\])+?)(?:,\s*|\s+)pp?\.?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]|\[((?:Source|Doc)\s*[:\-]?\s*\d+(?:\s*,\s*(?:(?:Source|Doc)\s*[:\-]?\s*)?\d+)*)\]/gi;
+  let cursor = 0;
+  let processedText = "";
+  let adjacentKeys = new Set<string>();
 
-  // Helper to process a single paragraph or claim group
-  const processBlock = (block: string): string => {
-    // Preserve code blocks without interpreting citation-like text as sources.
-    if (block.trim().startsWith("```")) {
-      return block;
-    }
-    const isTable = block.trim().startsWith("|");
+  const makeLink = (citation: ParsedCitationLink, evidenceKey = getCitationKey(citation)) => {
+    const key = getCitationKey(citation);
+    inlineCitationKeys.add(evidenceKey);
+    if (adjacentKeys.has(key)) return "";
+    adjacentKeys.add(key);
+    const params = new URLSearchParams();
+    if (citation.document_id) params.set("docId", citation.document_id);
+    params.set("name", citation.document_name);
+    params.set("pageStart", String(citation.page_start));
+    params.set("pageEnd", String(citation.page_end));
+    if (citation.chunk_id) params.set("chunkId", citation.chunk_id);
+    if (citation.snippet) params.set("snippet", citation.snippet);
+    return `[📄 ${formatCitationPages(citation.page_start, citation.page_end)}](citation://open?${params})`;
+  };
 
-    const matches = Array.from(block.matchAll(DOC_PAGE_REGEX));
-    if (matches.length === 0) return block;
+  for (const match of Array.from(rawText.matchAll(markerPattern))) {
+    const start = match.index;
+    const end = start + match[0].length;
+    const escapes = rawText.slice(0, start).match(/\\+$/)?.[0].length || 0;
+    if (escapes % 2) continue;
+    if (protectedRanges.some(([a, b]) => start < b && end > a)) continue;
+    const between = rawText.slice(cursor, start);
+    if (!/^[ \t]*$/.test(between)) adjacentKeys = new Set();
 
-    const seenKeysInBlock = new Set<string>();
-    const uniqueCitationsInBlock: Array<{
-      docId: string;
-      chunkId: string;
-      docName: string;
-      finalStart: number;
-      finalEnd: number;
-      snippet: string;
-    }> = [];
-
-    for (const match of matches) {
-      const rawFilename = match[1].trim();
-      const startPage = parseInt(match[2], 10);
-      const endPage = match[3] ? parseInt(match[3], 10) : startPage;
-
-      // Find matching structured citation to preserve UUIDs and chunk IDs
-      const matched =
-        structuredCitations.find((c) => {
-          const nameMatches =
-            c.document_name.toLowerCase().includes(rawFilename.toLowerCase()) ||
-            rawFilename.toLowerCase().includes(c.document_name.toLowerCase());
-          return nameMatches && c.page_start === startPage;
-        }) ||
-        structuredCitations.find((c) => {
-          return (
-            c.document_name.toLowerCase().includes(rawFilename.toLowerCase()) ||
-            rawFilename.toLowerCase().includes(c.document_name.toLowerCase())
-          );
-        });
-
-      const docId = matched?.document_id || "";
-      const chunkId = matched?.chunk_id || "";
-      const docName = matched?.document_name || rawFilename;
-      const finalStart = matched?.page_start || startPage;
-      const finalEnd = matched?.page_end || endPage;
-
-      const citationKey = getCitationKey({
-        document_id: docId || docName,
-        document_name: docName,
-        page_start: finalStart,
-        page_end: finalEnd,
-      });
-
-      inlineCitationKeys.add(citationKey);
-
-      if (!seenKeysInBlock.has(citationKey)) {
-        seenKeysInBlock.add(citationKey);
-        uniqueCitationsInBlock.push({
-          docId,
-          chunkId,
-          docName,
-          finalStart,
-          finalEnd,
-          snippet: matched?.snippet || "",
-        });
+    let replacement: string;
+    if (match[4]) {
+      const markers: string[] = [];
+      for (const source of Array.from(match[4].matchAll(/\d+/g))) {
+        const citation = structuredCitations[Number(source[0]) - 1];
+        if (citation?.document_id && citation.chunk_id &&
+            validPages(citation.page_start, citation.page_end)) {
+          const link = makeLink(citation);
+          if (link) markers.push(link);
+        }
       }
+      // Unresolved source indices cannot identify a real document/page.
+      replacement = markers.join(" ");
+    } else {
+      const name = match[1].trim();
+      const pageStart = Number(match[2]);
+      const pageEnd = Number(match[3] || match[2]);
+      if (!validPages(pageStart, pageEnd)) continue;
+      const candidates = structuredCitations.filter(c =>
+        normalizeName(c.document_name) === normalizeName(name) &&
+        c.document_id && c.chunk_id && validPages(c.page_start, c.page_end) &&
+        c.page_start <= pageStart && c.page_end >= pageEnd
+      );
+      // A filename alone cannot disambiguate two different documents.
+      if (structuredCitations.length &&
+          (!candidates.length || new Set(candidates.map(c => c.document_id)).size > 1)) continue;
+      const matched = candidates.find(c => c.page_start === pageStart && c.page_end === pageEnd)
+        || candidates[0];
+      replacement = makeLink({
+        document_id: matched?.document_id,
+        document_name: matched?.document_name || name,
+        page_start: pageStart,
+        page_end: pageEnd,
+        chunk_id: matched?.chunk_id,
+        snippet: matched?.snippet,
+      }, matched ? getCitationKey(matched) : undefined);
     }
+    processedText += between + replacement;
+    cursor = end;
+  }
 
-    // Strip inline citation markers from inside sentences
-    let cleanedText = block.replace(DOC_PAGE_REGEX, "");
-    cleanedText = cleanedText.replace(/[ \t]{2,}/g, " ");
-    cleanedText = cleanedText.replace(/\s+([.,!?;:])/g, "$1");
-
-    // Format compact citation links: [📄 p.9] or [📄 pp.9–10]
-    const citationLinks = uniqueCitationsInBlock.map((c) => {
-      const pageBadge =
-        c.finalStart === c.finalEnd
-          ? `p.${c.finalStart}`
-          : `pp.${c.finalStart}–${c.finalEnd}`;
-      const badgeText = `📄 ${pageBadge}`;
-
-      const params = new URLSearchParams();
-      if (c.docId) params.set("docId", c.docId);
-      params.set("name", c.docName);
-      params.set("pageStart", String(c.finalStart));
-      params.set("pageEnd", String(c.finalEnd));
-      if (c.chunkId) params.set("chunkId", c.chunkId);
-      if (c.snippet) params.set("snippet", c.snippet);
-
-      return `[${badgeText}](citation://open?${params.toString()})`;
-    });
-
-    const trimmed = cleanedText.trimEnd();
-    if (isTable) {
-      return citationLinks.length > 0
-        ? `${trimmed}\n\n${citationLinks.join(" ")}`
-        : trimmed;
-    }
-
-    return trimmed ? `${trimmed} ${citationLinks.join(" ")}` : citationLinks.join(" ");
-  };
-
-  // Split into paragraphs / claim blocks preserving markdown block separators
-  const paragraphs = processed.split(/(\n\s*\n)/);
-  const transformed = paragraphs.map((block) => {
-    // Preserve blank line delimiters
-    if (/^\n\s*\n$/.test(block)) return block;
-
-    // Check if block contains list items (process list items line-by-line)
-    const lines = block.split("\n");
-    const isList = lines.some((l) => /^\s*[-*+]\s+|^\s*\d+\.\s+/.test(l));
-    if (isList) {
-      return lines
-        .map((line) => {
-          if (/^\s*[-*+]\s+|^\s*\d+\.\s+/.test(line)) {
-            return processBlock(line);
-          }
-          return line;
-        })
-        .join("\n");
-    }
-
-    return processBlock(block);
-  });
-
-  return {
-    processedText: transformed.join(""),
-    inlineCitationKeys,
-  };
+  return { processedText: processedText + rawText.slice(cursor), inlineCitationKeys };
 }

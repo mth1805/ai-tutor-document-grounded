@@ -37,7 +37,7 @@ def test_answer_record_schema_and_json_array_parsing(tmp_path):
               "retrieved_evidence": [], "gold_evidence_ids": ["fixture:machine_learning"],
               "final_generated_answer": "A", "document_citations": [], "citation_metadata": {},
               "evidence_gate": {}, "ttft_ms": 1.0, "generation_latency_ms": 2.0,
-              "total_answer_latency_ms": 3.0, "model_configuration": {"model": "gemini-3.8-flash"}}
+              "total_answer_latency_ms": 3.0, "model_configuration": {"model": "gemini-3.5-flash-lite"}}
     assert validate_answer_record(record) is record
     path = tmp_path / "answers.json"
     path.write_text(json.dumps([record], ensure_ascii=False, indent=2), encoding="utf-8")
@@ -454,7 +454,7 @@ async def test_answer_relevancy_ascore_uses_async_gemini_compatible_embeddings(m
 @pytest.mark.asyncio
 async def test_capture_uses_retrieval_and_emits_answer_record_schema(monkeypatch):
     class MockLLM:
-        model_name = "gemini-3.8-flash"
+        model_name = "gemini-3.5-flash-lite"
         thinking_level = "medium"
         max_output_tokens = 2048
 
@@ -479,7 +479,7 @@ async def test_capture_retries_sequentially_and_writes_one_final_record_per_eval
     import asyncio
 
     class RetryOnceLLM:
-        model_name = "gemini-3.8-flash"
+        model_name = "gemini-3.5-flash-lite"
         thinking_level = "medium"
         max_output_tokens = 2048
 

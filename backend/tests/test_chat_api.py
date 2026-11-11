@@ -297,6 +297,49 @@ def test_chat_streaming_sse():
     assert done_json["citations"][0]["document_name"] == "Genetics.pdf"
 
 
+def test_document_stream_hides_split_internal_heading_and_matches_done_content():
+    ws_id, conv_id = create_user_workspace_and_conversation(HEADERS_A)
+    ws_uuid = uuid.UUID(ws_id)
+    user_uuid = uuid.UUID(USER_A_ID)
+    doc_id = uuid.uuid4()
+    _IN_MEMORY_DOCUMENTS[doc_id] = Document(
+        id=doc_id, workspace_id=ws_uuid, user_id=user_uuid,
+        original_filename="Genetics.pdf", storage_path=f"{ws_id}/{doc_id}/Genetics.pdf",
+        mime_type="application/pdf", file_size=128, status="processed",
+        embedding_status="completed", created_at=datetime.now(timezone.utc),
+    )
+    content = "DNA is a double helix composed of adenine and thymine."
+    vector = MockEmbeddingProvider().encode_batch([content])[0]
+    _IN_MEMORY_CHUNKS[doc_id] = [DocumentChunk(
+        id=uuid.uuid4(), document_id=doc_id, workspace_id=ws_uuid, user_id=user_uuid,
+        chunk_index=0, content=content, page_number_start=2, page_number_end=2,
+        token_count=10, embedding=vector, created_at=datetime.now(timezone.utc),
+    )]
+    set_llm_provider(MockLLMProvider(tokens=[
+        "PEDAGOGICAL ", "MODE: DETAILED ", "GUIDANCE\n", "Leaked instruction. [Source 1]",
+    ]))
+
+    response = client.post(
+        f"/api/v1/conversations/{conv_id}/chat", headers=HEADERS_A,
+        json={"content": "DNA double helix adenine thymine", "chat_mode": "Full Solution"},
+    )
+    assert response.status_code == 200
+    events = []
+    for block in response.text.strip().split("\n\n"):
+        event_name = next((line[7:] for line in block.splitlines() if line.startswith("event: ")), None)
+        data_line = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if event_name and data_line:
+            events.append((event_name, json.loads(data_line)))
+    tokens = [data["token"] for name, data in events if name == "token"]
+    done = next(data for name, data in events if name == "done")
+
+    assert len(tokens) >= 2
+    assert "PEDAGOGICAL MODE" not in "".join(tokens)
+    assert "".join(tokens) == done["content"]
+    assert done["content"] == "I couldn't produce a safe response to that request. Please try again."
+    assert done["citations"] == []
+
+
 def test_chat_llm_provider_error_handling():
     """Verify provider error during streaming yields event: error gracefully."""
     ws_id, conv_id = create_user_workspace_and_conversation(HEADERS_A)
@@ -348,4 +391,5 @@ def test_chat_llm_provider_error_handling():
     assert res.status_code == 200
     body = res.text
     assert "event: error" in body
-    assert "Upstream service unavailable" in body
+    assert "Response generation failed. Please try again." in body
+    assert "Upstream service unavailable" not in body

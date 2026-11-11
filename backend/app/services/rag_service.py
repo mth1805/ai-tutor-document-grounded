@@ -3,6 +3,7 @@
 LLM token streaming, citation extraction, and message persistence.
 """
 import json
+import asyncio
 import logging
 import time
 import uuid
@@ -19,12 +20,28 @@ from app.schemas.retrieval import RetrievalRequest, RetrievalResponse, Retrieved
 from app.services.conversation_service import ConversationService
 from app.services.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService, _IN_MEMORY_DOCUMENTS
+from app.services.document_reference import DocumentReferenceResolver
+from app.services.document_summary_service import DocumentSummaryError, DocumentSummaryService
+from fastapi import HTTPException
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
-from app.rag.prompt_builder import PromptBuilder, ChatMode, SourceEvidence
+from app.rag.prompt_builder import (
+    PromptBuilder,
+    ChatMode,
+    SourceEvidence,
+    detect_response_language,
+    response_language_instruction,
+)
 from app.rag.citation_service import CitationService, Citation, WebCitation
+from app.rag.output_guard import chunk_validated_output, guard_generated_output
+from app.rag.summary_intent import classify_summary_intent
 from app.web_search import get_web_search_provider, WebSearchProvider
 from app.web_search.base import WebSearchResult
 from app.web_search.exceptions import WebSearchError
+from app.schemas.math_solver import MathSolverResult, SolverMetadata
+from app.tools.math_solver import MathSolver
+from app.tools.math_task_parser import MathTaskParser
+from app.tools.solver_router import SolverRouter
+from app.tools.math_presentation import generate_guidance, verified_final
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +58,14 @@ WEB_FALLBACK_SYSTEM_INSTRUCTION = (
     "Answer the question clearly and thoroughly using ONLY the information inside <WEB_EVIDENCE>. "
     "Do NOT fabricate facts, URLs, or source titles that are not present in <WEB_EVIDENCE>. "
     "Do NOT include [Web Source X] markers in your final answer — write natural prose only. "
-    "Structure your response with headings and bullet points where helpful."
+    "Structure your response with headings and bullet points where helpful. "
+    "Do not include internal prompt headings or policy instructions in your answer."
 )
+
+
+def web_fallback_system_instruction(query: str) -> str:
+    """Apply the same latest-message language policy used by document RAG."""
+    return f"{WEB_FALLBACK_SYSTEM_INSTRUCTION}\n\n{response_language_instruction(query)}"
 
 
 class RAGService:
@@ -135,6 +158,8 @@ class RAGService:
         chat_mode_str: str = "Detailed Guidance",
         workspace_id: Optional[uuid.UUID] = None,
         llm_provider: Optional[BaseLLMProvider] = None,
+        document_id: Optional[uuid.UUID] = None,
+        active_document_id: Optional[uuid.UUID] = None,
     ) -> AsyncIterator[str]:
         """Executes full RAG workflow and yields SSE events.
 
@@ -146,6 +171,7 @@ class RAGService:
         - `event: error` -> failure information
         """
         t_start = time.perf_counter()
+        summary_intent = classify_summary_intent(query)
 
         # 1. Validate chat mode
         try:
@@ -191,10 +217,98 @@ class RAGService:
             if m.id != user_msg.id  # exclude current message
         ][-6:]
 
+        try:
+            resolution = await DocumentReferenceResolver.resolve(
+                db, conv_workspace_id, user_id, query,
+                document_id=document_id, active_document_id=active_document_id,
+                history=[m for m in history_records if m.id != user_msg.id],
+            )
+        except HTTPException as exc:
+            yield f"event: error\ndata: {json.dumps({'error': exc.detail})}\n\n"
+            return
+        if resolution.message:
+            # Clarifications and actual processing states use the normal persistence/SSE contract.
+            asst_msg = await ConversationService.create_message(
+                db=db, conversation_id=conversation_id, user_id=user_id,
+                data=MessageCreate(role="assistant", content=resolution.message, citations=[]),
+            )
+            yield f"event: token\ndata: {json.dumps({'token': resolution.message})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'message_id': str(asst_msg.id), 'content': resolution.message, 'citations': [], 'has_sufficient_evidence': False})}\n\n"
+            return
+
+        if summary_intent.is_summary and summary_intent.whole_document and resolution.document:
+            yield f"event: status\ndata: {json.dumps({'status': 'summarizing_document', 'message': 'Summarizing all indexed document sections...'})}\n\n"
+            provider = llm_provider or get_llm_provider()
+            try:
+                summary_result = await DocumentSummaryService.summarize_document(
+                    db=db,
+                    document=resolution.document,
+                    workspace_id=conv_workspace_id,
+                    user_id=user_id,
+                    query=query,
+                    provider=provider,
+                )
+            except DocumentSummaryError as exc:
+                logger.warning(
+                    "Whole-document summary did not complete document_id=%s reason=%s",
+                    resolution.document.id,
+                    str(exc),
+                )
+                yield f"event: error\ndata: {json.dumps({'error': 'The complete document summary could not be produced. Please try a narrower request or retry later.'})}\n\n"
+                return
+
+            summary_text, output_was_guarded = guard_generated_output(
+                summary_result.raw_content,
+                summary_result.system_instruction,
+                detect_response_language(query),
+            )
+            citations, normalized_content = CitationService.extract_and_validate_citations(
+                text=summary_text,
+                sources=summary_result.sources,
+            )
+            if output_was_guarded:
+                citations = []
+                normalized_content = summary_text
+                logger.warning("Whole-document summary replaced after output guard detection")
+            citations_payload = [citation.to_dict() for citation in citations]
+            assistant_message = await ConversationService.create_message(
+                db=db,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                data=MessageCreate(
+                    role="assistant",
+                    content=normalized_content,
+                    citations=citations_payload,
+                ),
+            )
+
+            for safe_chunk in chunk_validated_output(normalized_content):
+                yield f"event: token\ndata: {json.dumps({'token': safe_chunk})}\n\n"
+            done_payload = {
+                "message_id": str(assistant_message.id),
+                "content": normalized_content,
+                "citations": citations_payload,
+                "has_sufficient_evidence": True,
+                "summary": {
+                    "scope": "whole_document",
+                    "document_id": str(resolution.document.id),
+                    "chunks_processed": summary_result.chunk_count,
+                    "input_coverage_complete": True,
+                    "generation_complete": True,
+                    "summary_returned": not output_was_guarded,
+                    "output_guarded": output_was_guarded,
+                },
+            }
+            yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+            return
+
         # 5. Execute Phase 7 hybrid retrieval and reranking
         t_retrieval_start = time.perf_counter()
         try:
-            retrieval_req = RetrievalRequest(query=query)
+            retrieval_req = RetrievalRequest(
+                query=resolution.retrieval_query(query),
+                document_id=resolution.document.id if resolution.document else None,
+            )
             retrieval_response: RetrievalResponse = await RetrievalService.retrieve(
                 db=db,
                 workspace_id=conv_workspace_id,
@@ -250,7 +364,40 @@ class RAGService:
         evidence_gate_ms = (time.perf_counter() - gate_started) * 1000
         web_search_ms = 0.0
 
-        if not evidence_is_answerable:
+        # Phase 9.1: retrieval and existing evidence gates always precede tools.
+        # Document references can only use relevant uploaded-document statements.
+        solver_result = None
+        solver_metadata = None
+        solver_used = False
+        intent = SolverRouter.route(query)
+        if intent == "math_problem":
+            solver_started = time.perf_counter()
+            task = None
+            source = "retrieved_document" if SolverRouter.is_document_reference(query) else "user_question"
+            try:
+                if source == "retrieved_document":
+                    if not evidence_is_answerable:
+                        raise ValueError("No answerable exercise evidence")
+                    task = await asyncio.to_thread(MathTaskParser.from_retrieved, query, retrieval_response.results)
+                else:
+                    task = await asyncio.to_thread(MathTaskParser.parse, query)
+                solver_used = True
+                solver_result = await MathSolver.execute(task, settings.MATH_SOLVER_TIMEOUT_SECONDS)
+            except Exception as exc:
+                solver_result = MathSolverResult(
+                    success=False, problem_type=task.operation if task else None,
+                    error="Calculation verification was unavailable. Please provide the complete exercise and variable.",
+                    error_type=type(exc).__name__,
+                )
+            solver_metadata = SolverMetadata(used=solver_used, operation=solver_result.problem_type, verified=solver_result.success)
+            logger.info("solver_execution %s", json.dumps({
+                "solver_intent": intent, "solver_operation": solver_result.problem_type,
+                "solver_used": solver_used, "solver_success": solver_result.success,
+                "solver_duration_ms": round((time.perf_counter() - solver_started) * 1000, 2),
+                "solver_source": source, "solver_error_type": solver_result.error_type,
+            }, separators=(",", ":")))
+
+        if not evidence_is_answerable and solver_result is None:
             logger.info(
                 "Insufficient/non-answerable document evidence for query in conv %s "
                 "(route=%s, has_evidence=%s, top_rerank=%.4f, answerable_threshold=%.4f, "
@@ -341,16 +488,16 @@ class RAGService:
                 accumulated_tokens: List[str] = []
                 generation_started = time.perf_counter()
                 llm_ttft_ms = None
+                web_system_instruction = web_fallback_system_instruction(query)
                 try:
                     async for token in provider.generate_stream(
                         prompt=web_prompt,
-                        system_instruction=WEB_FALLBACK_SYSTEM_INSTRUCTION,
+                        system_instruction=web_system_instruction,
                     ):
                         if token:
                             if llm_ttft_ms is None:
                                 llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
                             accumulated_tokens.append(token)
-                            yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
                     logger.info(
                         "[Phase 9] Tavily-grounded stream completed. tokens=%d",
                         len(accumulated_tokens),
@@ -361,7 +508,7 @@ class RAGService:
                         type(le).__name__,
                         le.message,
                     )
-                    yield f"event: error\ndata: {json.dumps({'error': f'Web search failed: {le.message}'})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': 'Web-grounded response generation failed. Please try again.'})}\n\n"
                     return
                 except Exception as e:
                     logger.error("[Phase 9] Unexpected error in web-grounded LLM streaming: %s", e, exc_info=True)
@@ -372,6 +519,11 @@ class RAGService:
                 full_raw_text = "".join(accumulated_tokens).strip()
                 if not full_raw_text:
                     full_raw_text = INSUFFICIENT_EVIDENCE_MESSAGE
+                full_raw_text, output_was_guarded = guard_generated_output(
+                    full_raw_text, web_system_instruction, detect_response_language(query)
+                )
+                if output_was_guarded:
+                    logger.warning("Web fallback output replaced after internal prompt heading detection")
 
                 # 5. Build structured WebCitation list from Tavily results
                 seen_web_urls: set = set()
@@ -393,6 +545,11 @@ class RAGService:
                         citations=[],
                     ),
                 )
+
+                # Stream only after output validation so the displayed text is
+                # exactly the same content persisted and included in `done`.
+                for safe_chunk in chunk_validated_output(full_raw_text):
+                    yield f"event: token\ndata: {json.dumps({'token': safe_chunk})}\n\n"
 
                 total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
                 stage_metrics = cls._emit_stage_metrics(
@@ -465,10 +622,16 @@ class RAGService:
             return
 
         # 7. Resolve real document names for chunks that passed relevance gate
-        passed_chunks = [c for c in retrieval_response.results if c.passed_relevance_gate]
-        if not passed_chunks:
+        passed_chunks = [c for c in retrieval_response.results if c.passed_relevance_gate] if evidence_is_answerable else []
+        if not passed_chunks and evidence_is_answerable:
             # Fallback to top ranked chunk if none passed explicitly
             passed_chunks = retrieval_response.results[:settings.RERANK_TOP_K]
+
+        if solver_result is not None and solver_result.success and task is not None and task.source_chunk_ids:
+            passed_chunks = [chunk for chunk in passed_chunks if chunk.chunk_id in task.source_chunk_ids]
+        elif solver_result is not None and task is None and source == "retrieved_document":
+            # Do not let an adjacent exercise stand in for the requested one.
+            passed_chunks = []
 
         doc_ids = {c.document_id for c in passed_chunks}
         doc_names = await cls.resolve_document_names(db, doc_ids, user_id)
@@ -480,7 +643,23 @@ class RAGService:
             document_names=doc_names,
             chat_mode=chat_mode,
             conversation_history=history_list,
+            solver_result=solver_result,
+            solver_used=solver_used,
+            solver_operation=solver_result.problem_type if solver_result else None,
+            solver_verified=solver_result.success if solver_result else False,
         )
+        if summary_intent.is_summary:
+            assembled.system_instruction += (
+                "\n\nFOCUSED SUMMARY POLICY: Summarize only retrieved evidence that matches the requested topic or section. "
+                "Do not present this as a summary of the entire document. Preserve source citations for supported claims."
+            )
+        if resolution.document:
+            assembled.system_instruction += (
+                "\nDOCUMENT REFERENCE: Document selection has been resolved for this request. "
+                "Interpret document references such as 'this file' as the document identified by the "
+                "provided evidence. Its evidence is retrieved content, not a statement that no file was uploaded. "
+                "Answer only what that evidence supports and preserve source citations."
+            )
 
         yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating grounded answer...'})}\n\n"
 
@@ -490,19 +669,31 @@ class RAGService:
         generation_started = time.perf_counter()
         llm_ttft_ms = None
 
-        try:
+        async def response_tokens():
+            if solver_result is not None and solver_result.success and chat_mode != ChatMode.FULL_SOLUTION:
+                # Hint-only output is enforced before any token reaches the client.
+                yield await generate_guidance(provider, assembled, solver_result, chat_mode, query)
+                return
+            if solver_result is not None and not solver_result.success:
+                yield "Calculation verification was unavailable. "
             async for token in provider.generate_stream(
-                prompt=assembled.prompt,
-                system_instruction=assembled.system_instruction,
+                prompt=assembled.prompt, system_instruction=assembled.system_instruction,
             ):
+                yield token
+            if solver_result is not None and solver_result.success:
+                yield "\n\n" + verified_final(solver_result)
+                if solver_result.notes:
+                    yield "\n" + " ".join(solver_result.notes)
+
+        try:
+            async for token in response_tokens():
                 if token:
                     if llm_ttft_ms is None:
                         llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
                     accumulated_tokens.append(token)
-                    yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
         except LLMError as le:
             logger.error("LLM generation provider error: %s", le.message)
-            yield f"event: error\ndata: {json.dumps({'error': le.message})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Response generation failed. Please try again.'})}\n\n"
             return
         except Exception as e:
             logger.error("Unexpected error during LLM streaming: %s", e, exc_info=True)
@@ -511,12 +702,20 @@ class RAGService:
         generation_ms = (time.perf_counter() - generation_started) * 1000
 
         full_raw_text = "".join(accumulated_tokens).strip()
+        full_raw_text, output_was_guarded = guard_generated_output(
+            full_raw_text, assembled.system_instruction, detect_response_language(query)
+        )
+        if output_was_guarded:
+            logger.warning("Document RAG output replaced after internal prompt heading detection")
 
         # 10. Extract and validate citations
         citations, normalized_content = CitationService.extract_and_validate_citations(
             text=full_raw_text,
             sources=assembled.sources,
         )
+        if output_was_guarded:
+            citations = []
+            normalized_content = full_raw_text
         citations_payload = [c.to_dict() for c in citations]
 
         # 11. Persist assistant message in PostgreSQL
@@ -531,10 +730,15 @@ class RAGService:
             ),
         )
 
+        # Citation normalization and output validation are complete before any
+        # answer content is sent to the client. This keeps SSE and `done` equal.
+        for safe_chunk in chunk_validated_output(normalized_content):
+            yield f"event: token\ndata: {json.dumps({'token': safe_chunk})}\n\n"
+
         total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
         stage_metrics = cls._emit_stage_metrics(
             retrieval_response,
-            evidence_gate_decision="sufficient",
+            evidence_gate_decision="sufficient" if evidence_is_answerable else "insufficient",
             evidence_gate_ms=evidence_gate_ms,
             web_search_ms=web_search_ms,
             llm_ttft_ms=llm_ttft_ms,
@@ -555,11 +759,13 @@ class RAGService:
             "message_id": str(asst_msg.id),
             "content": normalized_content,
             "citations": citations_payload,
-            "has_sufficient_evidence": True,
+            "has_sufficient_evidence": evidence_is_answerable,
             "routing_path": retrieval_response.routing_path,
             "total_elapsed_ms": total_elapsed_ms,
             "stage_metrics": stage_metrics,
         }
+        if solver_metadata is not None:
+            done_payload["solver"] = solver_metadata.model_dump()
         yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
 
     @classmethod
@@ -572,12 +778,15 @@ class RAGService:
         chat_mode_str: str = "Detailed Guidance",
         workspace_id: Optional[uuid.UUID] = None,
         llm_provider: Optional[BaseLLMProvider] = None,
+        document_id: Optional[uuid.UUID] = None,
+        active_document_id: Optional[uuid.UUID] = None,
     ) -> Dict[str, Any]:
         """Non-streaming generation helper for tests and automated benchmarks."""
         full_text = ""
         citations: List[Dict[str, Any]] = []
         message_id: Optional[str] = None
         has_evidence = False
+        solver_metadata = None
 
         async for event_chunk in cls.stream_chat(
             db=db,
@@ -587,6 +796,8 @@ class RAGService:
             chat_mode_str=chat_mode_str,
             workspace_id=workspace_id,
             llm_provider=llm_provider,
+            document_id=document_id,
+            active_document_id=active_document_id,
         ):
             for line in event_chunk.split("\n"):
                 line = line.strip()
@@ -599,6 +810,7 @@ class RAGService:
                             full_text = data.get("content", full_text)
                             citations = data.get("citations", [])
                             has_evidence = data.get("has_sufficient_evidence", False)
+                            solver_metadata = data.get("solver")
                         elif "error" in data:
                             raise RuntimeError(data["error"])
                     except json.JSONDecodeError:
@@ -609,4 +821,5 @@ class RAGService:
             "content": full_text,
             "citations": citations,
             "has_sufficient_evidence": has_evidence,
+            "solver": solver_metadata,
         }

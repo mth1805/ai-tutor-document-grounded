@@ -12,8 +12,10 @@ async def run() -> dict:
     from app.core.config import settings
 
     model = settings.GEMINI_MODEL
-    if model != "gemini-3.8-flash":
-        raise RuntimeError(f"Smoke test requires configured gemini-3.8-flash; configured model is {model!r}.")
+    if model != "gemini-3.5-flash-lite":
+        raise RuntimeError(
+            f"Smoke test requires configured gemini-3.5-flash-lite; configured model is {model!r}."
+        )
     try:
         from app.llm.gemini_provider import GeminiProvider
         provider = GeminiProvider()
