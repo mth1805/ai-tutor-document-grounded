@@ -65,7 +65,10 @@ async def embed_attempt(request: EmbedAttempt) -> bool:
         async def current_attempt():
             current = await load_claimed_job(request.job_id)
             return bool(current and int(current["claimed_attempt"]) == request.attempt)
-        return await EmbeddingService.embed_document(session, document_id, user_id, lease_guard=current_attempt)
+        return await EmbeddingService.embed_document(
+            session, document_id, user_id, lease_guard=current_attempt,
+            ingestion_job_id=request.job_id, ingestion_attempt=request.attempt,
+        )
 
 
 @router.post("/internal/local-models/embed", response_model=EmbedResult)

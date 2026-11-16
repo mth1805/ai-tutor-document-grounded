@@ -1,13 +1,16 @@
 """Bounded whole-document summarization over every indexed chunk."""
 import logging
+import json
 import uuid
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Mapping, Sequence
 
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.observability import request_id_context
 from app.llm import BaseLLMProvider
 from app.models.chunk import DocumentChunk
 from app.models.document import Document
@@ -87,7 +90,11 @@ class DocumentSummaryService:
 
         if len(chunk_groups) == 1:
             prompt = cls._document_prompt(query, document, chunk_groups[0], 1, source_by_chunk, final=True)
-            raw_content = await cls._generate(provider, prompt, system_instruction, settings.LLM_MAX_OUTPUT_TOKENS)
+            raw_content = await cls._generate(
+                provider, prompt, system_instruction, settings.LLM_MAX_OUTPUT_TOKENS,
+                document_id=document.id, mode="direct", stage_name="direct",
+                group_index=1, group_count=1,
+            )
             return DocumentSummaryResult(
                 raw_content=raw_content, sources=sources, system_instruction=system_instruction,
                 chunk_count=len(chunks),
@@ -98,7 +105,11 @@ class DocumentSummaryService:
         segments: list[_SummarySegment] = []
         for group_index, group in enumerate(chunk_groups, start=1):
             prompt = cls._document_prompt(query, document, group, group_index, source_by_chunk, final=False)
-            result = await cls._generate(provider, prompt, system_instruction, map_output_tokens)
+            result = await cls._generate(
+                provider, prompt, system_instruction, map_output_tokens,
+                document_id=document.id, mode="map", stage_name="map",
+                group_index=group_index, group_count=len(chunk_groups),
+            )
             source_indices = tuple(source_index_by_chunk[chunk.id] for chunk in group)
             segments.append(_SummarySegment(
                 content=result,
@@ -108,10 +119,12 @@ class DocumentSummaryService:
 
         # Hierarchically reduce map results until all notes fit with reserved
         # space for policy, document metadata, and final output instructions.
+        reduction_level = 0
         while await run_in_threadpool(
             cls._prompt_token_count,
             cls._reduce_prompt(query, document, segments, final=True), system_instruction,
         ) > input_budget:
+            reduction_level += 1
             segment_groups = await run_in_threadpool(
                 cls._pack_segments, segments, query, document, system_instruction, input_budget,
             )
@@ -120,7 +133,12 @@ class DocumentSummaryService:
             reduced: list[_SummarySegment] = []
             for group_index, group in enumerate(segment_groups, start=1):
                 prompt = cls._reduce_prompt(query, document, group, final=False)
-                result = await cls._generate(provider, prompt, system_instruction, map_output_tokens)
+                result = await cls._generate(
+                    provider, prompt, system_instruction, map_output_tokens,
+                    document_id=document.id, mode="reduce", stage_name="reduce_intermediate",
+                    group_index=group_index, group_count=len(segment_groups),
+                    reduction_level=reduction_level,
+                )
                 source_indices = tuple(sorted({i for segment in group for i in segment.source_indices}))
                 reduced.append(_SummarySegment(
                     content=result,
@@ -133,7 +151,9 @@ class DocumentSummaryService:
         if await run_in_threadpool(cls._prompt_token_count, final_prompt, system_instruction) > input_budget:
             raise DocumentSummaryError("Summary notes exceed the configured model input budget.")
         raw_content = await cls._generate(
-            provider, final_prompt, system_instruction, settings.LLM_MAX_OUTPUT_TOKENS
+            provider, final_prompt, system_instruction, settings.LLM_MAX_OUTPUT_TOKENS,
+            document_id=document.id, mode="reduce", stage_name="reduce_final",
+            group_index=1, group_count=len(segments), reduction_level=reduction_level,
         )
         reduce_calls += 1
         return DocumentSummaryResult(
@@ -317,21 +337,66 @@ class DocumentSummaryService:
     @staticmethod
     async def _generate(
         provider: BaseLLMProvider, prompt: str, system_instruction: str, max_output_tokens: int,
+        *, document_id: uuid.UUID, mode: str, stage_name: str,
+        group_index: int, group_count: int, reduction_level: int | None = None,
     ) -> str:
+        started = perf_counter()
+        request_id = request_id_context.get()
+        model_name = getattr(provider, "model_name", type(provider).__name__)
+        estimated_input_tokens = await run_in_threadpool(
+            DocumentSummaryService._prompt_token_count, prompt, system_instruction,
+        )
+        diagnostic = {
+            "request_id": request_id,
+            "document_id": str(document_id),
+            "operation": "whole_document_summary",
+            "mode": mode,
+            "stage": stage_name,
+            "group_index": group_index,
+            "group_count": group_count,
+            "reduction_level": reduction_level,
+            "model": model_name,
+            "estimated_input_tokens": estimated_input_tokens,
+            "max_output_tokens": max_output_tokens,
+        }
+        response_received = False
         try:
             response = await provider.generate_with_metadata(
                 prompt=prompt,
                 system_instruction=system_instruction,
                 max_output_tokens=max_output_tokens,
             )
+            response_received = True
         except Exception as exc:
-            logger.error("Document summary generation failed category=%s", type(exc).__name__)
+            details = getattr(exc, "details", None)
+            retryable = details.get("retryable") if isinstance(details, dict) else None
+            logger.error(
+                "document_summary_generation_failed %s",
+                json.dumps({**diagnostic, "response_received": False,
+                            "duration_ms": round((perf_counter() - started) * 1000, 2),
+                            "exception_category": type(exc).__name__, "retryable": retryable}),
+            )
             raise DocumentSummaryError("Document summary generation failed; no partial summary was returned.") from exc
+        elapsed_ms = round((perf_counter() - started) * 1000, 2)
+        response_metadata = {
+            **diagnostic,
+            "candidate_count": response.candidate_count,
+            "finish_reason": response.finish_reason,
+            "completed": response.completed,
+            "actual_input_tokens": response.input_tokens,
+            "actual_output_tokens": response.output_tokens,
+            "actual_total_tokens": response.total_tokens,
+            "duration_ms": elapsed_ms,
+            "response_received": response_received,
+        }
         if not response.completed:
+            logger.warning("document_summary_generation_incomplete %s", json.dumps(response_metadata))
             raise DocumentSummaryError(
                 "Document summary generation was incomplete; no partial summary was returned."
             )
         text = (response.text or "").strip()
         if not text:
+            logger.warning("document_summary_generation_empty %s", json.dumps(response_metadata))
             raise DocumentSummaryError("Document summary generation returned no content; no partial summary was returned.")
+        logger.info("document_summary_generation_completed %s", json.dumps(response_metadata))
         return text

@@ -20,7 +20,7 @@ import {
   Search,
 } from "lucide-react";
 import { apiClient, DocumentItem } from "@/lib/api";
-import { isDocumentProcessing } from "@/lib/document-status";
+import { DocumentListRequestTracker, isDocumentProcessing } from "@/lib/document-status";
 import { downloadOriginalDocument } from "@/lib/document-download";
 import { useAuth } from "@/lib/auth-context";
 import { RetrievalInspectorModal } from "@/components/RetrievalInspectorModal";
@@ -56,6 +56,10 @@ export function DocumentManager({
   const [isInspectorOpen, setIsInspectorOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const documentFetchRequests = useRef(new DocumentListRequestTracker());
+  const backgroundFetchInFlight = useRef(false);
+  const activeWorkspaceId = useRef(workspaceId);
+  activeWorkspaceId.current = workspaceId;
 
   // Helper: Format file size
   const formatFileSize = (bytes: number): string => {
@@ -91,20 +95,30 @@ export function DocumentManager({
   // Fetch documents for the workspace
   const fetchDocuments = useCallback(async (background = false) => {
     if (!token || !workspaceId) return;
+    if (background && backgroundFetchInFlight.current) return;
 
+    if (background) backgroundFetchInFlight.current = true;
+    const requestId = documentFetchRequests.current.begin();
     if (!background) setIsLoading(true);
-    setError(null);
+    if (!background) setError(null);
     try {
       const data = await apiClient.listDocuments(workspaceId, token);
+      if (workspaceId !== activeWorkspaceId.current) return;
+      if (!documentFetchRequests.current.isCurrent(requestId)) return;
       setDocuments(data);
       if (onDocumentCountChange) {
         onDocumentCountChange(data.length);
       }
     } catch (err: unknown) {
+      if (workspaceId !== activeWorkspaceId.current || !documentFetchRequests.current.isCurrent(requestId)) return;
       const msg = err instanceof Error ? err.message : "Failed to load documents";
-      setError(msg);
+      // A transient polling failure does not change the last confirmed document
+      // state or imply that an active ingestion job failed.
+      if (!background) setError(msg);
     } finally {
-      if (!background) setIsLoading(false);
+      if (background) backgroundFetchInFlight.current = false;
+      if (!background && workspaceId === activeWorkspaceId.current &&
+          documentFetchRequests.current.isCurrent(requestId)) setIsLoading(false);
     }
   }, [token, workspaceId, onDocumentCountChange]);
 
@@ -113,8 +127,8 @@ export function DocumentManager({
   }, [fetchDocuments]);
 
   // Auto-poll document list if any document is currently processing, queued, or embedding
+  const hasActiveProcessing = documents.some(isDocumentProcessing);
   useEffect(() => {
-    const hasActiveProcessing = documents.some(isDocumentProcessing);
     if (!hasActiveProcessing || !token || !workspaceId) return;
 
     const interval = setInterval(() => {
@@ -122,7 +136,7 @@ export function DocumentManager({
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [documents, token, workspaceId, fetchDocuments]);
+  }, [hasActiveProcessing, token, workspaceId, fetchDocuments]);
 
   // Handle file selection and upload
   const handleFileUpload = async (files: FileList | null) => {
@@ -162,6 +176,7 @@ export function DocumentManager({
 
     try {
       const uploaded = await apiClient.uploadDocument(workspaceId, file, token);
+      documentFetchRequests.current.invalidate();
       setDocuments((prev) => [uploaded, ...prev]);
       if (onDocumentCountChange) {
         onDocumentCountChange(documents.length + 1);
@@ -190,6 +205,7 @@ export function DocumentManager({
     setError(null);
     try {
       await apiClient.deleteDocument(docId, token);
+      documentFetchRequests.current.invalidate();
       setDocuments((prev) => prev.filter((d) => d.id !== docId));
       if (onDocumentCountChange) {
         onDocumentCountChange(Math.max(0, documents.length - 1));
@@ -224,6 +240,11 @@ export function DocumentManager({
     setError(null);
     try {
       await apiClient.reprocessDocument(docId, token);
+      documentFetchRequests.current.invalidate();
+      setDocuments((prev) => prev.map((doc) => doc.id === docId
+        ? { ...doc, status: "queued", embedding_status: "pending", embedded_at: null,
+            embedding_error: null, processing_error: null, processed_at: null }
+        : doc));
       setSuccessMessage("Document ingestion started.");
       setTimeout(() => setSuccessMessage(null), 3000);
       await fetchDocuments();
@@ -244,6 +265,10 @@ export function DocumentManager({
     setError(null);
     try {
       await apiClient.embedDocument(docId, token);
+      documentFetchRequests.current.invalidate();
+      setDocuments((prev) => prev.map((doc) => doc.id === docId
+        ? { ...doc, embedding_status: "processing", embedding_error: null }
+        : doc));
       setSuccessMessage("Embedding generation scheduled.");
       setTimeout(() => setSuccessMessage(null), 3000);
       await fetchDocuments();

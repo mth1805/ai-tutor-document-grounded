@@ -11,6 +11,10 @@ class GenerationResult:
     text: str
     completed: bool = True
     finish_reason: str | None = None
+    candidate_count: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class BaseLLMProvider(ABC):

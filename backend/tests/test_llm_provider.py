@@ -74,6 +74,9 @@ async def test_gemini_provider_preserves_candidate_completion_metadata(
         return SimpleNamespace(
             text="generated response",
             candidates=[SimpleNamespace(finish_reason=finish_reason)],
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=120, candidates_token_count=45, total_token_count=165,
+            ),
         )
 
     monkeypatch.setattr(provider, "_generate_response", fake_generate_response)
@@ -81,7 +84,31 @@ async def test_gemini_provider_preserves_candidate_completion_metadata(
 
     assert result.text == "generated response"
     assert result.completed is expected_complete
-    assert result.finish_reason == (finish_reason.name if finish_reason is not None else None)
+    assert result.finish_reason == (finish_reason.name if finish_reason is not None else "MISSING_FINISH_REASON")
+    assert result.candidate_count == 1
+    assert (result.input_tokens, result.output_tokens, result.total_tokens) == (120, 45, 165)
+
+
+@pytest.mark.asyncio
+async def test_gemini_provider_reports_missing_candidate_and_missing_finish_reason(monkeypatch):
+    provider = GeminiProvider(api_key="test-dummy-key")
+    responses = iter([
+        SimpleNamespace(text="", candidates=[], usage_metadata=None),
+        SimpleNamespace(text="", candidates=[SimpleNamespace(finish_reason=None)], usage_metadata=None),
+    ])
+
+    async def fake_generate_response(*args, **kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(provider, "_generate_response", fake_generate_response)
+    missing_candidate = await provider.generate_with_metadata("private prompt")
+    missing_finish_reason = await provider.generate_with_metadata("private prompt")
+
+    assert missing_candidate.finish_reason == "MISSING_CANDIDATE"
+    assert missing_candidate.candidate_count == 0
+    assert not missing_candidate.completed
+    assert missing_finish_reason.finish_reason == "MISSING_FINISH_REASON"
+    assert not missing_finish_reason.completed
 
 
 @pytest.mark.asyncio

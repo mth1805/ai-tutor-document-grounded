@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
 
+from app.core.observability import request_id_context
+
 logger = logging.getLogger(__name__)
 context = ContextVar("ingestion_telemetry", default=None)
 
@@ -14,7 +16,8 @@ def event(stage: str, **fields):
     if state is not None and "error_code" in fields:
         state["metrics"].update({key: fields[key] for key in ("error_code", "error_category") if key in fields})
     identifiers = {key: state[key] for key in ("job_id", "document_id", "attempt")} if state else {}
-    logger.info(json.dumps({"event": "ingestion_stage", **identifiers, "stage": stage, **fields}))
+    logger.info(json.dumps({"event": "ingestion_stage", "request_id": request_id_context.get(),
+                            **identifiers, "stage": stage, **fields}))
 
 
 def metric(**fields):

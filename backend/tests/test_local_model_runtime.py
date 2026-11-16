@@ -83,8 +83,8 @@ async def test_worker_local_handoff_failure_does_not_complete_job(monkeypatch):
     monkeypatch.setattr(ingestion_queue, "request_local_embedding", AsyncMock(return_value=False))
     finish = AsyncMock()
     monkeypatch.setattr(ingestion_queue, "finish_job", finish)
-    assert await ingestion_queue.process_claimed_job(job_id) is False
-    finish.assert_awaited_once_with(job_id, succeeded=False)
+    assert await ingestion_queue.process_claimed_job(job_id, 1) is False
+    finish.assert_awaited_once_with(job_id, 1, succeeded=False)
 
 
 @pytest.mark.asyncio

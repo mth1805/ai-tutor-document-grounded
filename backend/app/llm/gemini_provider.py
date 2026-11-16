@@ -218,14 +218,30 @@ class GeminiProvider(BaseLLMProvider):
         candidates = getattr(response, "candidates", None) or []
         finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
         if finish_reason is None:
-            reason_name = None
+            reason_name = "MISSING_CANDIDATE" if not candidates else "MISSING_FINISH_REASON"
         else:
             reason_name = getattr(finish_reason, "name", None) or str(finish_reason).rsplit(".", 1)[-1]
             reason_name = str(reason_name).upper()
+        usage = getattr(response, "usage_metadata", None)
+        try:
+            text = response.text or ""
+        except Exception as exc:
+            # Some blocked/empty candidate responses raise when the SDK's
+            # convenience text property is accessed. Keep the finish reason
+            # and usage metadata available to the summary diagnostics.
+            logger.warning(
+                "Gemini response text unavailable exception=%s finish_reason=%s candidate_count=%d",
+                type(exc).__name__, reason_name, len(candidates),
+            )
+            text = ""
         return GenerationResult(
-            text=response.text or "",
+            text=text,
             completed=reason_name == "STOP",
             finish_reason=reason_name,
+            candidate_count=len(candidates),
+            input_tokens=getattr(usage, "prompt_token_count", None),
+            output_tokens=getattr(usage, "candidates_token_count", None),
+            total_tokens=getattr(usage, "total_token_count", None),
         )
 
     async def _generate_response(

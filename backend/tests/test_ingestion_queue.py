@@ -8,6 +8,7 @@ from app.models.ingestion_job import DocumentIngestionJob
 from app.models.document import Document
 from app.services.ingestion_service import IngestionService
 from app.workers import ingestion_queue
+from app.services.ingestion.fencing import set_ingestion_attempt_context
 
 
 class FakeSession:
@@ -32,6 +33,19 @@ class FakeSession:
 
     async def flush(self):
         return None
+
+
+@pytest.mark.asyncio
+async def test_database_writes_receive_transaction_local_attempt_token():
+    from unittest.mock import AsyncMock
+
+    job_id = uuid.uuid4()
+    db = SimpleNamespace(execute=AsyncMock())
+    await set_ingestion_attempt_context(db, job_id, 4)
+    statement, parameters = db.execute.await_args.args
+    assert "set_config('app.ingestion_job_id'" in str(statement)
+    assert "set_config('app.ingestion_attempt'" in str(statement)
+    assert parameters == {"job_id": str(job_id), "attempt": "4"}
 
 
 @pytest.mark.asyncio
@@ -107,11 +121,26 @@ async def test_worker_claims_and_finalizes_through_service_rpc(monkeypatch):
     monkeypatch.setattr(ingestion_queue.settings, "SUPABASE_SERVICE_ROLE_KEY", "test-only-key")
     monkeypatch.setattr(ingestion_queue.httpx, "AsyncClient", Client)
 
-    await ingestion_queue.finish_job(uuid.UUID(int=1), succeeded=True)
+    await ingestion_queue.finish_job(uuid.UUID(int=1), 3, succeeded=True)
 
     assert calls[0][0] == "https://unit.test/rest/v1/rpc/complete_document_ingestion_job"
     assert calls[0][1]["Authorization"] == "Bearer test-only-key"
-    assert calls[0][2] == {"p_job_id": str(uuid.UUID(int=1))}
+    assert calls[0][2] == {"p_job_id": str(uuid.UUID(int=1)), "p_attempt_count": 3}
+
+
+@pytest.mark.asyncio
+async def test_claim_lease_exceeds_modal_worker_timeout_without_exceeding_rpc_limit(monkeypatch):
+    calls = []
+
+    async def rpc(function, payload):
+        calls.append((function, payload))
+        return []
+
+    monkeypatch.setattr(ingestion_queue, "_rpc", rpc)
+    await ingestion_queue.claim_jobs(limit=1)
+    assert calls[0][0] == "claim_document_ingestion_jobs"
+    assert calls[0][1]["p_lease_seconds"] == ingestion_queue.INGESTION_JOB_LEASE_SECONDS
+    assert 1800 < calls[0][1]["p_lease_seconds"] <= 3600
 
 
 def test_queue_migration_keeps_rls_and_bounded_retry_contract():
@@ -133,6 +162,10 @@ async def test_enqueue_locks_owned_document_without_queue_update_privileges():
     session = FakeSession()
     document = SimpleNamespace(id=uuid.uuid4(), workspace_id=uuid.uuid4())
     await IngestionService.enqueue_document(session, document, uuid.uuid4())
+    assert document.status == "queued"
+    assert document.embedding_status == "pending"
+    assert document.embedded_at is None
+    assert document.embedding_error is None
     assert "FOR UPDATE" in str(session.statements[0])
     assert "documents.user_id" in str(session.statements[0])
     assert "documents.workspace_id" in str(session.statements[0])
@@ -155,17 +188,21 @@ async def test_worker_claimed_attempt_runs_pipeline_and_finalizes(monkeypatch, s
 
     async def process(doc, user, **options):
         assert (doc, user) == (document_id, user_id)
-        assert options == {"defer_failure_to_queue": True}
+        assert options == {
+            "defer_failure_to_queue": True,
+            "ingestion_job_id": job_id,
+            "ingestion_attempt": 1,
+        }
         return success
 
-    async def finish(job, *, succeeded):
-        calls.append((job, succeeded))
+    async def finish(job, attempt, *, succeeded):
+        calls.append((job, attempt, succeeded))
 
     monkeypatch.setattr(ingestion_queue, "load_claimed_job", load)
     monkeypatch.setattr(IngestionService, "process_document_background", process)
     monkeypatch.setattr(ingestion_queue, "finish_job", finish)
-    assert await ingestion_queue.process_claimed_job(job_id) is success
-    assert calls == [(job_id, success)]
+    assert await ingestion_queue.process_claimed_job(job_id, 1) is success
+    assert calls == [(job_id, 1, success)]
 
 
 @pytest.mark.asyncio
@@ -178,14 +215,33 @@ async def test_worker_pipeline_exception_is_failed_and_logs_are_sanitized(monkey
     async def process(*args, **kwargs):
         raise RuntimeError("PRIVATE_DOCUMENT_OR_CREDENTIAL")
 
-    async def finish(_job, *, succeeded):
+    async def finish(_job, _attempt, *, succeeded):
         assert succeeded is False
 
     monkeypatch.setattr(ingestion_queue, "load_claimed_job", load)
     monkeypatch.setattr(IngestionService, "process_document_background", process)
     monkeypatch.setattr(ingestion_queue, "finish_job", finish)
-    assert await ingestion_queue.process_claimed_job(job_id) is False
+    assert await ingestion_queue.process_claimed_job(job_id, 2) is False
     assert "PRIVATE_DOCUMENT_OR_CREDENTIAL" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_delayed_worker_cannot_adopt_a_newer_claim_attempt(monkeypatch):
+    job_id = uuid.uuid4()
+    process = pytest.fail
+    finish = pytest.fail
+
+    async def load(_job):
+        return {
+            "claimed_document_id": str(uuid.uuid4()),
+            "claimed_user_id": str(uuid.uuid4()),
+            "claimed_attempt": 2,
+        }
+
+    monkeypatch.setattr(ingestion_queue, "load_claimed_job", load)
+    monkeypatch.setattr(IngestionService, "process_document_background", process)
+    monkeypatch.setattr(ingestion_queue, "finish_job", finish)
+    assert await ingestion_queue.process_claimed_job(job_id, 1) is False
 
 
 @pytest.mark.asyncio
@@ -197,9 +253,9 @@ async def test_worker_poll_recovers_from_rpc_failure_and_claims_only_one(monkeyp
         attempts.append(limit)
         if len(attempts) == 1:
             raise ConnectionError("private error")
-        return [{"job_id": str(uuid.UUID(int=1))}]
+        return [{"job_id": str(uuid.UUID(int=1)), "claimed_attempt": 1}]
 
-    async def process(_job):
+    async def process(_job, _attempt):
         stop.set()
         return True
 
@@ -239,9 +295,30 @@ async def test_failed_attempt_uses_retry_rpc_without_unbounded_error_detail(monk
         return "queued"
 
     monkeypatch.setattr(ingestion_queue, "_rpc", rpc)
-    await ingestion_queue.finish_job(uuid.UUID(int=1), succeeded=False)
+    await ingestion_queue.finish_job(uuid.UUID(int=1), 2, succeeded=False)
     assert calls == [("fail_document_ingestion_job", {
-        "p_job_id": str(uuid.UUID(int=1)), "p_error": "INGESTION_ATTEMPT_FAILED",
+        "p_job_id": str(uuid.UUID(int=1)), "p_attempt_count": 2,
+        "p_error": "INGESTION_ATTEMPT_FAILED",
+    })]
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_renews_the_same_attempt(monkeypatch):
+    calls = []
+    stop = asyncio.Event()
+
+    async def rpc(function, payload):
+        calls.append((function, payload))
+        stop.set()
+        return True
+
+    monkeypatch.setattr(ingestion_queue, "_rpc", rpc)
+    job_id = uuid.UUID(int=8)
+    await ingestion_queue._heartbeat_job_lease(job_id, 4, stop)
+    assert calls == [("renew_document_ingestion_job_lease", {
+        "p_job_id": str(job_id),
+        "p_attempt_count": 4,
+        "p_lease_seconds": 120,
     })]
 
 
@@ -271,3 +348,16 @@ def test_new_queue_grants_do_not_weaken_policies_or_service_only_rpc_access():
     assert "CREATE POLICY" not in sql
     assert "DISABLE ROW LEVEL SECURITY" not in sql
     assert "GRANT EXECUTE" not in sql
+
+
+def test_attempt_fencing_migration_checks_lease_at_database_write_boundary():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    sql = (root / "supabase/migrations/20261111090000_fence_document_ingestion_attempts.sql").read_text()
+    assert "lease_expires_at > clock_timestamp()" in sql
+    assert "attempt_count = p_attempt_count" in sql
+    assert "FOR UPDATE" in sql
+    assert "assert_document_ingestion_attempt" in sql
+    assert "BEFORE INSERT OR UPDATE OR DELETE ON public.document_chunks" in sql
+    assert "renew_document_ingestion_job_lease" in sql
