@@ -54,11 +54,89 @@ Set `TAVILY_API_KEY`; `TAVILY_MAX_RESULTS` is bounded by the application's sourc
 2. Create a Modal Secret named `ai-tutor-production` containing the production backend variables above and a random server-only `MODAL_INFERENCE_TOKEN`. Or set `MODAL_SECRET_NAME` to a secret you created.
 3. From the repository root, set `MODAL_INFERENCE_GPU=T4` (or another supported Modal GPU) in the deployment shell, then run `modal deploy backend/deploy/modal_app.py`. Copy the `gpu_inference` endpoint URL from deployment output into `MODAL_INFERENCE_URL` in the backend Modal Secret, then redeploy the callers with the same command. The first deployment without the URL safely uses CPU fallback.
 4. Modal uses `backend/requirements.lock.txt` for the CPU API, poller, and durable ingestion worker. The dedicated inference endpoint uses `backend/requirements-gpu.lock.txt`. Both are exact Python 3.11/Linux x86_64 locks. Their source inputs are `requirements-cpu.in` (PyTorch CPU index and `torch==2.14.1+cpu`) and `requirements-gpu.in` (`torch==2.14.1` from PyPI); both keep the same Sentence Transformers, BGE-M3, and CrossEncoder dependencies. The API lock excludes CUDA/NVIDIA runtime packages, while the GPU endpoint lock retains them. The CPU image includes Tesseract with English/Vietnamese language data and LibreOffice Writer for scanned-PDF/image OCR and legacy `.doc` uploads; the smaller inference image does not include those ingestion tools. The root Dockerfile installs the CPU lock. Validate clean Linux image builds before rollout.
-5. Drain the old ingestion worker fleet, then apply the durable ingestion migration followed by `20261111090000_fence_document_ingestion_attempts.sql` using the normal reviewed Supabase migration workflow before deploying this application version. Do not apply ad-hoc production DDL. The fencing migration changes the queue RPC signatures; deploy the worker and migration in lockstep so workers pass the claimed attempt token. The worker queue requires `SUPABASE_URL` and backend-only `SUPABASE_SERVICE_ROLE_KEY`; only the narrowly scoped queue RPCs use that key. Document content processing continues through the authenticated per-user database session.
+5. Use the controlled drain sequence below before applying `20261111090000_fence_document_ingestion_attempts.sql`. Verify whether the durable queue migration is already applied; apply it first only if it is missing. Use the normal reviewed Supabase migration workflow, never ad-hoc production DDL. The fencing migration changes the queue RPC signatures; deploy the worker and migration in lockstep so workers pass the claimed attempt token. The worker queue requires `SUPABASE_URL` and backend-only `SUPABASE_SERVICE_ROLE_KEY`; only the narrowly scoped queue RPCs use that key. Document content processing continues through the authenticated per-user database session.
 6. The wrapper uses a persistent Modal Volume named `ai-tutor-model-cache` (override with `MODAL_MODEL_CACHE_VOLUME`) mounted at `/models`. After deploying the wrapper but before routing traffic, run `modal run backend/deploy/modal_app.py::prepare_model_cache`; it downloads both model checkpoints and commits the cache. Runtime API, ingestion, and inference containers mount that volume read-only and run Hugging Face in offline mode. Repeat cache preparation before deploying changes to either model checkpoint. Model-file cache compatibility must be validated in a staged deployment.
 7. API and worker CPU/memory are configurable with `MODAL_API_CPU`, `MODAL_API_MEMORY_MB`, `MODAL_INGESTION_CPU`, and `MODAL_INGESTION_MEMORY_MB`. `MODAL_MAX_CONCURRENT_INPUTS` bounds ASGI concurrency per container. The API, poller, and durable ingestion job runner remain CPU-only. Only `gpu_inference` owns CUDA; it performs embedding/reranking inference and never accesses the ingestion queue or database. The scheduled poller runs every 15 seconds and claims up to 10 due jobs with a 1,860-second initial lease. Once running, workers renew their matching attempt to a 120-second lease every 30 seconds, then retry failures up to three attempts with backoff. Modal's 30-minute worker execution limit excludes scheduling; if scheduling consumes the initial lease, the stale token prevents that delayed invocation from processing a newer claim. Expired leases are reclaimed by the database RPC; attempt fencing rejects writes after expiry or reclaim.
 
 `modal deploy` provisions public API and scheduled worker functions, and may incur charges. Do not run it until you intend to create those resources. The repository does not deploy automatically.
+
+### Temporary Production worker drain
+
+Modal deploys an App as a unit: changing the poller also updates the other
+functions in that App. Build the drain source from the exact currently deployed
+Production revision, not from a branch that contains the new worker signature.
+For the current v12 baseline, archive commit
+`d394871aa298c0e905d19dd4c74100299dc314eb`, then remove only
+`schedule=modal.Period(seconds=15),` from the `poll_ingestion_queue` decorator.
+Keep the v12 `fastapi_app`, `gpu_inference`, and `process_ingestion_job` source
+unchanged. Review the source diff and confirm it contains only that one removed
+line before deploying.
+
+1. In the Modal dashboard/CLI, confirm the App is `ai-tutor-api`, identify the
+   currently deployed version and full source commit, and positively identify
+   the Production Modal environment. Never infer the environment from a local
+   profile or from a Secret name.
+2. From the archived drain source root, deploy the same App using the confirmed
+   environment and rolling strategy:
+
+   ```powershell
+   Set-Location <DRAIN_SOURCE_ROOT>
+   modal deploy --env <CONFIRMED_PRODUCTION_ENV> --strategy=rolling backend/deploy/modal_app.py
+   ```
+
+   The drain source keeps v12's API and GPU definitions/configuration. Because
+   Modal updates the whole App, inspect the deployment diff/status and confirm
+   the API and inference endpoints remain healthy. Do not use `recreate` for
+   this drain: rolling lets already-assigned inputs finish, while recreate
+   terminates running inputs and may cause retries.
+3. The removed schedule prevents future poller ticks after the rolling update
+   completes. Wait for the prior poller invocation and every worker invocation
+   it already spawned to become terminal. Check Modal's App/function activity
+   and logs; independently run the read-only queue status queries below. Do not
+   apply the migration while an old worker invocation is still running or while
+   any job remains `processing`. Queued jobs may remain queued during the drain.
+4. Confirm the durable queue schema is present, then apply the reviewed fencing
+   migration through the approved Supabase Production workflow. Verify the
+   migration record, RPC signatures, triggers and helper ACLs before rollout.
+5. From the reviewed final release source, deploy `backend/deploy/modal_app.py`
+   to that same positively confirmed environment with `--strategy=rolling`.
+   Confirm the new worker signature is active, the poller schedule is restored
+   to 15 seconds, and queue processing, lease renewal and terminal outcomes are
+   healthy. Keep the drain archive until the release has been verified.
+
+The release defaults are `MODAL_GPU_FUNCTION_TIMEOUT_SECONDS=90`,
+`GPU_WORKER_TIMEOUT_SECONDS=120`, and
+`GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS=30`. Confirm the Modal deploy-time
+environment and backend runtime Secret agree; changing a Secret alone does not
+change the already-deployed function timeout. A 120-second caller budget equals
+the configured 90-second function timeout plus the 30-second allowance.
+
+The following queries are read-only and should be run against the confirmed
+Production database only by an authorized operator after verifying the project
+identity. They distinguish pending work from active leases and help confirm the
+queue is drained before migration:
+
+```sql
+SELECT status, count(*)
+FROM public.document_ingestion_jobs
+WHERE status IN ('queued', 'processing')
+GROUP BY status
+ORDER BY status;
+
+SELECT id, document_id, status, attempt_count, max_attempts, locked_at,
+       updated_at
+FROM public.document_ingestion_jobs
+WHERE status = 'processing'
+ORDER BY locked_at NULLS FIRST;
+```
+
+Before the fencing migration, `locked_at` is the queue's lease-start timestamp;
+`lease_expires_at` is added by that migration and must not be selected before it
+is applied. These database reads alone do not prove that Modal has no in-flight
+invocation; confirm both Modal invocation activity and zero `processing` rows
+before the migration. Production identity checks, migration application,
+deployments and health checks are manual Production operations; repository tests
+below are local-only.
 
 ## G. Model configuration and queue operation
 

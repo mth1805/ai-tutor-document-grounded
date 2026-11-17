@@ -101,19 +101,33 @@ def test_pdf_and_image_preview_regression(name, content, mime):
 
 
 def test_libreoffice_conversion_isolated_profile_and_cleanup(monkeypatch):
+    import os
     from app.services import document_preview
     roots = []
-    monkeypatch.setattr(document_preview.shutil, "which", lambda _: "soffice")
+    monkeypatch.setattr(settings, "LIBREOFFICE_CMD", "soffice")
+    monkeypatch.setattr(
+        document_preview.shutil,
+        "which",
+        lambda command: "soffice.com" if command == "soffice.com" else "soffice",
+    )
+    calls = []
     def run(command, **kwargs):
         root = Path(command[-1]).parent
         roots.append(root)
+        calls.append(command)
+        if os.name == "nt":
+            assert command[0] == "soffice.com"
         assert command[-1].endswith("source.docx")
         assert any(arg.startswith("-env:UserInstallation=file:") for arg in command)
         assert kwargs["timeout"] == settings.LIBREOFFICE_TIMEOUT_SECONDS
+        if len(calls) == 1 and os.name == "nt":
+            raise PermissionError(13, "Access is denied", None, 5)
         (root / "source.pdf").write_bytes(b"%PDF-1.5 preview")
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(document_preview.subprocess, "run", run)
     assert document_preview.convert_word_to_pdf(word_bytes(), "ĐỀ CƯƠNG.docx").startswith(b"%PDF-")
+    assert len(calls) == (2 if os.name == "nt" else 1)
+    assert len(set(roots)) == 1
     assert not roots[0].exists()
 
 
@@ -162,9 +176,14 @@ async def test_uncertain_commit_never_deletes_a_referenced_object(monkeypatch):
 
 
 def test_real_local_pdf_docx_unicode_smoke(monkeypatch):
+    import os
     import shutil
     import fitz
-    executable = shutil.which("soffice")
+    executable = (
+        shutil.which("soffice.com") or shutil.which("soffice")
+        if os.name == "nt"
+        else shutil.which("soffice")
+    )
     if not executable:
         pytest.skip("Local LibreOffice executable unavailable")
     # Use the discovered local tool without changing the user's environment file.

@@ -69,7 +69,7 @@ END;
 $$;
 
 DROP FUNCTION IF EXISTS public.complete_document_ingestion_job(UUID);
-CREATE FUNCTION public.complete_document_ingestion_job(
+CREATE OR REPLACE FUNCTION public.complete_document_ingestion_job(
     p_job_id UUID,
     p_attempt_count INTEGER
 )
@@ -92,7 +92,7 @@ END;
 $$;
 
 DROP FUNCTION IF EXISTS public.fail_document_ingestion_job(UUID, TEXT);
-CREATE FUNCTION public.fail_document_ingestion_job(
+CREATE OR REPLACE FUNCTION public.fail_document_ingestion_job(
     p_job_id UUID,
     p_attempt_count INTEGER,
     p_error TEXT
