@@ -63,6 +63,8 @@ class MockLLMProvider(BaseLLMProvider):
         # Spy attributes for test inspection
         self.last_prompt: Optional[str] = None
         self.last_system_instruction: Optional[str] = None
+        self.last_generate_kwargs: dict = {}
+        self.last_stream_kwargs: dict = {}
         self.call_count: int = 0
         self.web_grounding_call_count: int = 0
 
@@ -74,6 +76,7 @@ class MockLLMProvider(BaseLLMProvider):
     ) -> str:
         self.last_prompt = prompt
         self.last_system_instruction = system_instruction
+        self.last_generate_kwargs = dict(kwargs)
         self.call_count += 1
 
         if self.simulate_error:
@@ -89,6 +92,7 @@ class MockLLMProvider(BaseLLMProvider):
     ) -> AsyncIterator[str]:
         self.last_prompt = prompt
         self.last_system_instruction = system_instruction
+        self.last_stream_kwargs = dict(kwargs)
         self.call_count += 1
 
         if self.simulate_error:

@@ -97,7 +97,8 @@ def test_direct_math_http_uses_real_process_and_persists(monkeypatch):
     monkeypatch.setattr(settings, "MATH_SOLVER_TIMEOUT_SECONDS", 15.0)
     order = []
     mock_retrieval(monkeypatch, sufficient=False, order=order)
-    set_llm_provider(MockLLMProvider(tokens=["Take the square root, then add two."]))
+    llm = MockLLMProvider(tokens=["Take the square root, then add two."])
+    set_llm_provider(llm)
     workspace, cid = conversation()
     response = client.post(f"/api/v1/conversations/{cid}/chat/sync", headers=headers,
                            json={"content": "Calculate sqrt(16)+2", "chat_mode": "Full Solution", "workspace_id": workspace})
@@ -106,6 +107,7 @@ def test_direct_math_http_uses_real_process_and_persists(monkeypatch):
     assert order == ["retrieve"]
     assert data["solver"] == {"used": True, "type": "math", "operation": "calculate", "verified": True}
     assert "Verified result: 6" in data["content"]
+    assert llm.last_stream_kwargs["max_output_tokens"] == settings.CHAT_MAX_OUTPUT_TOKENS
     assert data["citations"] == [] and not data["has_sufficient_evidence"]
     history = client.get(f"/api/v1/conversations/{cid}/messages", headers=headers).json()
     assert len(history) == 2 and history[-1]["content"] == data["content"]
@@ -129,6 +131,7 @@ def test_hint_modes_cannot_leak_even_with_malicious_llm_output(monkeypatch, mode
     assert len(text.split("\n\n")) == count
     assert done["solver"]["verified"]
     assert llm.call_count == 1
+    assert "max_output_tokens" not in llm.last_generate_kwargs
     assert '"result":["2","3"]' in llm.last_prompt
     assert "INTERNAL ONLY" in llm.last_system_instruction
     if mode == "Detailed Guidance":

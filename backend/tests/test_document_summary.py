@@ -268,6 +268,8 @@ def test_large_document_uses_ordered_map_reduce_with_bounded_tokens_and_complete
     assert done["summary"]["input_coverage_complete"] is True
     assert done["summary"]["generation_complete"] is True
     assert len(provider.prompts) == 4  # three map calls and one final reduction
+    assert provider.output_limits[-1] == settings.LLM_MAX_OUTPUT_TOKENS
+    assert settings.LLM_MAX_OUTPUT_TOKENS == 2048
     assert "[Source 1]" in provider.prompts[-1] and "[Source 3]" in provider.prompts[-1]
 
 

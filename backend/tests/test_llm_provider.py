@@ -1,4 +1,5 @@
 """Unit tests for Phase 8 LLM provider abstractions."""
+import asyncio
 import pytest
 from unittest.mock import MagicMock
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from app.llm import (
     LLMAuthenticationError,
     LLMQuotaError,
     LLMProviderError,
+    LLMTimeoutError,
 )
 
 
@@ -122,6 +124,52 @@ async def test_gemini_generate_keeps_legacy_string_return_contract(monkeypatch):
     assert await provider.generate("normal RAG prompt") == "legacy response"
 
 
+def test_generation_budget_and_timeout_defaults_are_separate():
+    config = Settings(_env_file=None, ENVIRONMENT="test")
+
+    assert config.CHAT_MAX_OUTPUT_TOKENS == 8192
+    assert config.LLM_MAX_OUTPUT_TOKENS == 2048
+    assert config.LLM_STREAMING_TIMEOUT_SECONDS == 90.0
+
+
+@pytest.mark.parametrize("field,value", [
+    ("CHAT_MAX_OUTPUT_TOKENS", 127),
+    ("CHAT_MAX_OUTPUT_TOKENS", 8193),
+    ("LLM_STREAMING_TIMEOUT_SECONDS", 0),
+    ("LLM_STREAMING_TIMEOUT_SECONDS", -1),
+])
+def test_invalid_chat_budget_and_streaming_timeout_are_rejected(field, value):
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ENVIRONMENT="test", **{field: value})
+
+
+@pytest.mark.asyncio
+async def test_gemini_provider_applies_configured_timeout(monkeypatch):
+    provider = GeminiProvider(api_key="test-dummy-key")
+    monkeypatch.setattr(settings, "LLM_STREAMING_TIMEOUT_SECONDS", 0.01)
+
+    class SlowModels:
+        async def generate_content(self, **kwargs):
+            await asyncio.sleep(0.1)
+
+    provider._client = SimpleNamespace(aio=SimpleNamespace(models=SlowModels()))
+
+    with pytest.raises(LLMTimeoutError):
+        await provider._generate_response("prompt")
+
+    class SlowStreamModels:
+        async def generate_content_stream(self, **kwargs):
+            async def chunks():
+                await asyncio.sleep(0.1)
+                yield SimpleNamespace(text="late chunk")
+            return chunks()
+
+    provider._client = SimpleNamespace(aio=SimpleNamespace(models=SlowStreamModels()))
+    with pytest.raises(LLMTimeoutError):
+        async for _ in provider.generate_stream("prompt"):
+            pass
+
+
 def test_gemini_provider_missing_api_key(monkeypatch):
     monkeypatch.setattr(settings, "GEMINI_API_KEY", None)
     with pytest.raises(LLMConfigurationError) as exc_info:
@@ -159,9 +207,14 @@ def test_gemini_provider_uses_gemini_3_thinking_config(monkeypatch):
     provider = GeminiProvider(api_key="test-dummy-key")
 
     standard_config = provider._build_config(system_instruction="Be helpful")
+    chat_config = provider._build_config(
+        system_instruction="Be helpful",
+        max_output_tokens=settings.CHAT_MAX_OUTPUT_TOKENS,
+    )
 
     assert provider.model_name == "gemini-3.5-flash-lite"
     assert standard_config.max_output_tokens == 2048
+    assert chat_config.max_output_tokens == 8192
     assert standard_config.thinking_config.thinking_level == types.ThinkingLevel.MEDIUM
     assert standard_config.system_instruction == "Be helpful"
     assert "temperature" not in standard_config.model_fields_set

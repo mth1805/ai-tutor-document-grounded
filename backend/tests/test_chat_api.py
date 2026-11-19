@@ -146,8 +146,9 @@ def test_chat_insufficient_evidence_deterministic_fallback(monkeypatch):
     assert "couldn't find enough information" in messages[1]["content"]
 
 
-def test_chat_sync_grounded_answer_and_citations():
-    """Verify complete sync generation with document chunks, citations, and message persistence."""
+@pytest.mark.parametrize("chat_mode", ["Light Guidance", "Detailed Guidance", "Full Solution"])
+def test_chat_sync_grounded_answer_and_citations(chat_mode):
+    """All user-facing chat modes retain grounded citations and use the chat budget."""
     ws_id, conv_id = create_user_workspace_and_conversation(HEADERS_A)
     ws_uuid = uuid.UUID(ws_id)
     u_uuid = uuid.UUID(USER_A_ID)
@@ -198,7 +199,7 @@ def test_chat_sync_grounded_answer_and_citations():
         headers=HEADERS_A,
         json={
             "content": "Photosynthesis occurs in chloroplasts sunlight glucose",
-            "chat_mode": "Detailed Guidance",
+            "chat_mode": chat_mode,
         },
     )
     assert res.status_code == 200
@@ -214,9 +215,10 @@ def test_chat_sync_grounded_answer_and_citations():
     assert citation["page_start"] == 7
     assert citation["page_end"] == 8
 
-    # Verify LLM was called with Detailed Guidance
+    # Verify the selected chat mode and its output budget reached the provider.
     assert mock_llm.call_count == 1
-    assert "DETAILED GUIDANCE" in mock_llm.last_system_instruction
+    assert chat_mode.upper() in mock_llm.last_system_instruction
+    assert mock_llm.last_stream_kwargs["max_output_tokens"] == settings.CHAT_MAX_OUTPUT_TOKENS
 
     # Verify messages persisted in DB
     msg_res = client.get(f"/api/v1/conversations/{conv_id}/messages", headers=HEADERS_A)

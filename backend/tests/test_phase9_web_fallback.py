@@ -209,6 +209,7 @@ def test_insufficient_evidence_triggers_tavily_web_fallback(monkeypatch):
     assert data["has_sufficient_evidence"] is False
     assert mock_web.call_count == 1         # Tavily WAS called exactly once
     assert mock_llm.call_count == 1         # generate_stream (doc-free, Tavily-grounded)
+    assert mock_llm.last_stream_kwargs["max_output_tokens"] == settings.CHAT_MAX_OUTPUT_TOKENS
 
 
 def test_web_stream_hides_split_internal_heading_and_matches_done_content(monkeypatch):

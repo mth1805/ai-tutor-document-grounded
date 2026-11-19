@@ -112,8 +112,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
     GEMINI_THINKING_LEVEL: str = "medium"
+    # User-facing chat answers use a separate larger budget; internal/non-chat
+    # generation (including document summaries) continues to use LLM_MAX_OUTPUT_TOKENS.
+    CHAT_MAX_OUTPUT_TOKENS: int = Field(default=8192, ge=128, le=8192)
     LLM_MAX_OUTPUT_TOKENS: int = 2048
-    LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
+    LLM_STREAMING_TIMEOUT_SECONDS: float = Field(default=90.0, gt=0)
     DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET: int = Field(default=12000, ge=1000, le=100000)
     DOCUMENT_SUMMARY_MAP_OUTPUT_TOKENS: int = Field(default=512, ge=128, le=2048)
 

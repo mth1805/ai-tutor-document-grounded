@@ -493,6 +493,7 @@ class RAGService:
                     async for token in provider.generate_stream(
                         prompt=web_prompt,
                         system_instruction=web_system_instruction,
+                        max_output_tokens=settings.CHAT_MAX_OUTPUT_TOKENS,
                     ):
                         if token:
                             if llm_ttft_ms is None:
@@ -678,6 +679,7 @@ class RAGService:
                 yield "Calculation verification was unavailable. "
             async for token in provider.generate_stream(
                 prompt=assembled.prompt, system_instruction=assembled.system_instruction,
+                max_output_tokens=settings.CHAT_MAX_OUTPUT_TOKENS,
             ):
                 yield token
             if solver_result is not None and solver_result.success:

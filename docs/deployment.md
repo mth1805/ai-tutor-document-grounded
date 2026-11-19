@@ -30,7 +30,7 @@ Configure these as Modal Secret values (never in source control):
 | `GEMINI_API_KEY`, `GEMINI_MODEL` | Gemini generation. |
 | `TAVILY_API_KEY`, `TAVILY_MAX_RESULTS`, `WEB_SEARCH_TIMEOUT_SECONDS` | Bounded Tavily fallback. |
 | `BACKEND_CORS_ORIGINS` | JSON array of exact Vercel origins, e.g. `["https://app.example.com"]`; no wildcard. |
-| `LLM_PROVIDER`, `LLM_MAX_OUTPUT_TOKENS`, `LLM_STREAMING_TIMEOUT_SECONDS` | Existing LLM selection and generation limits. |
+| `LLM_PROVIDER`, `CHAT_MAX_OUTPUT_TOKENS`, `LLM_MAX_OUTPUT_TOKENS`, `LLM_STREAMING_TIMEOUT_SECONDS` | Provider selection, separate chat/non-chat output budgets, and provider-call timeout. |
 | `LOG_LEVEL`, `PREWARM_MODELS` | Logging and optional startup model warmup. |
 | `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS` | Per-container SQLAlchemy pool budget; coordinate with Modal container concurrency and the Supabase connection limit. |
 
@@ -42,7 +42,7 @@ Apply the committed migrations through the normal Supabase migration workflow be
 
 ## D. Gemini configuration
 
-The authoritative project default is `GEMINI_MODEL=gemini-3.5-flash-lite`; set that value and the API key in the backend secret store. Provider calls are asynchronous; the configured streaming timeout is `LLM_STREAMING_TIMEOUT_SECONDS`. Check current provider quotas and model availability in your account before launch.
+The authoritative project default is `GEMINI_MODEL=gemini-3.5-flash-lite`; set that value and the API key in the backend secret store. `CHAT_MAX_OUTPUT_TOKENS` (default 8192) applies to user-facing chat answers; `LLM_MAX_OUTPUT_TOKENS` (default 2048) remains the limit for non-chat generation, including document summaries. `LLM_STREAMING_TIMEOUT_SECONDS` (default 90 seconds) wraps both streaming and non-streaming Gemini provider calls, so the longer timeout also applies to summary and other provider operations. Modal's FastAPI function timeout remains 150 seconds and is an outer request limit. Check current provider quotas and model availability in your account before launch.
 
 ## E. Tavily configuration
 
