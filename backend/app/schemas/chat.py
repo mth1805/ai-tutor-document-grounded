@@ -1,6 +1,6 @@
 """Schemas for Phase 8 Grounded RAG Chat API."""
 import uuid
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field, field_validator
 from app.schemas.math_solver import SolverMetadata
 
@@ -43,3 +43,7 @@ class ChatResponse(BaseModel):
     citations: List[Dict[str, Any]] = Field(default_factory=list)
     has_sufficient_evidence: bool = True
     solver: Optional[SolverMetadata] = None
+    generation_status: Optional[Literal[
+        "completed", "incomplete", "interrupted", "blocked", "failed", "unverified"
+    ]] = None
+    generation_metadata: Optional[Dict[str, Any]] = None

@@ -27,6 +27,8 @@ class Message(Base):
     citations: Mapped[Optional[Any]] = mapped_column(
         JSONB, default=list, nullable=True
     )
+    generation_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    generation_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

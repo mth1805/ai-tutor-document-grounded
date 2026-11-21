@@ -13,10 +13,14 @@ from app.services.ingestion_service import _IN_MEMORY_CHUNKS
 from app.services.document_service import _IN_MEMORY_DOCUMENTS
 from app.services.workspace_service import _IN_MEMORY_WORKSPACES
 from app.services.conversation_service import _IN_MEMORY_CONVERSATIONS, _IN_MEMORY_MESSAGES
+from app.services.conversation_service import ConversationService
+from app.schemas.message import MessageCreate
 from app.ml.loader import set_embedding_provider, set_reranker_provider
 from app.ml.mock_provider import MockEmbeddingProvider
 from app.ml.reranker_mock import MockRerankerProvider
 from app.llm import set_llm_provider, reset_llm_provider, MockLLMProvider, LLMProviderError
+from app.llm.base import GenerationResult
+from app.llm.base import BaseLLMProvider
 
 client = TestClient(app)
 
@@ -66,6 +70,32 @@ def create_user_workspace_and_conversation(user_headers=HEADERS_A):
     assert conv_res.status_code == 201
     conv_id = conv_res.json()["id"]
     return ws_id, conv_id
+
+
+@pytest.mark.asyncio
+async def test_conversation_service_persists_assistant_with_explicit_status():
+    _, conv_id = create_user_workspace_and_conversation()
+
+    message = await ConversationService.create_message(
+        db=None,
+        conversation_id=uuid.UUID(conv_id),
+        user_id=uuid.UUID(USER_A_ID),
+        data=MessageCreate(role="assistant", content="A partial but useful answer"),
+        generation_status="incomplete",
+    )
+
+    assert message is not None
+    assert message.role == "assistant"
+    assert message.generation_status == "incomplete"
+
+    with pytest.raises(ValueError, match="supported generation_status"):
+        await ConversationService.create_message(
+            db=None,
+            conversation_id=uuid.UUID(conv_id),
+            user_id=uuid.UUID(USER_A_ID),
+            data=MessageCreate(role="assistant", content="Unknown outcome"),
+            generation_status="unknown",
+        )
 
 
 def test_unauthenticated_chat_rejected():
@@ -297,6 +327,120 @@ def test_chat_streaming_sse():
     assert "[Doc: Genetics.pdf, p. 1]" in done_json["content"]
     assert len(done_json["citations"]) == 1
     assert done_json["citations"][0]["document_name"] == "Genetics.pdf"
+
+
+@pytest.mark.parametrize(("generation_status", "finish_reason", "expected_event"), [
+    ("completed", "STOP", "done"),
+    ("incomplete", "MAX_TOKENS", "done"),
+    ("blocked", "SAFETY", "done"),
+    ("blocked", "RECITATION", "done"),
+    ("interrupted", None, "done"),
+    ("unverified", None, "done"),
+    ("failed", None, "error"),
+])
+def test_chat_generation_outcome_is_validated_persisted_once_and_returned(
+    generation_status, finish_reason, expected_event,
+):
+    ws_id, conv_id = create_user_workspace_and_conversation(HEADERS_A)
+    ws_uuid, user_uuid = uuid.UUID(ws_id), uuid.UUID(USER_A_ID)
+    doc_id = uuid.uuid4()
+    _IN_MEMORY_DOCUMENTS[doc_id] = Document(
+        id=doc_id, workspace_id=ws_uuid, user_id=user_uuid,
+        original_filename="Integrity.pdf", storage_path=f"{ws_id}/{doc_id}/Integrity.pdf",
+        mime_type="application/pdf", file_size=100, status="processed",
+        embedding_status="completed", created_at=datetime.now(timezone.utc),
+    )
+    evidence = "A documented fact used to validate the generated citation."
+    chunk_id = uuid.uuid4()
+    _IN_MEMORY_CHUNKS[doc_id] = [DocumentChunk(
+        id=chunk_id, document_id=doc_id, workspace_id=ws_uuid, user_id=user_uuid,
+        chunk_index=0, content=evidence, page_number_start=4, page_number_end=4,
+        token_count=10, embedding=MockEmbeddingProvider().encode_batch([evidence])[0],
+        created_at=datetime.now(timezone.utc),
+    )]
+
+    class OutcomeProvider(MockLLMProvider):
+        async def generate_stream_with_metadata(self, prompt, system_instruction=None, **kwargs):
+            self.last_stream_kwargs = dict(kwargs)
+            self.call_count += 1
+            return GenerationResult(
+                text="Partial documented explanation [Source 1].",
+                finish_reason=finish_reason,
+                candidate_count=1,
+                input_tokens=15,
+                output_tokens=7,
+                total_tokens=22,
+                generation_status=generation_status,
+            )
+
+    set_llm_provider(OutcomeProvider())
+    response = client.post(
+        f"/api/v1/conversations/{conv_id}/chat", headers=HEADERS_A,
+        json={"content": "Explain the documented fact"},
+    )
+    assert response.status_code == 200
+    events = []
+    for block in response.text.strip().split("\n\n"):
+        name = next((line[7:] for line in block.splitlines() if line.startswith("event: ")), None)
+        data = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if name and data:
+            events.append((name, json.loads(data)))
+    terminal_name, terminal = next((name, data) for name, data in reversed(events)
+                                   if name in {"done", "error"})
+    assert terminal_name == expected_event
+    assert terminal["generation_status"] == generation_status
+    history = client.get(f"/api/v1/conversations/{conv_id}/messages", headers=HEADERS_A).json()
+    assert len(history) == 2
+    assert history[0]["role"] == "user" and history[0]["generation_status"] is None
+    assistant = history[1]
+    assert assistant["generation_status"] == generation_status
+    if finish_reason:
+        assert assistant["generation_metadata"]["finish_reason"] == finish_reason
+    assert assistant["generation_metadata"]["prompt_token_count"] == 15
+    if generation_status == "blocked":
+        assert "Partial documented explanation" not in assistant["content"]
+        assert assistant["citations"] == []
+    else:
+        assert assistant["citations"][0]["chunk_id"] == str(chunk_id)
+        assert "[Doc: Integrity.pdf, p. 4]" in assistant["content"]
+
+
+def test_legacy_stream_exhaustion_is_unverified_and_persisted_not_completed():
+    # Frontend parser regression is exercised in deployment.test.mjs. The API's
+    # terminal-state contract is covered here by ensuring status isn't inferred
+    # from ordinary stream exhaustion by a legacy provider.
+    ws_id, conv_id = create_user_workspace_and_conversation(HEADERS_A)
+    ws_uuid, user_uuid = uuid.UUID(ws_id), uuid.UUID(USER_A_ID)
+    doc_id = uuid.uuid4()
+    _IN_MEMORY_DOCUMENTS[doc_id] = Document(
+        id=doc_id, workspace_id=ws_uuid, user_id=user_uuid,
+        original_filename="Legacy.pdf", storage_path=f"{ws_id}/{doc_id}/Legacy.pdf",
+        mime_type="application/pdf", file_size=100, status="processed",
+        embedding_status="completed", created_at=datetime.now(timezone.utc),
+    )
+    content = "A legacy stream fact for retrieval testing."
+    _IN_MEMORY_CHUNKS[doc_id] = [DocumentChunk(
+        id=uuid.uuid4(), document_id=doc_id, workspace_id=ws_uuid, user_id=user_uuid,
+        chunk_index=0, content=content, page_number_start=1, page_number_end=1,
+        token_count=8, embedding=MockEmbeddingProvider().encode_batch([content])[0],
+        created_at=datetime.now(timezone.utc),
+    )]
+    class LegacyProvider(BaseLLMProvider):
+        async def generate(self, prompt, system_instruction=None, **kwargs):
+            return "legacy output"
+
+        async def generate_stream(self, prompt, system_instruction=None, **kwargs):
+            yield "legacy output"
+
+    set_llm_provider(LegacyProvider())
+    response = client.post(
+        f"/api/v1/conversations/{conv_id}/chat", headers=HEADERS_A,
+        json={"content": "legacy stream fact"},
+    )
+    assert response.status_code == 200
+    assert '"generation_status": "unverified"' in response.text
+    messages = client.get(f"/api/v1/conversations/{conv_id}/messages", headers=HEADERS_A).json()
+    assert messages[-1]["generation_status"] == "unverified"
 
 
 def test_document_stream_hides_split_internal_heading_and_matches_done_content():

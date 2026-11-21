@@ -75,12 +75,14 @@ async def generate_guidance(provider, assembled, result, chat_mode: ChatMode, qu
     count = 1 if chat_mode == ChatMode.LIGHT_GUIDANCE else len(steps)
     indices = list(range(count))
     try:
-        selection = await provider.generate(
+        selection_result = await provider.generate_with_metadata(
             prompt=assembled.prompt + "\n<VETTED_HINTS>\n" + json.dumps(steps) +
                    '\n</VETTED_HINTS>\nReturn only JSON {"hint_indices": [0, ...]}. Select conceptual next steps; never output a final answer.',
             system_instruction=assembled.system_instruction,
         )
-        parsed = json.loads(selection)
+        if not selection_result.completed or selection_result.finish_reason != "STOP":
+            raise ValueError("Hint selection did not finish normally")
+        parsed = json.loads(selection_result.text)
         selected = parsed["hint_indices"]
         if (isinstance(selected, list) and len(selected) == count
                 and all(type(index) is int and 0 <= index < len(steps) for index in selected)

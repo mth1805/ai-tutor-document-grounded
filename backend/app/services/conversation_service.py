@@ -14,6 +14,10 @@ from app.services.workspace_service import WorkspaceService, _IN_MEMORY_WORKSPAC
 _IN_MEMORY_CONVERSATIONS: dict[uuid.UUID, Conversation] = {}
 _IN_MEMORY_MESSAGES: dict[uuid.UUID, Message] = {}
 
+_SUPPORTED_GENERATION_STATUSES = frozenset(
+    {"completed", "incomplete", "interrupted", "blocked", "failed", "unverified"}
+)
+
 
 class ConversationService:
     @staticmethod
@@ -192,8 +196,16 @@ class ConversationService:
         conversation_id: uuid.UUID,
         user_id: uuid.UUID,
         data: MessageCreate,
+        *,
+        generation_status: Optional[str] = None,
+        generation_metadata: Optional[dict] = None,
     ) -> Optional[Message]:
         """Appends a new message to a conversation after verifying ownership."""
+        if data.role == "assistant" and generation_status not in _SUPPORTED_GENERATION_STATUSES:
+            raise ValueError(
+                "Assistant messages require a supported generation_status"
+            )
+
         conversation = await ConversationService.get_conversation(
             db, conversation_id, user_id
         )
@@ -208,6 +220,8 @@ class ConversationService:
             role=data.role,
             content=data.content.strip(),
             citations=citations,
+            generation_status=generation_status if data.role == "assistant" else None,
+            generation_metadata=generation_metadata if data.role == "assistant" else None,
             created_at=now,
         )
 
