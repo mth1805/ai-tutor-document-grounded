@@ -41,6 +41,7 @@ class ChatGenerationRun(Base):
     generation_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("state IN ('queued','dispatching','running','cancel_requested','completed','incomplete','interrupted','blocked','failed','unverified')", name="chat_generation_runs_state_check"),
