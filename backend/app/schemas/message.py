@@ -27,6 +27,12 @@ class MessageCreate(BaseModel):
     )
 
 
+class UserMessageCreate(MessageCreate):
+    """Request schema for the public message endpoint, which accepts user input only."""
+
+    role: Literal["user"] = "user"
+
+
 class MessageResponse(BaseModel):
     id: uuid.UUID
     conversation_id: uuid.UUID
@@ -35,6 +41,10 @@ class MessageResponse(BaseModel):
     citations: Optional[List[Dict[str, Any]]] = Field(
         default_factory=list, description="Structured document citations"
     )
+    generation_status: Optional[Literal[
+        "completed", "incomplete", "interrupted", "blocked", "failed", "unverified"
+    ]] = None
+    generation_metadata: Optional[Dict[str, Any]] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

@@ -1,10 +1,12 @@
 """Private, temporary Word previews. No preview artifacts are stored persistently."""
 import logging
 import io
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 import unicodedata
 from collections import Counter
@@ -91,7 +93,16 @@ def convert_word_to_verified_pdf(content: bytes, filename: str) -> bytes:
 
 
 def convert_word_to_pdf(content: bytes, filename: str) -> bytes:
-    executable = shutil.which(settings.LIBREOFFICE_CMD)
+    configured_command = settings.LIBREOFFICE_CMD
+    # On Windows, ``soffice.com`` is LibreOffice's console launcher. Prefer it
+    # for the bare command so subprocess creation is not dependent on PATHEXT
+    # ordering (which may otherwise select the GUI ``soffice.exe`` launcher).
+    if os.name == "nt" and Path(configured_command).name.lower() == "soffice":
+        executable = shutil.which("soffice.com")
+        if not executable:
+            executable = shutil.which(configured_command)
+    else:
+        executable = shutil.which(configured_command)
     if not executable:
         raise RuntimeError("PREVIEW_CONVERTER_UNAVAILABLE")
     with tempfile.TemporaryDirectory(prefix="ai-tutor-preview-") as directory:
@@ -100,13 +111,31 @@ def convert_word_to_pdf(content: bytes, filename: str) -> bytes:
         source.write_bytes(content)
         # A separate profile prevents concurrent LibreOffice processes attaching
         # to another request's instance. No shell or user-controlled command args.
-        result = subprocess.run(
-            [executable, f"-env:UserInstallation={(root / 'profile').as_uri()}",
-             "--headless", "--convert-to", "pdf:writer_pdf_Export",
-             "--outdir", directory, str(source)],
-            capture_output=True, timeout=settings.LIBREOFFICE_TIMEOUT_SECONDS,
-            check=False,
-        )
+        command = [
+            executable, f"-env:UserInstallation={(root / 'profile').as_uri()}",
+            "--headless", "--convert-to", "pdf:writer_pdf_Export",
+            "--outdir", directory, str(source),
+        ]
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    command, capture_output=True,
+                    timeout=settings.LIBREOFFICE_TIMEOUT_SECONDS, check=False,
+                )
+                break
+            except PermissionError as exc:
+                # WinError 5 with no filename means Windows denied process
+                # creation before LibreOffice touched the temporary files.
+                if (
+                    os.name != "nt" or getattr(exc, "winerror", None) != 5
+                    or getattr(exc, "filename", None) is not None or attempt == 2
+                ):
+                    raise
+                logger.warning(
+                    "LibreOffice process launch denied by Windows; retrying attempt=%s winerror=%s",
+                    attempt + 1, exc.winerror,
+                )
+                time.sleep(0.1 * (attempt + 1))
         output = root / "source.pdf"
         if result.returncode != 0 or not output.is_file():
             raise RuntimeError("PREVIEW_CONVERSION_FAILED")

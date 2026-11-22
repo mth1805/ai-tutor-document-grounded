@@ -42,7 +42,7 @@ hf_cache/
 **/model_cache/
 backend/.models/
 backend/models/
-models/
+/models/
 *.safetensors
 *.pth
 *.pt

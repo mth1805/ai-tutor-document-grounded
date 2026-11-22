@@ -65,7 +65,27 @@ export interface Message {
   content: string;
   citations?: Citation[];
   web_sources?: WebCitation[];
+  generation_status?: GenerationStatus | null;
+  generation_metadata?: GenerationMetadata | null;
   created_at: string;
+}
+
+export type GenerationStatus = "completed" | "incomplete" | "interrupted" | "blocked" | "failed" | "unverified";
+
+export interface GenerationMetadata {
+  finish_reason?: string;
+  candidate_count?: number;
+  prompt_token_count?: number;
+  candidates_token_count?: number;
+  thoughts_token_count?: number;
+  total_token_count?: number;
+  model_version?: string;
+  response_id?: string;
+  generation_duration_ms?: number;
+  time_to_first_token_ms?: number;
+  error_type?: string;
+  error_classification?: string;
+  http_status?: number;
 }
 
 export interface ChatStreamCallbacks {
@@ -79,8 +99,15 @@ export interface ChatStreamCallbacks {
     has_sufficient_evidence: boolean;
     used_web_fallback?: boolean;
     solver?: SolverMetadata;
+    generation_status?: GenerationStatus;
+    generation_metadata?: GenerationMetadata;
   }) => void;
-  onError?: (error: string) => void;
+  onError?: (error: string, terminal?: {
+    message_id?: string;
+    content?: string;
+    generation_status?: GenerationStatus;
+    generation_metadata?: GenerationMetadata;
+  }) => void;
 }
 
 export interface SolverMetadata {
@@ -91,7 +118,7 @@ export interface SolverMetadata {
 }
 
 export interface MessageCreate {
-  role: "user" | "assistant" | "system";
+  role: "user";
   content: string;
   citations?: Citation[];
 }
@@ -661,7 +688,7 @@ export const apiClient = {
       const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
       if (!isLocal && API_BASE_URL.startsWith("http://localhost")) {
         const err = `Production configuration error: Cannot connect to ${API_BASE_URL} from hosted domain (${window.location.origin}). NEXT_PUBLIC_API_BASE_URL must be set to your deployed HTTPS API.`;
-        callbacks.onError?.(err);
+        callbacks.onError?.(err, { generation_status: "failed" });
         throw new ApiError(err);
       }
     }
@@ -689,13 +716,13 @@ export const apiClient = {
       } catch {
         // ignore JSON parse error
       }
-      callbacks.onError?.(errorMsg);
+      callbacks.onError?.(errorMsg, { generation_status: "failed" });
       throw new ApiError(errorMsg, response.status);
     }
 
     const reader = response.body?.getReader();
     if (!reader) {
-      callbacks.onError?.("Streaming not supported by browser environment.");
+      callbacks.onError?.("Streaming not supported by browser environment.", { generation_status: "failed" });
       return;
     }
 
@@ -739,7 +766,10 @@ export const apiClient = {
               callbacks.onDone?.(data);
             } else if (eventName === "error") {
               terminalEventReceived = true;
-              callbacks.onError?.(data.error);
+              callbacks.onError?.(data.error, {
+                ...data,
+                generation_status: data.generation_status || "failed",
+              });
             }
           } catch {
             // Ignore non-json data
@@ -747,7 +777,7 @@ export const apiClient = {
         }
       }
       if (!terminalEventReceived && !signal?.aborted) {
-        throw new ApiError("Stream ended before completion. Please retry.");
+        throw new ApiError("Stream ended before completion. The response may be incomplete.");
       }
     } catch (err: unknown) {
       if (signal?.aborted) {

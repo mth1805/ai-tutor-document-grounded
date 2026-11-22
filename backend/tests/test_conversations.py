@@ -86,7 +86,7 @@ def test_conversation_crud_and_messages_lifecycle():
             "content": "It describes the wave function of a quantum-mechanical system.",
         },
     )
-    assert msg2_res.status_code == 201
+    assert msg2_res.status_code == 422
 
     # 6. User A lists messages (chronological order)
     messages_res = client.get(
@@ -95,9 +95,8 @@ def test_conversation_crud_and_messages_lifecycle():
     )
     assert messages_res.status_code == 200
     messages = messages_res.json()
-    assert len(messages) == 2
+    assert len(messages) == 1
     assert messages[0]["role"] == "user"
-    assert messages[1]["role"] == "assistant"
 
     # 7. User A deletes conversation
     del_res = client.delete(
@@ -112,6 +111,25 @@ def test_conversation_crud_and_messages_lifecycle():
         headers=HEADERS_A,
     )
     assert verify_msgs.status_code == 404
+
+
+def test_public_message_endpoint_rejects_assistant_messages():
+    ws_res = client.post(
+        "/api/v1/workspaces", headers=HEADERS_A, json={"name": "Message API"}
+    )
+    conv_res = client.post(
+        f"/api/v1/workspaces/{ws_res.json()['id']}/conversations",
+        headers=HEADERS_A,
+        json={"title": "User input only"},
+    )
+
+    response = client.post(
+        f"/api/v1/conversations/{conv_res.json()['id']}/messages",
+        headers=HEADERS_A,
+        json={"role": "assistant", "content": "Client supplied answer"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_cross_user_isolation_for_conversations_and_messages():

@@ -6,11 +6,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.ml import device_runtime
 
 
 MODAL_URL = "https://workspace--app-gpu-inference.modal.run"
+
+
+@pytest.fixture(autouse=True)
+def isolate_gpu_admission_slots(monkeypatch):
+    """Late request callbacks must not leak test-local permits into other tests."""
+    monkeypatch.setattr(
+        device_runtime,
+        "_GPU_ADMISSION",
+        threading.BoundedSemaphore(device_runtime._GPU_MAX_OUTSTANDING),
+    )
 
 
 def _remote_settings(monkeypatch):
@@ -56,6 +66,42 @@ def test_remote_request_uses_bounded_timeout_and_server_token(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer never-log-this-token"
 
 
+def test_gpu_deadline_has_headroom_for_modal_startup_over_the_minimum_worker_window():
+    assert Settings.model_fields["GPU_WORKER_TIMEOUT_SECONDS"].default == 120.0
+    assert Settings.model_fields["MODAL_GPU_FUNCTION_TIMEOUT_SECONDS"].default == 90.0
+    assert Settings.model_fields["GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS"].default == 30.0
+
+
+def test_gpu_caller_deadline_must_cover_endpoint_and_bounded_overhead():
+    with pytest.raises(ValueError, match="must be at least"):
+        Settings(
+            ENVIRONMENT="development",
+            GPU_WORKER_TIMEOUT_SECONDS=119,
+            MODAL_GPU_FUNCTION_TIMEOUT_SECONDS=90,
+            GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS=30,
+        )
+
+
+def test_httpx_timeout_enters_bounded_late_work_quarantine(monkeypatch):
+    from concurrent.futures import Future
+
+    monkeypatch.setattr(settings, "MODAL_GPU_FUNCTION_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS", 0.02)
+    admission = threading.BoundedSemaphore(1)
+    assert admission.acquire(blocking=False)
+    future = Future()
+    timed_out = threading.Event()
+    future.add_done_callback(lambda done: device_runtime._release_when_done(
+        done, admission, operation="test", worker="gpu", started=time.perf_counter(),
+        caller_timed_out=timed_out,
+    ))
+    future.set_exception(device_runtime.httpx.ReadTimeout("read timed out"))
+
+    assert not admission.acquire(blocking=False)
+    time.sleep(0.3)
+    assert admission.acquire(blocking=False)
+
+
 def test_remote_embedding_splits_inputs_into_bounded_ordered_requests(monkeypatch):
     _remote_settings(monkeypatch)
     posted = []
@@ -71,11 +117,12 @@ def test_remote_embedding_splits_inputs_into_bounded_ordered_requests(monkeypatc
 def test_remote_scheduling_wait_has_an_outer_deadline(monkeypatch):
     _remote_settings(monkeypatch)
     monkeypatch.setattr(settings, "GPU_WORKER_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(device_runtime, "_GPU_LATE_WORK_QUARANTINE_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "MODAL_GPU_FUNCTION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS", 0.0)
     monkeypatch.setattr(device_runtime.httpx, "post", lambda *a, **k: time.sleep(0.1))
     with pytest.raises(device_runtime.InferenceUnavailable, match="request timed out"):
         device_runtime.infer_remote("embed", ["x"])
-    time.sleep(0.12)  # Let the deliberately late mock request release its slot.
+    time.sleep(0.5)  # Let the deliberately late mock request and bounded quarantine finish.
 
 
 def test_embedding_remote_invalid_output_falls_back_to_cpu(monkeypatch):
@@ -637,7 +684,8 @@ def test_remote_cancellation_cancels_work_that_has_not_started(monkeypatch):
 def test_multiple_late_gpu_requests_are_bounded_and_capacity_recovers(monkeypatch):
     _remote_settings(monkeypatch)
     monkeypatch.setattr(settings, "GPU_WORKER_TIMEOUT_SECONDS", 0.02)
-    monkeypatch.setattr(device_runtime, "_GPU_LATE_WORK_QUARANTINE_SECONDS", 0.02)
+    monkeypatch.setattr(settings, "MODAL_GPU_FUNCTION_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(settings, "GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS", 0.0)
     started = threading.Event()
     finish_remote = threading.Event()
     def delayed_post(*args, **kwargs):

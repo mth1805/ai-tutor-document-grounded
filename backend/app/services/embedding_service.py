@@ -17,6 +17,7 @@ from app.ml.loader import get_embedding_provider
 from app.db.session import AsyncSessionLocal
 from app.ml.local_runtime import infer
 from app.services.ingestion.telemetry import stage, metric, event
+from app.services.ingestion.fencing import set_ingestion_attempt_context
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ class EmbeddingService:
         provider: Optional[BaseEmbeddingProvider] = None,
         batch_size: Optional[int] = None,
         lease_guard: Optional[Callable[[], Awaitable[bool]]] = None,
+        ingestion_job_id: uuid.UUID | None = None,
+        ingestion_attempt: int | None = None,
     ) -> bool:
         """Computes embeddings for all chunks of a processed document and commits them atomically.
 
@@ -77,11 +80,13 @@ class EmbeddingService:
 
         if db is not None:
             try:
+                await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                 await db.commit()
                 await db.refresh(doc)
             except Exception as e:
                 logger.error("embedding_status_update_failed document_id=%s category=%s", document_id, type(e).__name__)
                 await db.rollback()
+                return False
 
         try:
             logger.info("embedding_started document_id=%s", document_id)
@@ -114,6 +119,7 @@ class EmbeddingService:
                 doc.embedded_at = completed_time
                 doc.embedding_error = None
                 if db is not None:
+                    await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                     await db.commit()
                     await db.refresh(doc)
                 logger.info("embedding_completed document_id=%s count=0", document_id)
@@ -170,6 +176,7 @@ class EmbeddingService:
             doc.embedding_error = None
 
             if db is not None:
+                await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                 with stage("vector_store"):
                     await db.commit()
                     await db.refresh(doc)
@@ -212,6 +219,7 @@ class EmbeddingService:
                     if doc:
                         doc.embedding_status = "failed"
                         doc.embedding_error = error_msg
+                        await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                         await db.commit()
                 except Exception as db_err:
                     logger.critical(

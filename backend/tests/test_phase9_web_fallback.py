@@ -36,6 +36,7 @@ from app.ml.loader import set_embedding_provider, set_reranker_provider
 from app.ml.mock_provider import MockEmbeddingProvider
 from app.ml.reranker_mock import MockRerankerProvider
 from app.llm import set_llm_provider, reset_llm_provider, MockLLMProvider, LLMProviderError
+from app.llm.base import GenerationResult
 from app.rag.citation_service import WebCitation
 from app.services.rag_service import web_fallback_system_instruction
 from app.web_search import set_web_search_provider, reset_web_search_provider
@@ -53,6 +54,37 @@ def test_web_fallback_uses_latest_message_language():
     assert "respond in Vietnamese" in instruction
     assert "ONLY the information inside <WEB_EVIDENCE>" in instruction
     assert "language of retrieved documents" in instruction
+
+
+def test_web_fallback_max_tokens_is_persisted_as_incomplete(monkeypatch):
+    monkeypatch.setattr(settings, "WEB_SEARCH_FALLBACK_ENABLED", True)
+    _, conversation_id = _create_workspace_and_conversation()
+
+    class TruncatedProvider(MockLLMProvider):
+        async def generate_stream_with_metadata(self, prompt, system_instruction=None, **kwargs):
+            return GenerationResult(
+                text="Partial answer based on web evidence.", finish_reason="MAX_TOKENS",
+                candidate_count=1, input_tokens=30, output_tokens=12, total_tokens=42,
+                generation_status="incomplete",
+            )
+
+    set_llm_provider(TruncatedProvider())
+    response = client.post(
+        f"/api/v1/conversations/{conversation_id}/chat", headers=HEADERS_A,
+        json={"content": "Explain an online topic"},
+    )
+    assert response.status_code == 200
+    events = [
+        (block.splitlines()[0][7:], json.loads(block.splitlines()[1][6:]))
+        for block in response.text.strip().split("\n\n") if block.startswith("event:")
+    ]
+    done = next(data for name, data in events if name == "done")
+    assert done["generation_status"] == "incomplete"
+    assert done["generation_metadata"]["finish_reason"] == "MAX_TOKENS"
+    assert done["used_web_fallback"] is True
+    messages = client.get(f"/api/v1/conversations/{conversation_id}/messages", headers=HEADERS_A).json()
+    assert messages[-1]["generation_status"] == "incomplete"
+    assert messages[-1]["generation_metadata"]["total_token_count"] == 42
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +241,7 @@ def test_insufficient_evidence_triggers_tavily_web_fallback(monkeypatch):
     assert data["has_sufficient_evidence"] is False
     assert mock_web.call_count == 1         # Tavily WAS called exactly once
     assert mock_llm.call_count == 1         # generate_stream (doc-free, Tavily-grounded)
+    assert mock_llm.last_stream_kwargs["max_output_tokens"] == settings.CHAT_MAX_OUTPUT_TOKENS
 
 
 def test_web_stream_hides_split_internal_heading_and_matches_done_content(monkeypatch):

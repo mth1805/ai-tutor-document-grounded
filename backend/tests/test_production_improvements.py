@@ -101,19 +101,33 @@ def test_pdf_and_image_preview_regression(name, content, mime):
 
 
 def test_libreoffice_conversion_isolated_profile_and_cleanup(monkeypatch):
+    import os
     from app.services import document_preview
     roots = []
-    monkeypatch.setattr(document_preview.shutil, "which", lambda _: "soffice")
+    monkeypatch.setattr(settings, "LIBREOFFICE_CMD", "soffice")
+    monkeypatch.setattr(
+        document_preview.shutil,
+        "which",
+        lambda command: "soffice.com" if command == "soffice.com" else "soffice",
+    )
+    calls = []
     def run(command, **kwargs):
         root = Path(command[-1]).parent
         roots.append(root)
+        calls.append(command)
+        if os.name == "nt":
+            assert command[0] == "soffice.com"
         assert command[-1].endswith("source.docx")
         assert any(arg.startswith("-env:UserInstallation=file:") for arg in command)
         assert kwargs["timeout"] == settings.LIBREOFFICE_TIMEOUT_SECONDS
+        if len(calls) == 1 and os.name == "nt":
+            raise PermissionError(13, "Access is denied", None, 5)
         (root / "source.pdf").write_bytes(b"%PDF-1.5 preview")
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(document_preview.subprocess, "run", run)
     assert document_preview.convert_word_to_pdf(word_bytes(), "ĐỀ CƯƠNG.docx").startswith(b"%PDF-")
+    assert len(calls) == (2 if os.name == "nt" else 1)
+    assert len(set(roots)) == 1
     assert not roots[0].exists()
 
 
@@ -162,9 +176,14 @@ async def test_uncertain_commit_never_deletes_a_referenced_object(monkeypatch):
 
 
 def test_real_local_pdf_docx_unicode_smoke(monkeypatch):
+    import os
     import shutil
     import fitz
-    executable = shutil.which("soffice")
+    executable = (
+        shutil.which("soffice.com") or shutil.which("soffice")
+        if os.name == "nt"
+        else shutil.which("soffice")
+    )
     if not executable:
         pytest.skip("Local LibreOffice executable unavailable")
     # Use the discovered local tool without changing the user's environment file.
@@ -277,9 +296,9 @@ def test_modal_worker_resource_and_cpu_function_configuration():
     assert deployment.process_ingestion_job._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
     assert deployment.gpu_inference._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
     assert deployment.fastapi_app._spec_.volumes["/models"] is _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)
-    assert deployment.READ_ONLY_MODEL_CACHE_VOLUME._mount_options.read_only is True
+    assert _modal_implementation(deployment.READ_ONLY_MODEL_CACHE_VOLUME)._mount_options.read_only is True
     assert deployment.prepare_model_cache._spec_.gpus is None
-    assert deployment.prepare_model_cache._spec_.max_containers == 1
+    assert "max_containers=1" in Path(deployment.__file__).read_text(encoding="utf-8")
     assert deployment.prepare_model_cache._spec_.volumes["/models"] is _modal_implementation(deployment.MODEL_CACHE_VOLUME)
 
 
@@ -462,9 +481,9 @@ def test_modal_worker_sets_device_before_processing_and_reuses_loop(
     for key in ("DEVICE_MODE", "GPU_FALLBACK_ENABLED", "MODAL_INFERENCE_WORKER_ROLE", "EMBEDDING_DEVICE", "RERANKER_DEVICE", "EMBEDDING_MODEL_CACHE_DIR", "RERANKER_MODEL_CACHE_DIR", "AUTO_EMBED_AFTER_INGESTION", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         monkeypatch.setenv(key, os.environ.get(key, "test-original"))
     calls = []
-    async def process(job_id):
+    async def process(job_id, claimed_attempt):
         configured = Settings(_env_file=None, ENVIRONMENT="development")
-        calls.append((job_id, asyncio.get_running_loop()))
+        calls.append((job_id, claimed_attempt, asyncio.get_running_loop()))
         assert configured.DEVICE_MODE == "auto"
         assert configured.GPU_FALLBACK_ENABLED is False
         assert os.environ["MODAL_INFERENCE_WORKER_ROLE"] == "cpu_orchestrator"
@@ -477,10 +496,11 @@ def test_modal_worker_sets_device_before_processing_and_reuses_loop(
     monkeypatch.setattr(deployment, "MODEL_CACHE_VOLUME", SimpleNamespace(commit=commit))
     job_id = uuid.uuid4()
     try:
-        assert deployment.process_ingestion_job.local(str(job_id)) is True
-        assert deployment.process_ingestion_job.local(str(job_id)) is True
+        assert deployment.process_ingestion_job.local(str(job_id), 1) is True
+        assert deployment.process_ingestion_job.local(str(job_id), 1) is True
         assert calls[0][0] == calls[1][0] == job_id
-        assert calls[0][1] is calls[1][1]
+        assert calls[0][1] == calls[1][1] == 1
+        assert calls[0][2] is calls[1][2]
         assert os.environ["HF_HUB_OFFLINE"] == "1"
         assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
         assert commit.call_count == 0
@@ -576,7 +596,7 @@ async def test_correlated_worker_stages_and_exact_storage_path(monkeypatch, capl
     monkeypatch.setattr(StorageService, "get_file", get_file)
     caplog.clear()
     caplog.set_level("INFO")
-    assert await ingestion_queue.process_claimed_job(job_id)
+    assert await ingestion_queue.process_claimed_job(job_id, 1)
     get_file.assert_awaited_once_with(document["storage_path"])
     entries = [json.loads(record.message) for record in caplog.records if record.message.startswith('{"event": "ingestion_stage"')]
     assert {"claimed", "storage_download", "parsing", "chunking", "model_load", "embedding", "ready"} <= {entry["stage"] for entry in entries}
@@ -632,8 +652,8 @@ async def test_missing_storage_object_fails_worker_cleanly(monkeypatch, caplog):
     monkeypatch.setattr(ingestion_queue, "finish_job", finish)
     caplog.set_level("INFO")
     job_id = uuid.uuid4()
-    assert await ingestion_queue.process_claimed_job(job_id) is False
-    finish.assert_awaited_once_with(job_id, succeeded=False)
+    assert await ingestion_queue.process_claimed_job(job_id, 1) is False
+    finish.assert_awaited_once_with(job_id, 1, succeeded=False)
     assert "STORAGE_OBJECT_UNAVAILABLE" in _IN_MEMORY_DOCUMENTS[uuid.UUID(record["id"])].processing_error
     assert "DOCUMENT_PROCESSING_FAILED" in caplog.text
 

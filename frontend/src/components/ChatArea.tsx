@@ -20,7 +20,7 @@ import {
   CheckCircle2,
   ExternalLink,
 } from "lucide-react";
-import { apiClient, Message, Citation, WebCitation } from "@/lib/api";
+import { apiClient, Message, Citation, WebCitation, GenerationStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDocument } from "@/lib/document-context";
 import { MarkdownRenderer } from "@/components/MarkdownRenderer";
@@ -122,6 +122,7 @@ export function ChatArea() {
       role: "assistant",
       content: "",
       citations: [],
+      generation_status: null,
       created_at: new Date().toISOString(),
     };
 
@@ -167,14 +168,26 @@ export function ChatArea() {
                       content: payload.content || accumulatedContent,
                       citations: payload.citations || [],
                       web_sources: payload.web_sources || [],
+                      generation_status: payload.generation_status || "unverified",
+                      generation_metadata: payload.generation_metadata || null,
                     }
                   : m
               )
             );
             setGenerationStatus(null);
           },
-          onError: (errMsg) => {
+          onError: (errMsg, terminal) => {
             setError(errMsg);
+            const status: GenerationStatus = terminal?.generation_status || "interrupted";
+            setMessages((prev) => prev.map((m) => m.id === tempAsstMsgId
+              ? {
+                  ...m,
+                  id: terminal?.message_id || m.id,
+                  content: terminal?.content ?? accumulatedContent,
+                  generation_status: status,
+                  generation_metadata: terminal?.generation_metadata || null,
+                }
+              : m));
             setGenerationStatus(null);
           },
         },
@@ -369,6 +382,23 @@ export function ChatArea() {
                           citations={msg.citations}
                           onOpenCitation={handleOpenCitation}
                         />
+                      )}
+
+                      {!isUser && msg.generation_status && msg.generation_status !== "completed" && (
+                        <div
+                          role="status"
+                          className={`mt-2 pt-2 border-t text-[11px] ${
+                            msg.generation_status === "blocked" || msg.generation_status === "failed"
+                              ? "border-rose-200 text-rose-700 dark:border-rose-900/60 dark:text-rose-300"
+                              : "border-amber-200 text-amber-700 dark:border-amber-900/60 dark:text-amber-300"
+                          }`}
+                        >
+                          {msg.generation_status === "incomplete" && "This answer is incomplete."}
+                          {msg.generation_status === "interrupted" && "Generation was interrupted. This answer may be incomplete."}
+                          {msg.generation_status === "blocked" && "Generation was blocked."}
+                          {msg.generation_status === "failed" && "Generation failed."}
+                          {msg.generation_status === "unverified" && "Completion could not be verified."}
+                        </div>
                       )}
 
                       {/* Citations & Document Evidence Section */}

@@ -1,11 +1,13 @@
 """Ingestion Service for managing document parsing, chunk persistence, and idempotent reprocessing."""
 import uuid
 import logging
+from time import perf_counter
 from datetime import datetime, timezone
 from typing import List, Optional
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.concurrency import run_in_threadpool
+from app.core.config import settings
 
 from app.models.document import Document
 from app.models.chunk import DocumentChunk
@@ -14,7 +16,8 @@ from app.services.document_service import DocumentService
 from app.services.ingestion.pipeline import IngestionPipeline
 from app.services.ingestion.models import ProcessedChunk
 from app.db.session import AsyncSessionLocal
-from app.services.ingestion.telemetry import stage, event
+from app.services.ingestion.telemetry import stage, event, context
+from app.services.ingestion.fencing import set_ingestion_attempt_context
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,9 @@ class IngestionService:
         document.status = "queued"
         document.processing_error = None
         document.processed_at = None
+        document.embedding_status = "pending"
+        document.embedded_at = None
+        document.embedding_error = None
         db.add(DocumentIngestionJob(
             document_id=document.id,
             workspace_id=document.workspace_id,
@@ -82,6 +88,8 @@ class IngestionService:
         user_id: uuid.UUID,
         pipeline: Optional[IngestionPipeline] = None,
         defer_failure_to_queue: bool = False,
+        ingestion_job_id: uuid.UUID | None = None,
+        ingestion_attempt: int | None = None,
     ) -> bool:
         """Processes an uploaded document, parses text, produces chunks, and commits them atomically.
 
@@ -95,30 +103,37 @@ class IngestionService:
             True if processing and chunk persistence succeeded, False otherwise.
         """
         # 1. Fetch document and verify authorization
+        started = perf_counter()
+        previous_status = None
         doc = await DocumentService.get_document(db, document_id, user_id)
         if not doc:
             logger.warning("Document %s not found or unauthorized for user %s", document_id, user_id)
             return False
 
         # 2. Transition status to 'processing'
+        previous_status = doc.status
         now = datetime.now(timezone.utc)
         doc.status = "processing"
         doc.processing_started_at = now
         doc.processing_error = None
-        from app.core.config import settings
-        if settings.LOCAL_SHARED_MODELS:
-            # Parsing replaces canonical chunks: never reuse a prior completed flag.
-            doc.embedding_status = "pending"
-            doc.embedded_at = None
-            doc.embedding_error = None
+        # Parsing replaces canonical chunks: never retain a completed embedding
+        # state or vectors from the previous ingestion attempt.
+        doc.embedding_status = "pending"
+        doc.embedded_at = None
+        doc.embedding_error = None
 
         if db is not None:
             try:
+                await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                 await db.commit()
                 await db.refresh(doc)
             except Exception as e:
                 logger.error("document_status_update_failed document_id=%s category=%s", document_id, type(e).__name__)
                 await db.rollback()
+                return False
+        state = context.get() or {}
+        event("status_transition", document_id=str(document_id), previous_status=previous_status,
+              current_status=doc.status, attempt=state.get("attempt"))
 
         # 3. Retrieve raw file bytes from private storage
         try:
@@ -129,19 +144,23 @@ class IngestionService:
 
             # 4. Run CPU-bound parsing, cleaning, and chunking in threadpool
             active_pipeline = pipeline or IngestionPipeline()
-            logger.info("document_parse_started document_id=%s", document_id)
+            logger.info("document_parse_started document_id=%s stage=parse attempt=%s",
+                        document_id, state.get("attempt"))
+            parse_started = perf_counter()
             chunks: List[ProcessedChunk] = await run_in_threadpool(
                 active_pipeline.process,
                 file_bytes,
                 doc.original_filename,
                 doc.mime_type,
             )
-            logger.info("document_parse_completed document_id=%s", document_id)
+            logger.info("document_parse_completed document_id=%s stage=parse chunk_count=%d duration_ms=%.2f",
+                        document_id, len(chunks), round((perf_counter() - parse_started) * 1000, 2))
 
             # 5. Atomic persistence: delete previous chunks & insert new chunks in a single transaction
             processed_time = datetime.now(timezone.utc)
 
             if db is not None:
+                await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                 # Delete existing chunks for idempotency
                 await db.execute(
                     delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
@@ -192,21 +211,29 @@ class IngestionService:
                 doc.processed_at = processed_time
                 doc.processing_error = None
 
-            logger.info("chunks_created document_id=%s count=%d", doc.id, len(chunks))
+            logger.info("chunks_created document_id=%s count=%d status=%s", doc.id, len(chunks), doc.status)
+            event("status_transition", document_id=str(document_id), previous_status="processing",
+                  current_status="processed", attempt=state.get("attempt"))
 
             # Phase 6 Integration: Automatically trigger embedding for processed document
-            from app.core.config import settings
             if settings.AUTO_EMBED_AFTER_INGESTION:
                 from app.services.embedding_service import EmbeddingService
                 logger.info("Auto-triggering Phase 6 embedding for processed document %s", doc.id)
-                if not await EmbeddingService.embed_document(db, doc.id, user_id):
+                if not await EmbeddingService.embed_document(
+                    db, doc.id, user_id,
+                    ingestion_job_id=ingestion_job_id,
+                    ingestion_attempt=ingestion_attempt,
+                ):
                     raise RuntimeError("Embedding stage failed")
 
             return True
 
         except Exception as err:
-            event("failed", error_category=type(err).__name__, error_code="DOCUMENT_PROCESSING_FAILED")
-            logger.error("document_processing_failed document_id=%s category=%s", document_id, type(err).__name__)
+            event("failed", error_category=type(err).__name__, error_code="DOCUMENT_PROCESSING_FAILED",
+                  duration_ms=round((perf_counter() - started) * 1000, 2),
+                  timeout_category="operation_timeout" if isinstance(err, TimeoutError) else None)
+            logger.error("document_processing_failed document_id=%s stage=ingestion category=%s duration_ms=%.2f",
+                         document_id, type(err).__name__, round((perf_counter() - started) * 1000, 2))
             failed_time = datetime.now(timezone.utc)
             error_msg = (
                 "Document processing failed. Please retry or upload a new copy."
@@ -222,6 +249,7 @@ class IngestionService:
                         doc.status = "processing" if defer_failure_to_queue else "failed"
                         doc.processing_error = error_msg
                         doc.processed_at = None if defer_failure_to_queue else failed_time
+                        await set_ingestion_attempt_context(db, ingestion_job_id, ingestion_attempt)
                         await db.commit()
                 except Exception as db_err:
                     logger.critical("document_failure_record_failed document_id=%s category=%s", document_id, type(db_err).__name__)
@@ -229,6 +257,9 @@ class IngestionService:
                 doc.status = "failed"
                 doc.processing_error = error_msg
                 doc.processed_at = failed_time
+
+            event("status_transition", document_id=str(document_id), previous_status="processing",
+                  current_status=doc.status, attempt=state.get("attempt"))
 
             return False
 
@@ -239,22 +270,24 @@ class IngestionService:
         user_id: uuid.UUID,
         pipeline: Optional[IngestionPipeline] = None,
         defer_failure_to_queue: bool = False,
+        ingestion_job_id: uuid.UUID | None = None,
+        ingestion_attempt: int | None = None,
     ) -> bool:
         """Asynchronous background worker execution for document ingestion."""
         if AsyncSessionLocal is None:
-            return await cls.process_document(None, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue)
+            return await cls.process_document(None, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue, ingestion_job_id=ingestion_job_id, ingestion_attempt=ingestion_attempt)
 
         try:
             from app.db.session import get_db
             from app.main import app
             if get_db in app.dependency_overrides:
-                return await cls.process_document(None, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue)
+                return await cls.process_document(None, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue, ingestion_job_id=ingestion_job_id, ingestion_attempt=ingestion_attempt)
         except Exception:
             pass
 
         async with AsyncSessionLocal() as session:
             session.info["rls_user_id"] = user_id
-            return await cls.process_document(session, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue)
+            return await cls.process_document(session, document_id, user_id, pipeline=pipeline, defer_failure_to_queue=defer_failure_to_queue, ingestion_job_id=ingestion_job_id, ingestion_attempt=ingestion_attempt)
 
     @classmethod
     async def list_document_chunks(

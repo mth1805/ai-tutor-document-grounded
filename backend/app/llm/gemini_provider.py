@@ -3,6 +3,7 @@ import logging
 import asyncio
 import json
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import AsyncIterator, Optional
@@ -218,15 +219,143 @@ class GeminiProvider(BaseLLMProvider):
         candidates = getattr(response, "candidates", None) or []
         finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
         if finish_reason is None:
-            reason_name = None
+            reason_name = "MISSING_CANDIDATE" if not candidates else "MISSING_FINISH_REASON"
         else:
             reason_name = getattr(finish_reason, "name", None) or str(finish_reason).rsplit(".", 1)[-1]
             reason_name = str(reason_name).upper()
+        usage = getattr(response, "usage_metadata", None)
+        try:
+            text = response.text or ""
+        except Exception as exc:
+            # Some blocked/empty candidate responses raise when the SDK's
+            # convenience text property is accessed. Keep the finish reason
+            # and usage metadata available to the summary diagnostics.
+            logger.warning(
+                "Gemini response text unavailable exception=%s finish_reason=%s candidate_count=%d",
+                type(exc).__name__, reason_name, len(candidates),
+            )
+            text = ""
         return GenerationResult(
-            text=response.text or "",
+            text=text,
             completed=reason_name == "STOP",
             finish_reason=reason_name,
+            candidate_count=len(candidates),
+            input_tokens=getattr(usage, "prompt_token_count", None),
+            output_tokens=getattr(usage, "candidates_token_count", None),
+            total_tokens=getattr(usage, "total_token_count", None),
+            thoughts_tokens=getattr(usage, "thoughts_token_count", None),
+            model_version=getattr(response, "model_version", None),
+            response_id=getattr(response, "response_id", None),
+            generation_status=self._classify_finish(reason_name, bool(candidates)),
         )
+
+    @staticmethod
+    def _classify_finish(reason_name: str | None, has_candidate: bool) -> str:
+        if not has_candidate:
+            return "unverified"
+        if reason_name == "STOP":
+            return "completed"
+        if reason_name == "MAX_TOKENS":
+            return "incomplete"
+        if reason_name in {"SAFETY", "RECITATION"}:
+            return "blocked"
+        return "unverified"
+
+    @staticmethod
+    def _is_stream_interruption(exc: Exception, diagnostic: dict) -> bool:
+        class_names = {cls.__name__ for cls in type(exc).__mro__}
+        network_or_timeout = {
+            "TimeoutError", "TimeoutException", "ReadTimeout", "ConnectTimeout",
+            "WriteTimeout", "PoolTimeout", "ConnectionError", "ConnectionResetError",
+            "NetworkError", "RequestError", "ReadError", "WriteError", "ConnectError",
+            "RemoteProtocolError",
+        }
+        return (
+            diagnostic.get("classification") == "timeout"
+            or bool(class_names & network_or_timeout)
+            or diagnostic.get("provider_status") == "UNAVAILABLE"
+        )
+
+    async def generate_stream_with_metadata(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """Consume Gemini's response stream while retaining final metadata and partial text."""
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
+        started = time.perf_counter()
+        text_parts: list[str] = []
+        first_token_ms = None
+        finish_reason = None
+        candidate_count = None
+        input_tokens = output_tokens = thoughts_tokens = total_tokens = None
+        model_version = response_id = None
+        has_candidate = False
+        try:
+            async with asyncio.timeout(settings.LLM_STREAMING_TIMEOUT_SECONDS):
+                stream = await self._client.aio.models.generate_content_stream(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                async for chunk in stream:
+                    candidates = getattr(chunk, "candidates", None) or []
+                    if candidates:
+                        has_candidate = True
+                        candidate_count = len(candidates)
+                        candidate_reason = getattr(candidates[0], "finish_reason", None)
+                        if candidate_reason is not None:
+                            value = getattr(candidate_reason, "name", None) or str(candidate_reason).rsplit(".", 1)[-1]
+                            finish_reason = str(value).upper()
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage is not None:
+                        input_tokens = getattr(usage, "prompt_token_count", input_tokens)
+                        output_tokens = getattr(usage, "candidates_token_count", output_tokens)
+                        thoughts_tokens = getattr(usage, "thoughts_token_count", thoughts_tokens)
+                        total_tokens = getattr(usage, "total_token_count", total_tokens)
+                    model_version = getattr(chunk, "model_version", None) or model_version
+                    response_id = getattr(chunk, "response_id", None) or response_id
+                    try:
+                        text_chunk = chunk.text
+                    except Exception as text_error:
+                        # Blocked/empty candidates can make the SDK convenience
+                        # property raise; candidate metadata remains authoritative.
+                        logger.debug("Gemini stream chunk text unavailable (%s)", type(text_error).__name__)
+                        text_chunk = None
+                    if text_chunk:
+                        if first_token_ms is None:
+                            first_token_ms = (time.perf_counter() - started) * 1000
+                        text_parts.append(text_chunk)
+            status = self._classify_finish(finish_reason, has_candidate)
+            return GenerationResult(
+                text="".join(text_parts), finish_reason=finish_reason,
+                candidate_count=candidate_count, input_tokens=input_tokens,
+                output_tokens=output_tokens, thoughts_tokens=thoughts_tokens,
+                total_tokens=total_tokens, model_version=model_version,
+                response_id=response_id,
+                generation_duration_ms=(time.perf_counter() - started) * 1000,
+                time_to_first_token_ms=first_token_ms,
+                generation_status=status,
+            )
+        except Exception as exc:
+            diagnostic = self._diagnostic(exc)
+            self._log_failure("metadata streaming generation", exc)
+            classification = diagnostic["classification"]
+            interrupted = self._is_stream_interruption(exc, diagnostic)
+            return GenerationResult(
+                text="".join(text_parts), finish_reason=finish_reason,
+                candidate_count=candidate_count, input_tokens=input_tokens,
+                output_tokens=output_tokens, thoughts_tokens=thoughts_tokens,
+                total_tokens=total_tokens, model_version=model_version,
+                response_id=response_id,
+                generation_duration_ms=(time.perf_counter() - started) * 1000,
+                time_to_first_token_ms=first_token_ms,
+                generation_status="interrupted" if interrupted else "failed",
+                error_type=diagnostic["exception_class"],
+                error_classification=classification,
+                http_status=diagnostic["http_status"],
+            )
 
     async def _generate_response(
         self,

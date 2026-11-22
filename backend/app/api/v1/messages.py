@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.core.security import get_current_user, AuthenticatedUser
-from app.schemas.message import MessageCreate, MessageResponse
+from app.schemas.message import MessageResponse, UserMessageCreate
 from app.services.conversation_service import ConversationService
 
 router = APIRouter(prefix="/conversations/{conversation_id}/messages", tags=["messages"])
@@ -40,7 +40,7 @@ async def list_messages(
 )
 async def create_message(
     conversation_id: uuid.UUID,
-    data: MessageCreate,
+    data: UserMessageCreate,
     current_user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MessageResponse:

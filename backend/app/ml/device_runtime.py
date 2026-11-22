@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 # the Modal function still enforces its global max_containers limit.
 _GPU_MAX_OUTSTANDING = 2
 _CPU_MAX_OUTSTANDING = 4
-_GPU_LATE_WORK_QUARANTINE_SECONDS = 60.0
 _CPU_EXECUTOR = ThreadPoolExecutor(max_workers=_CPU_MAX_OUTSTANDING, thread_name_prefix="ml-cpu-fallback")
 _GPU_EXECUTOR = ThreadPoolExecutor(max_workers=_GPU_MAX_OUTSTANDING, thread_name_prefix="modal-gpu-request")
 _GPU_ADMISSION = threading.BoundedSemaphore(_GPU_MAX_OUTSTANDING)
@@ -118,6 +117,7 @@ def _release_when_done(
     worker: str,
     started: float,
     caller_timed_out: threading.Event,
+    quarantine_seconds: float | None = None,
 ) -> None:
     """Keep a slot occupied until underlying work really finishes."""
     def release() -> None:
@@ -132,18 +132,34 @@ def _release_when_done(
         elif future.cancelled():
             logger.info("inference_task_cancelled worker=%s operation=%s", worker, operation)
     finally:
-        if worker == "gpu" and caller_timed_out.is_set() and not future.cancelled():
+        remote_may_still_run = caller_timed_out.is_set()
+        if worker == "gpu" and not future.cancelled() and not remote_may_still_run:
+            try:
+                remote_may_still_run = isinstance(future.exception(), httpx.RequestError)
+            except BaseException:
+                remote_may_still_run = False
+        if worker == "gpu" and remote_may_still_run and not future.cancelled():
             # Disconnecting the HTTP client cannot prove that Modal stopped an
-            # already-accepted inference. Keep this slot quarantined for the
-            # endpoint's minimum execution timeout to dampen timeout/retry waves.
-            timer = threading.Timer(_GPU_LATE_WORK_QUARANTINE_SECONDS, release)
+            # accepted inference. Bound quarantine by the configured remote
+            # execution timeout plus its explicit scheduling/network allowance.
+            hold_seconds = quarantine_seconds or max(
+                0.001,
+                float(settings.MODAL_GPU_FUNCTION_TIMEOUT_SECONDS)
+                + float(settings.GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS),
+            )
+            timer = threading.Timer(hold_seconds, release)
             timer.daemon = True
-            timer.start()
+            try:
+                timer.start()
+            except RuntimeError:
+                logger.exception("inference_quarantine_timer_start_failed worker=gpu operation=%s", operation)
+                release()
         else:
             release()
 
 
-def _submit_bounded(executor, admission, fn, *args, operation: str, worker: str, **kwargs) -> tuple[Future, threading.Event, float]:
+def _submit_bounded(executor, admission, fn, *args, operation: str, worker: str,
+                    quarantine_seconds: float | None = None, **kwargs) -> tuple[Future, threading.Event, float]:
     if not admission.acquire(blocking=False):
         logger.warning("inference_admission_rejected worker=%s operation=%s", worker, operation)
         raise InferenceUnavailable(f"{worker} inference capacity is saturated")
@@ -156,7 +172,7 @@ def _submit_bounded(executor, admission, fn, *args, operation: str, worker: str,
         raise
     future.add_done_callback(lambda done: _release_when_done(
         done, admission, operation=operation, worker=worker, started=started,
-        caller_timed_out=caller_timed_out,
+        caller_timed_out=caller_timed_out, quarantine_seconds=quarantine_seconds,
     ))
     return future, caller_timed_out, started
 
@@ -208,9 +224,15 @@ def _infer_remote_batch(operation: str, values: list, *, normalize: bool, batch_
         raise InferenceUnavailable("Modal GPU inference credentials are not configured")
 
     total_timeout = float(settings.GPU_WORKER_TIMEOUT_SECONDS)
+    quarantine_seconds = max(
+        0.001,
+        float(settings.MODAL_GPU_FUNCTION_TIMEOUT_SECONDS)
+        + float(settings.GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS),
+    )
     http_timeout = httpx.Timeout(total_timeout, connect=min(5.0, total_timeout))
     future, caller_timed_out, started = _submit_bounded(
         _GPU_EXECUTOR, _GPU_ADMISSION, httpx.post, operation=operation, worker="gpu",
+        quarantine_seconds=quarantine_seconds,
         url=endpoint,
         json={"operation": operation, "values": values, "normalize": normalize, "batch_size": batch_size},
         headers={"Authorization": f"Bearer {token}"},
@@ -224,8 +246,9 @@ def _infer_remote_batch(operation: str, values: list, *, normalize: bool, batch_
         caller_timed_out.set()
         cancelled_locally = future.cancel()
         logger.warning(
-            "inference_remote_timeout operation=%s local_cancelled=%s remote_may_continue=%s",
-            operation, cancelled_locally, not cancelled_locally,
+            "inference_remote_timeout operation=%s timeout_seconds=%.2f timeout_category=caller_deadline "
+            "local_cancelled=%s remote_may_continue=%s",
+            operation, total_timeout, cancelled_locally, not cancelled_locally,
         )
         raise InferenceUnavailable("Modal GPU inference request timed out") from exc
     except BaseException:

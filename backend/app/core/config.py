@@ -70,7 +70,12 @@ class Settings(BaseSettings):
     GPU_FALLBACK_ENABLED: bool = True
     MODAL_INFERENCE_URL: str | None = None
     MODAL_INFERENCE_TOKEN: str | None = None
-    GPU_WORKER_TIMEOUT_SECONDS: float = Field(default=20.0, gt=0, le=120)
+    # Backend end-to-end deadline includes scheduling and network overhead.
+    GPU_WORKER_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=120)
+    # Must match the timeout applied when deploying the Modal GPU function.
+    MODAL_GPU_FUNCTION_TIMEOUT_SECONDS: float = Field(default=90.0, ge=60, le=120)
+    # Bounded allowance for Modal scheduling, cold start, and response delivery.
+    GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS: float = Field(default=30.0, ge=0, le=60)
     CPU_FALLBACK_TIMEOUT_SECONDS: float = Field(default=180.0, gt=0, le=600)
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
     EMBEDDING_DIMENSION: int = 1024
@@ -107,8 +112,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
     GEMINI_THINKING_LEVEL: str = "medium"
+    # User-facing chat answers use a separate larger budget; internal/non-chat
+    # generation (including document summaries) continues to use LLM_MAX_OUTPUT_TOKENS.
+    CHAT_MAX_OUTPUT_TOKENS: int = Field(default=8192, ge=128, le=8192)
     LLM_MAX_OUTPUT_TOKENS: int = 2048
-    LLM_STREAMING_TIMEOUT_SECONDS: float = 60.0
+    LLM_STREAMING_TIMEOUT_SECONDS: float = Field(default=90.0, gt=0)
     DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET: int = Field(default=12000, ge=1000, le=100000)
     DOCUMENT_SUMMARY_MAP_OUTPUT_TOKENS: int = Field(default=512, ge=128, le=2048)
 
@@ -137,6 +145,14 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_configuration(self):
         """Fail early for missing production settings while keeping local startup flexible."""
+        required_gpu_caller_timeout = (
+            self.MODAL_GPU_FUNCTION_TIMEOUT_SECONDS + self.GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS
+        )
+        if self.GPU_WORKER_TIMEOUT_SECONDS < required_gpu_caller_timeout:
+            raise ValueError(
+                "GPU_WORKER_TIMEOUT_SECONDS must be at least "
+                "MODAL_GPU_FUNCTION_TIMEOUT_SECONDS plus GPU_MODAL_OVERHEAD_ALLOWANCE_SECONDS"
+            )
         if self.LOCAL_SHARED_MODELS and self.ENVIRONMENT.lower() != "development":
             raise ValueError("LOCAL_SHARED_MODELS is restricted to development")
         if self.ENVIRONMENT.lower() in {"production", "prod"}:

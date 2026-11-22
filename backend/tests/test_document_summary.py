@@ -268,6 +268,8 @@ def test_large_document_uses_ordered_map_reduce_with_bounded_tokens_and_complete
     assert done["summary"]["input_coverage_complete"] is True
     assert done["summary"]["generation_complete"] is True
     assert len(provider.prompts) == 4  # three map calls and one final reduction
+    assert provider.output_limits[-1] == settings.LLM_MAX_OUTPUT_TOKENS
+    assert settings.LLM_MAX_OUTPUT_TOKENS == 2048
     assert "[Source 1]" in provider.prompts[-1] and "[Source 3]" in provider.prompts[-1]
 
 
@@ -443,6 +445,78 @@ def test_incomplete_generation_at_required_stage_never_streams_partial_summary(
     assert any(name == "error" for name, _ in events)
     assert not any(name in {"token", "done"} for name, _ in events)
     assert "MAX_TOKENS" not in response.text
+
+
+@pytest.mark.parametrize(("kind", "expected_stage"), [
+    ("direct", "direct"),
+    ("map", "map"),
+    ("intermediate_reduce", "reduce_intermediate"),
+    ("final_reduce", "reduce_final"),
+])
+def test_summary_failure_logs_stage_and_safe_generation_metadata(monkeypatch, caplog, kind, expected_stage):
+    if kind in {"map", "final_reduce"}:
+        monkeypatch.setattr(settings, "DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET", 4000)
+    elif kind == "intermediate_reduce":
+        monkeypatch.setattr(settings, "DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET", 4000)
+    workspace_id, conversation_id = create_conversation()
+    if kind == "direct":
+        contents = ["PRIVATE_DOCUMENT_TEXT"]
+        token_counts = None
+        completion_flags = [False]
+    elif kind == "map":
+        contents = [f"PRIVATE_DOCUMENT_TEXT section {i} " + "fact " * 2200 for i in range(3)]
+        token_counts = None
+        completion_flags = [False]
+    elif kind == "intermediate_reduce":
+        contents = [f"PRIVATE_DOCUMENT_TEXT section {i} " + "fact " * 2200 for i in range(12)]
+        token_counts = None
+        completion_flags = [True] * 12 + [False]
+    else:
+        contents = [f"PRIVATE_DOCUMENT_TEXT section {i} " + "fact " * 2200 for i in range(3)]
+        token_counts = None
+        completion_flags = [True, True, True, False]
+
+    document = add_document(workspace_id, "Diagnostic.pdf", contents, token_counts=token_counts)
+    if kind == "intermediate_reduce":
+        class FailingRecursiveProvider(RecursiveSummaryProvider):
+            def __init__(self):
+                super().__init__()
+                self.flags = list(completion_flags)
+
+            async def generate_with_metadata(self, prompt, system_instruction=None, **kwargs):
+                text = await self.generate(prompt, system_instruction, **kwargs)
+                complete = self.flags.pop(0)
+                return GenerationResult(text=text, completed=complete,
+                                        finish_reason="STOP" if complete else "MAX_TOKENS",
+                                        candidate_count=1, input_tokens=1200,
+                                        output_tokens=500, total_tokens=1700)
+
+        provider = FailingRecursiveProvider()
+    else:
+        provider = MetadataSummaryProvider(completion_flags=completion_flags)
+    set_llm_provider(provider)
+
+    with caplog.at_level("WARNING", logger="app.services.document_summary_service"):
+        response = client.post(
+            f"/api/v1/conversations/{conversation_id}/chat", headers=HEADERS,
+            json={"content": "Summarize the entire document", "document_id": str(document.id)},
+        )
+
+    assert response.status_code == 200
+    assert "document_summary_generation_incomplete" in caplog.text
+    assert f'"stage": "{expected_stage}"' in caplog.text
+    assert f'"document_id": "{document.id}"' in caplog.text
+    assert '"finish_reason": "MAX_TOKENS"' in caplog.text
+    assert '"response_received": true' in caplog.text
+    assert '"request_id": "' in caplog.text
+    assert '"estimated_input_tokens":' in caplog.text
+    if kind == "intermediate_reduce":
+        assert '"actual_input_tokens": 1200' in caplog.text
+        assert '"actual_output_tokens": 500' in caplog.text
+    assert "PRIVATE_DOCUMENT_TEXT" not in caplog.text
+    assert "Faithful notes" not in caplog.text
+    assert "test-token:" not in caplog.text
+    assert any(name == "error" for name, _ in parse_events(response.text))
 
 
 @pytest.mark.parametrize(("responses", "error_at"), [([""], None), (None, 0)])

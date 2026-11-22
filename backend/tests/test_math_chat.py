@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.core.config import settings
 from app.llm import MockLLMProvider, set_llm_provider, reset_llm_provider
+from app.llm.base import GenerationResult
 from app.schemas.math_solver import MathSolverResult, MathTask
 from app.schemas.retrieval import RetrievalResponse, RetrievalTimingMetrics
 from app.services.rag_service import RAGService
@@ -97,7 +98,8 @@ def test_direct_math_http_uses_real_process_and_persists(monkeypatch):
     monkeypatch.setattr(settings, "MATH_SOLVER_TIMEOUT_SECONDS", 15.0)
     order = []
     mock_retrieval(monkeypatch, sufficient=False, order=order)
-    set_llm_provider(MockLLMProvider(tokens=["Take the square root, then add two."]))
+    llm = MockLLMProvider(tokens=["Take the square root, then add two."])
+    set_llm_provider(llm)
     workspace, cid = conversation()
     response = client.post(f"/api/v1/conversations/{cid}/chat/sync", headers=headers,
                            json={"content": "Calculate sqrt(16)+2", "chat_mode": "Full Solution", "workspace_id": workspace})
@@ -106,9 +108,36 @@ def test_direct_math_http_uses_real_process_and_persists(monkeypatch):
     assert order == ["retrieve"]
     assert data["solver"] == {"used": True, "type": "math", "operation": "calculate", "verified": True}
     assert "Verified result: 6" in data["content"]
+    assert llm.last_stream_kwargs["max_output_tokens"] == settings.CHAT_MAX_OUTPUT_TOKENS
     assert data["citations"] == [] and not data["has_sufficient_evidence"]
     history = client.get(f"/api/v1/conversations/{cid}/messages", headers=headers).json()
     assert len(history) == 2 and history[-1]["content"] == data["content"]
+
+
+def test_full_solution_does_not_append_verified_result_after_truncated_explanation(monkeypatch):
+    mock_retrieval(monkeypatch, sufficient=False)
+    local_solver(monkeypatch)
+
+    class TruncatedProvider(MockLLMProvider):
+        async def generate_stream_with_metadata(self, prompt, system_instruction=None, **kwargs):
+            return GenerationResult(
+                text="The calculation begins with the square root.",
+                finish_reason="MAX_TOKENS", generation_status="incomplete",
+            )
+
+    set_llm_provider(TruncatedProvider())
+    workspace, cid = conversation()
+    response = client.post(
+        f"/api/v1/conversations/{cid}/chat/sync", headers=headers,
+        json={"content": "Calculate sqrt(16)+2", "chat_mode": "Full Solution", "workspace_id": workspace},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["generation_status"] == "incomplete"
+    assert "The calculation begins" in data["content"]
+    assert "Verified result:" not in data["content"]
+    history = client.get(f"/api/v1/conversations/{cid}/messages", headers=headers).json()
+    assert history[-1]["generation_status"] == "incomplete"
 
 
 @pytest.mark.parametrize("mode,count", [("Light Guidance", 1), ("Detailed Guidance", 3)])
@@ -129,6 +158,7 @@ def test_hint_modes_cannot_leak_even_with_malicious_llm_output(monkeypatch, mode
     assert len(text.split("\n\n")) == count
     assert done["solver"]["verified"]
     assert llm.call_count == 1
+    assert "max_output_tokens" not in llm.last_generate_kwargs
     assert '"result":["2","3"]' in llm.last_prompt
     assert "INTERNAL ONLY" in llm.last_system_instruction
     if mode == "Detailed Guidance":

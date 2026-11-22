@@ -2,6 +2,7 @@
 import asyncio
 from typing import AsyncIterator, List, Optional
 from app.llm.base import BaseLLMProvider
+from app.llm.base import GenerationResult
 from app.llm.exceptions import LLMProviderError
 
 
@@ -63,6 +64,8 @@ class MockLLMProvider(BaseLLMProvider):
         # Spy attributes for test inspection
         self.last_prompt: Optional[str] = None
         self.last_system_instruction: Optional[str] = None
+        self.last_generate_kwargs: dict = {}
+        self.last_stream_kwargs: dict = {}
         self.call_count: int = 0
         self.web_grounding_call_count: int = 0
 
@@ -74,12 +77,28 @@ class MockLLMProvider(BaseLLMProvider):
     ) -> str:
         self.last_prompt = prompt
         self.last_system_instruction = system_instruction
+        self.last_generate_kwargs = dict(kwargs)
         self.call_count += 1
 
         if self.simulate_error:
             raise self.simulate_error
 
         return self.default_response
+
+    async def generate_with_metadata(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """Tests may explicitly use this deterministic double as confirmed STOP."""
+        started = asyncio.get_running_loop().time()
+        text = await self.generate(prompt, system_instruction, **kwargs)
+        return GenerationResult(
+            text=text, completed=True, finish_reason="STOP", candidate_count=1,
+            generation_status="completed",
+            generation_duration_ms=(asyncio.get_running_loop().time() - started) * 1000,
+        )
 
     async def generate_stream(
         self,
@@ -89,6 +108,7 @@ class MockLLMProvider(BaseLLMProvider):
     ) -> AsyncIterator[str]:
         self.last_prompt = prompt
         self.last_system_instruction = system_instruction
+        self.last_stream_kwargs = dict(kwargs)
         self.call_count += 1
 
         if self.simulate_error:
@@ -98,6 +118,38 @@ class MockLLMProvider(BaseLLMProvider):
             if self.token_delay > 0:
                 await asyncio.sleep(self.token_delay)
             yield token
+
+    async def generate_stream_with_metadata(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """A deterministic test double with an explicit normal finish outcome."""
+        started = asyncio.get_running_loop().time()
+        chunks = []
+        try:
+            async for token in self.generate_stream(prompt, system_instruction, **kwargs):
+                chunks.append(token)
+            return GenerationResult(
+                text="".join(chunks), finish_reason="STOP", candidate_count=1,
+                generation_status="completed",
+                generation_duration_ms=(asyncio.get_running_loop().time() - started) * 1000,
+                time_to_first_token_ms=(asyncio.get_running_loop().time() - started) * 1000 if chunks else None,
+            )
+        except Exception as exc:
+            name = type(exc).__name__
+            status = "interrupted" if name in {"LLMTimeoutError", "TimeoutError", "ConnectionError"} else "failed"
+            details = getattr(exc, "details", None)
+            http_status = details.get("http_status") if isinstance(details, dict) else None
+            return GenerationResult(
+                text="".join(chunks), generation_status=status,
+                generation_duration_ms=(asyncio.get_running_loop().time() - started) * 1000,
+                time_to_first_token_ms=(asyncio.get_running_loop().time() - started) * 1000 if chunks else None,
+                error_type=name,
+                error_classification=getattr(exc, "category", None),
+                http_status=http_status if isinstance(http_status, int) else None,
+            )
 
     async def generate_stream_with_grounding(
         self,

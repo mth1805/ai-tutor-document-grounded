@@ -92,8 +92,10 @@ test('SSE delivers split UTF-8 tokens incrementally and handles disconnect and s
     let resolveToken;
     const tokenReceived = new Promise((resolve) => { resolveToken = resolve; });
     const tokens = [];
+    let terminalPayload;
     const pending = apiClient.streamChat('conversation', { content: 'hello' }, 'test-token', {
       onToken: (token) => { tokens.push(token); resolveToken(); },
+      onDone: (payload) => { terminalPayload = payload; },
     }, abort.signal);
     const bytes = new TextEncoder().encode('event: token\ndata: {"token":"Việt"}\n\n');
     for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
@@ -102,6 +104,7 @@ test('SSE delivers split UTF-8 tokens incrementally and handles disconnect and s
     controller.enqueue(new TextEncoder().encode('event: done\ndata: {"content":"Việt"}\n\n'));
     controller.close();
     await pending;
+    assert.equal(terminalPayload.content, tokens[0]);
     const disconnected = apiClient.streamChat('conversation', { content: 'hello' }, 'test-token', {}, abort.signal);
     controller.close();
     await assert.rejects(disconnected, /before completion/);
@@ -109,5 +112,39 @@ test('SSE delivers split UTF-8 tokens incrementally and handles disconnect and s
     abort.abort();
     controller.error(new DOMException('Aborted', 'AbortError'));
     await stopped;
+  } finally { globalThis.fetch = original; }
+});
+
+test('SSE error carries failed completion state and EOF never calls onDone', async () => {
+  const original = globalThis.fetch;
+  let controller;
+  globalThis.fetch = async () => new Response(new ReadableStream({ start(value) { controller = value; } }));
+  try {
+    let errorTerminal;
+    const failed = apiClient.streamChat('conversation', { content: 'hello' }, 'test-token', {
+      onError: (_message, terminal) => { errorTerminal = terminal; },
+    });
+    controller.enqueue(new TextEncoder().encode('event: error\ndata: {"error":"failed","generation_status":"failed","message_id":"m1"}\n\n'));
+    controller.close();
+    await failed;
+    assert.equal(errorTerminal.generation_status, 'failed');
+    assert.equal(errorTerminal.message_id, 'm1');
+
+    let doneCalled = false;
+    const eof = apiClient.streamChat('conversation', { content: 'hello' }, 'test-token', {
+      onDone: () => { doneCalled = true; },
+    });
+    controller.close();
+    await assert.rejects(eof, /before completion/);
+    assert.equal(doneCalled, false);
+
+    let incompleteStatus;
+    const incomplete = apiClient.streamChat('conversation', { content: 'hello' }, 'test-token', {
+      onDone: (payload) => { incompleteStatus = payload.generation_status; },
+    });
+    controller.enqueue(new TextEncoder().encode('event: done\ndata: {"generation_status":"incomplete"}\n\n'));
+    controller.close();
+    await incomplete;
+    assert.equal(incompleteStatus, 'incomplete');
   } finally { globalThis.fetch = original; }
 });

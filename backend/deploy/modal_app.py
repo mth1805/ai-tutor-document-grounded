@@ -40,7 +40,7 @@ elif _legacy_ingestion_gpu is not None:
     INFERENCE_GPU = _legacy_ingestion_gpu.strip() or "T4"
 else:
     INFERENCE_GPU = "T4"
-GPU_WORKER_TIMEOUT = int(os.getenv("GPU_WORKER_TIMEOUT_SECONDS", "20"))
+GPU_FUNCTION_TIMEOUT = int(os.getenv("MODAL_GPU_FUNCTION_TIMEOUT_SECONDS", "90"))
 CPU_REQUIREMENTS = BACKEND / "requirements.lock.txt"
 GPU_REQUIREMENTS = BACKEND / "requirements-gpu.lock.txt"
 
@@ -114,7 +114,7 @@ def poll_ingestion_queue():
 
     jobs = asyncio.run(claim_jobs(limit=10))
     for job in jobs:
-        process_ingestion_job.spawn(job["job_id"])
+        process_ingestion_job.spawn(job["job_id"], job["claimed_attempt"])
 
 
 @app.function(
@@ -127,7 +127,7 @@ def poll_ingestion_queue():
     timeout=1800,
     scaledown_window=300,
 )
-def process_ingestion_job(job_id: str):
+def process_ingestion_job(job_id: str, claimed_attempt: int):
     """Process parsing and persistence on CPU; embeddings use bounded GPU inference."""
     # Set worker-only options before importing Settings; the inference endpoint
     # is the only CUDA resource and the CPU worker requires remote inference.
@@ -152,7 +152,7 @@ def process_ingestion_job(job_id: str):
         _worker_runner = asyncio.Runner()
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    return _worker_runner.run(process_claimed_job(uuid.UUID(job_id)))
+    return _worker_runner.run(process_claimed_job(uuid.UUID(job_id), int(claimed_attempt)))
 
 
 @app.function(
@@ -196,7 +196,9 @@ def prepare_model_cache():
     memory=int(os.getenv("MODAL_INFERENCE_MEMORY_MB", "12288")),
     gpu=INFERENCE_GPU,
     volumes={"/models": READ_ONLY_MODEL_CACHE_VOLUME},
-    timeout=max(60, GPU_WORKER_TIMEOUT),
+    # This is a deploy-time function execution limit. Runtime Secret changes do
+    # not alter an already-deployed Modal function specification.
+    timeout=max(60, GPU_FUNCTION_TIMEOUT),
     scaledown_window=300,
     max_containers=int(os.getenv("MODAL_INFERENCE_MAX_CONTAINERS", "2")),
 )

@@ -24,6 +24,7 @@ from app.services.document_reference import DocumentReferenceResolver
 from app.services.document_summary_service import DocumentSummaryError, DocumentSummaryService
 from fastapi import HTTPException
 from app.llm import get_llm_provider, BaseLLMProvider, LLMError
+from app.llm.base import GenerationResult
 from app.rag.prompt_builder import (
     PromptBuilder,
     ChatMode,
@@ -49,6 +50,18 @@ INSUFFICIENT_EVIDENCE_MESSAGE = (
     "I couldn't find enough information in the uploaded documents or web sources to answer that question confidently. "
     "Please ensure the relevant course materials or notes are uploaded and indexed, or try rephrasing your query."
 )
+SUPPORTED_GENERATION_STATUSES = frozenset(
+    {"completed", "incomplete", "interrupted", "blocked", "failed", "unverified"}
+)
+
+
+def _safe_generation_status(value: Optional[str]) -> str:
+    """Return a persisted status, retaining unknown provider outcomes as unverified."""
+    if value in SUPPORTED_GENERATION_STATUSES:
+        return value
+    if value is not None:
+        logger.warning("Unsupported generation status from provider; recording unverified")
+    return "unverified"
 
 # System instruction used when answering from Tavily web evidence (no document context).
 WEB_FALLBACK_SYSTEM_INSTRUCTION = (
@@ -66,6 +79,29 @@ WEB_FALLBACK_SYSTEM_INSTRUCTION = (
 def web_fallback_system_instruction(query: str) -> str:
     """Apply the same latest-message language policy used by document RAG."""
     return f"{WEB_FALLBACK_SYSTEM_INSTRUCTION}\n\n{response_language_instruction(query)}"
+
+
+def generation_metadata_payload(result) -> dict[str, Any]:
+    """Whitelist operational fields safe to persist and return to chat clients."""
+    return {
+        key: value for key, value in {
+            "finish_reason": result.finish_reason,
+            "candidate_count": result.candidate_count,
+            "prompt_token_count": result.input_tokens,
+            "candidates_token_count": result.output_tokens,
+            "thoughts_token_count": result.thoughts_tokens,
+            "total_token_count": result.total_tokens,
+            "model_version": result.model_version,
+            "response_id": result.response_id,
+            "generation_duration_ms": round(result.generation_duration_ms, 2)
+                if result.generation_duration_ms is not None else None,
+            "time_to_first_token_ms": round(result.time_to_first_token_ms, 2)
+                if result.time_to_first_token_ms is not None else None,
+            "error_type": result.error_type,
+            "error_classification": result.error_classification,
+            "http_status": result.http_status,
+        }.items() if value is not None
+    }
 
 
 class RAGService:
@@ -177,18 +213,18 @@ class RAGService:
         try:
             chat_mode = ChatMode.from_str(chat_mode_str)
         except ValueError as ve:
-            yield f"event: error\ndata: {json.dumps({'error': str(ve)})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': str(ve), 'generation_status': 'failed'})}\n\n"
             return
 
         # 2. Authorize and verify conversation ownership
         conversation = await ConversationService.get_conversation(db, conversation_id, user_id)
         if not conversation:
-            yield f"event: error\ndata: {json.dumps({'error': 'Conversation not found or unauthorized.'})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Conversation not found or unauthorized.', 'generation_status': 'failed'})}\n\n"
             return
 
         conv_workspace_id = conversation.workspace_id
         if workspace_id and workspace_id != conv_workspace_id:
-            yield f"event: error\ndata: {json.dumps({'error': 'Specified workspace does not match conversation.'})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Specified workspace does not match conversation.', 'generation_status': 'failed'})}\n\n"
             return
 
         logger.info(
@@ -224,16 +260,17 @@ class RAGService:
                 history=[m for m in history_records if m.id != user_msg.id],
             )
         except HTTPException as exc:
-            yield f"event: error\ndata: {json.dumps({'error': exc.detail})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': exc.detail, 'generation_status': 'failed'})}\n\n"
             return
         if resolution.message:
             # Clarifications and actual processing states use the normal persistence/SSE contract.
             asst_msg = await ConversationService.create_message(
                 db=db, conversation_id=conversation_id, user_id=user_id,
                 data=MessageCreate(role="assistant", content=resolution.message, citations=[]),
+                generation_status="completed",
             )
             yield f"event: token\ndata: {json.dumps({'token': resolution.message})}\n\n"
-            yield f"event: done\ndata: {json.dumps({'message_id': str(asst_msg.id), 'content': resolution.message, 'citations': [], 'has_sufficient_evidence': False})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'message_id': str(asst_msg.id), 'content': resolution.message, 'citations': [], 'has_sufficient_evidence': False, 'generation_status': 'completed'})}\n\n"
             return
 
         if summary_intent.is_summary and summary_intent.whole_document and resolution.document:
@@ -254,7 +291,7 @@ class RAGService:
                     resolution.document.id,
                     str(exc),
                 )
-                yield f"event: error\ndata: {json.dumps({'error': 'The complete document summary could not be produced. Please try a narrower request or retry later.'})}\n\n"
+                yield f"event: error\ndata: {json.dumps({'error': 'The complete document summary could not be produced. Please try a narrower request or retry later.', 'generation_status': 'failed'})}\n\n"
                 return
 
             summary_text, output_was_guarded = guard_generated_output(
@@ -280,6 +317,7 @@ class RAGService:
                     content=normalized_content,
                     citations=citations_payload,
                 ),
+                generation_status="completed",
             )
 
             for safe_chunk in chunk_validated_output(normalized_content):
@@ -289,6 +327,7 @@ class RAGService:
                 "content": normalized_content,
                 "citations": citations_payload,
                 "has_sufficient_evidence": True,
+                "generation_status": "completed",
                 "summary": {
                     "scope": "whole_document",
                     "document_id": str(resolution.document.id),
@@ -317,7 +356,7 @@ class RAGService:
             )
         except Exception as e:
             logger.error("Retrieval failed during chat for conversation %s: %s", conversation_id, e)
-            yield f"event: error\ndata: {json.dumps({'error': 'Failed to retrieve document evidence.'})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Failed to retrieve document evidence.', 'generation_status': 'failed'})}\n\n"
             return
 
         retrieval_duration_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 2)
@@ -439,16 +478,16 @@ class RAGService:
                         type(wse).__name__,
                         wse.message,
                     )
-                    yield f"event: error\ndata: {json.dumps({'error': f'Web search failed: {wse.message}'})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': f'Web search failed: {wse.message}', 'generation_status': 'failed'})}\n\n"
                     return
                 except Exception as e:
                     logger.error("[Phase 9] Unexpected Tavily error: %s", e, exc_info=True)
-                    yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web search.'})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web search.', 'generation_status': 'failed'})}\n\n"
                     return
 
                 if not tavily_results:
                     logger.warning("[Phase 9] Tavily returned zero results — cannot answer from web.")
-                    yield f"event: error\ndata: {json.dumps({'error': INSUFFICIENT_EVIDENCE_MESSAGE})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': INSUFFICIENT_EVIDENCE_MESSAGE, 'generation_status': 'failed'})}\n\n"
                     return
 
                 # 2. Build bounded web context for Gemini (capped at WEB_SEARCH_MAX_SOURCES)
@@ -483,42 +522,47 @@ class RAGService:
 
                 yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Formulating answer...'})}\n\n"
 
-                # 4. Stream tokens from existing generate_stream() — NO native grounding
+                # 4. Consume Gemini's metadata-aware stream — NO native grounding
                 provider = llm_provider or get_llm_provider()
-                accumulated_tokens: List[str] = []
                 generation_started = time.perf_counter()
                 llm_ttft_ms = None
                 web_system_instruction = web_fallback_system_instruction(query)
                 try:
-                    async for token in provider.generate_stream(
+                    generation_result = await provider.generate_stream_with_metadata(
                         prompt=web_prompt,
                         system_instruction=web_system_instruction,
-                    ):
-                        if token:
-                            if llm_ttft_ms is None:
-                                llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
-                            accumulated_tokens.append(token)
-                    logger.info(
-                        "[Phase 9] Tavily-grounded stream completed. tokens=%d",
-                        len(accumulated_tokens),
+                        max_output_tokens=settings.CHAT_MAX_OUTPUT_TOKENS,
                     )
+                    llm_ttft_ms = generation_result.time_to_first_token_ms
                 except LLMError as le:
                     logger.error(
                         "[Phase 9] LLM generation FAILED after Tavily search (LLMError=%s): %s",
                         type(le).__name__,
                         le.message,
                     )
-                    yield f"event: error\ndata: {json.dumps({'error': 'Web-grounded response generation failed. Please try again.'})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': 'Web-grounded response generation failed. Please try again.', 'generation_status': 'failed'})}\n\n"
                     return
                 except Exception as e:
                     logger.error("[Phase 9] Unexpected error in web-grounded LLM streaming: %s", e, exc_info=True)
-                    yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web-grounded response generation.'})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during web-grounded response generation.', 'generation_status': 'failed'})}\n\n"
                     return
                 generation_ms = (time.perf_counter() - generation_started) * 1000
+                completion_status = _safe_generation_status(generation_result.generation_status)
+                metadata_payload = generation_metadata_payload(generation_result)
+                logger.info("chat_generation_metrics %s", json.dumps({
+                    "generation_status": completion_status,
+                    **metadata_payload,
+                }, separators=(",", ":")))
 
-                full_raw_text = "".join(accumulated_tokens).strip()
+                full_raw_text = generation_result.text.strip()
+                if completion_status == "blocked":
+                    full_raw_text = "I couldn't provide that response because it was blocked by the safety system."
                 if not full_raw_text:
-                    full_raw_text = INSUFFICIENT_EVIDENCE_MESSAGE
+                    full_raw_text = (
+                        "The response was cut off before any answer text was produced. Please try again."
+                        if completion_status in {"incomplete", "interrupted", "unverified"}
+                        else INSUFFICIENT_EVIDENCE_MESSAGE
+                    )
                 full_raw_text, output_was_guarded = guard_generated_output(
                     full_raw_text, web_system_instruction, detect_response_language(query)
                 )
@@ -544,6 +588,8 @@ class RAGService:
                         content=full_raw_text,
                         citations=[],
                     ),
+                    generation_status=completion_status,
+                    generation_metadata=metadata_payload,
                 )
 
                 # Stream only after output validation so the displayed text is
@@ -564,7 +610,8 @@ class RAGService:
                     total_request_latency_ms=total_elapsed_ms,
                 )
                 logger.info(
-                    "[Phase 9] Tavily-grounded generation completed in %.2fms: %d web sources, msg=%s",
+                    "[Phase 9] Tavily-grounded generation finalized outcome=%s in %.2fms: %d web sources, msg=%s",
+                    completion_status,
                     total_elapsed_ms,
                     len(web_citations),
                     asst_msg.id,
@@ -577,11 +624,17 @@ class RAGService:
                     "web_sources": web_citations_payload,
                     "has_sufficient_evidence": False,
                     "used_web_fallback": True,
+                    "generation_status": completion_status,
+                    "generation_metadata": metadata_payload,
                     "routing_path": retrieval_response.routing_path,
                     "total_elapsed_ms": total_elapsed_ms,
                     "stage_metrics": stage_metrics,
                 }
-                yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+                if completion_status == "failed":
+                    done_payload["error"] = "Web-grounded response generation failed. Please try again."
+                    yield f"event: error\ndata: {json.dumps(done_payload)}\n\n"
+                else:
+                    yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
                 return
 
             # --- No web fallback (disabled): emit deterministic message ---
@@ -595,6 +648,7 @@ class RAGService:
                 conversation_id=conversation_id,
                 user_id=user_id,
                 data=MessageCreate(role="assistant", content=fallback_text, citations=[]),
+                generation_status="completed",
             )
 
             total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
@@ -614,6 +668,7 @@ class RAGService:
                 "citations": [],
                 "web_sources": [],
                 "has_sufficient_evidence": False,
+                "generation_status": "completed",
                 "routing_path": retrieval_response.routing_path,
                 "total_elapsed_ms": total_elapsed_ms,
                 "stage_metrics": stage_metrics,
@@ -665,43 +720,61 @@ class RAGService:
 
         # 9. Invoke LLM streaming
         provider = llm_provider or get_llm_provider()
-        accumulated_tokens: List[str] = []
         generation_started = time.perf_counter()
         llm_ttft_ms = None
-
-        async def response_tokens():
-            if solver_result is not None and solver_result.success and chat_mode != ChatMode.FULL_SOLUTION:
-                # Hint-only output is enforced before any token reaches the client.
-                yield await generate_guidance(provider, assembled, solver_result, chat_mode, query)
-                return
-            if solver_result is not None and not solver_result.success:
-                yield "Calculation verification was unavailable. "
-            async for token in provider.generate_stream(
-                prompt=assembled.prompt, system_instruction=assembled.system_instruction,
-            ):
-                yield token
-            if solver_result is not None and solver_result.success:
-                yield "\n\n" + verified_final(solver_result)
-                if solver_result.notes:
-                    yield "\n" + " ".join(solver_result.notes)
-
         try:
-            async for token in response_tokens():
-                if token:
-                    if llm_ttft_ms is None:
-                        llm_ttft_ms = (time.perf_counter() - generation_started) * 1000
-                    accumulated_tokens.append(token)
+            if solver_result is not None and solver_result.success and chat_mode != ChatMode.FULL_SOLUTION:
+                # The public answer is deterministic vetted guidance. An invalid,
+                # incomplete, or unverified internal selection uses that fallback.
+                guidance = await generate_guidance(provider, assembled, solver_result, chat_mode, query)
+                generation_result = GenerationResult(
+                    text=guidance, generation_status="completed", finish_reason="DETERMINISTIC",
+                )
+            else:
+                generation_result = await provider.generate_stream_with_metadata(
+                    prompt=assembled.prompt, system_instruction=assembled.system_instruction,
+                    max_output_tokens=settings.CHAT_MAX_OUTPUT_TOKENS,
+                )
+                if solver_result is not None and not solver_result.success:
+                    generation_result = type(generation_result)(
+                        **{**generation_result.__dict__,
+                           "text": "Calculation verification was unavailable. " + generation_result.text}
+                    )
+                # A verified deterministic result is supplemental only when the
+                # generated explanation has a confirmed normal STOP.
+                if solver_result is not None and solver_result.success \
+                        and generation_result.generation_status == "completed":
+                    suffix = "\n\n" + verified_final(solver_result)
+                    if solver_result.notes:
+                        suffix += "\n" + " ".join(solver_result.notes)
+                    generation_result = type(generation_result)(
+                        **{**generation_result.__dict__, "text": generation_result.text + suffix}
+                    )
+            llm_ttft_ms = generation_result.time_to_first_token_ms
         except LLMError as le:
             logger.error("LLM generation provider error: %s", le.message)
-            yield f"event: error\ndata: {json.dumps({'error': 'Response generation failed. Please try again.'})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Response generation failed. Please try again.', 'generation_status': 'failed'})}\n\n"
             return
         except Exception as e:
             logger.error("Unexpected error during LLM streaming: %s", e, exc_info=True)
-            yield f"event: error\ndata: {json.dumps({'error': 'An error occurred during response generation.'})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'An error occurred during response generation.', 'generation_status': 'failed'})}\n\n"
             return
         generation_ms = (time.perf_counter() - generation_started) * 1000
-
-        full_raw_text = "".join(accumulated_tokens).strip()
+        completion_status = _safe_generation_status(generation_result.generation_status)
+        metadata_payload = generation_metadata_payload(generation_result)
+        logger.info("chat_generation_metrics %s", json.dumps({
+            "generation_status": completion_status,
+            **metadata_payload,
+        }, separators=(",", ":")))
+        full_raw_text = generation_result.text.strip()
+        if completion_status == "blocked":
+            full_raw_text = "I couldn't provide that response because it was blocked by the safety system."
+        if not full_raw_text:
+            full_raw_text = (
+                "The response was cut off before any answer text was produced. Please try again."
+                if completion_status in {"incomplete", "interrupted", "unverified"}
+                else "The response could not be generated. Please try again."
+            )
         full_raw_text, output_was_guarded = guard_generated_output(
             full_raw_text, assembled.system_instruction, detect_response_language(query)
         )
@@ -713,7 +786,7 @@ class RAGService:
             text=full_raw_text,
             sources=assembled.sources,
         )
-        if output_was_guarded:
+        if output_was_guarded or completion_status == "blocked":
             citations = []
             normalized_content = full_raw_text
         citations_payload = [c.to_dict() for c in citations]
@@ -728,6 +801,8 @@ class RAGService:
                 content=normalized_content,
                 citations=citations_payload,
             ),
+            generation_status=completion_status,
+            generation_metadata=metadata_payload,
         )
 
         # Citation normalization and output validation are complete before any
@@ -748,7 +823,8 @@ class RAGService:
             total_request_latency_ms=total_elapsed_ms,
         )
         logger.info(
-            "RAG generation completed successfully in %.2fms: %d citations, msg=%s",
+            "RAG generation finalized outcome=%s in %.2fms: %d citations, msg=%s",
+            completion_status,
             total_elapsed_ms,
             len(citations),
             asst_msg.id,
@@ -763,10 +839,16 @@ class RAGService:
             "routing_path": retrieval_response.routing_path,
             "total_elapsed_ms": total_elapsed_ms,
             "stage_metrics": stage_metrics,
+            "generation_status": completion_status,
+            "generation_metadata": metadata_payload,
         }
         if solver_metadata is not None:
             done_payload["solver"] = solver_metadata.model_dump()
-        yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+        if completion_status == "failed":
+            done_payload["error"] = "Response generation failed. Please try again."
+            yield f"event: error\ndata: {json.dumps(done_payload)}\n\n"
+        else:
+            yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
 
     @classmethod
     async def generate_chat(
@@ -787,6 +869,8 @@ class RAGService:
         message_id: Optional[str] = None
         has_evidence = False
         solver_metadata = None
+        generation_status = None
+        generation_metadata = None
 
         async for event_chunk in cls.stream_chat(
             db=db,
@@ -811,6 +895,8 @@ class RAGService:
                             citations = data.get("citations", [])
                             has_evidence = data.get("has_sufficient_evidence", False)
                             solver_metadata = data.get("solver")
+                            generation_status = data.get("generation_status")
+                            generation_metadata = data.get("generation_metadata")
                         elif "error" in data:
                             raise RuntimeError(data["error"])
                     except json.JSONDecodeError:
@@ -822,4 +908,6 @@ class RAGService:
             "citations": citations,
             "has_sufficient_evidence": has_evidence,
             "solver": solver_metadata,
+            "generation_status": generation_status,
+            "generation_metadata": generation_metadata,
         }
