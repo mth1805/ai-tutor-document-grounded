@@ -1,6 +1,7 @@
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, SmallInteger
 
-from app.models.chat_generation_run import ChatGenerationRun
+from app.models.chat_generation_run import ChatGenerationContextSnapshot, ChatGenerationRun
+from app.models.conversation import Conversation
 
 
 def test_chat_generation_run_metadata_maps_nullable_timezone_aware_finished_at():
@@ -45,3 +46,13 @@ def test_chat_generation_run_metadata_maps_all_migration_columns():
     }
 
     assert set(ChatGenerationRun.__table__.columns.keys()) == expected_columns
+
+
+def test_chat_generation_context_snapshot_maps_private_migration_columns():
+    expected = {
+        "generation_id", "snapshot_version", "snapshot_payload", "canonical_snapshot",
+        "context_hash", "canonical_byte_count", "jsonb_rendered_byte_count", "created_at",
+    }
+    assert set(ChatGenerationContextSnapshot.__table__.columns.keys()) == expected
+    assert isinstance(ChatGenerationContextSnapshot.__table__.c.snapshot_version.type, SmallInteger)
+    assert Conversation.__table__.c.conversation_version.type.python_type is int

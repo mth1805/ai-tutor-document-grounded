@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, CHAR, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, CHAR, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, SmallInteger, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -74,4 +74,19 @@ class ChatGenerationSubscriber(Base):
     subscriber_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_checkpoint_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ChatGenerationContextSnapshot(Base):
+    __tablename__ = "chat_generation_context_snapshots"
+
+    generation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_generation_runs.generation_id", ondelete="CASCADE"), primary_key=True
+    )
+    snapshot_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    snapshot_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    canonical_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    context_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    canonical_byte_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    jsonb_rendered_byte_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

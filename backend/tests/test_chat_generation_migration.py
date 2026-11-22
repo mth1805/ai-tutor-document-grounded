@@ -4,6 +4,7 @@ The live-database test is opt-in and refuses to run without the same explicit
 disposable-target confirmations as the existing RLS integration suite.
 """
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -21,7 +22,29 @@ from tests.test_rls_context import _validate_rls_test_target
 MIGRATIONS = (
     "20261121140000_add_chat_generation_run_lifecycle.sql",
     "20261122150000_harden_chat_generation_worker_fencing.sql",
+    "20261122170000_add_immutable_chat_generation_context_snapshots.sql",
 )
+
+
+def _generation_snapshot(content: str, mode: str = "Detailed Guidance") -> dict:
+    return {
+        "original_request": content,
+        "normalized_mode": mode,
+        "workspace_id": None,
+        "selected_document_ids": [],
+        "history": [],
+        "resolved_document_references": {},
+        "generation_path": "document",
+        "system_instruction": "Captured system instruction",
+        "prompt_plan": [{"stage": "final", "prompt": "Captured prompt", "max_output_tokens": 8192}],
+        "evidence": [],
+        "routing_decisions": {},
+        "citation_sources": [],
+        "web_results": [],
+        "solver_output": None,
+        "whole_document_source_chunks": [],
+        "whole_document_summary_plan": None,
+    }
 
 
 async def _as_role(connection, role: str, user_id: uuid.UUID | None = None) -> None:
@@ -38,25 +61,42 @@ async def _as_role(connection, role: str, user_id: uuid.UUID | None = None) -> N
 
 
 async def _create_generation(connection, schema: str, *, generation_id, conversation_id,
-                             user_id, fingerprint: str | None = None, content="question"):
+                             user_id, content="question"):
+    version = await connection.scalar(text(
+        f'SELECT conversation_version FROM "{schema}".conversations WHERE id=:id'
+    ), {"id": conversation_id})
+    snapshot = _generation_snapshot(content)
+    canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    request = {
+        "content": content, "mode": "Detailed Guidance", "workspace_id": None,
+        "document_id": None, "active_document_id": None,
+    }
+    canonical_request = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return (await connection.execute(text(f"""
-        SELECT * FROM "{schema}".create_chat_generation(
-            :generation_id, :conversation_id, :user_id, :fingerprint, :content,
-            'detailed', NULL, NULL, NULL
+        SELECT * FROM "{schema}".create_chat_generation_with_snapshot(
+            :generation_id, :conversation_id, :user_id, :expected_version,
+            :fingerprint, :content, :mode, NULL, NULL, NULL, 1::smallint,
+            CAST(:snapshot AS jsonb), :context_hash, :canonical_snapshot, :canonical_request
         )
     """), {
         "generation_id": generation_id,
         "conversation_id": conversation_id,
         "user_id": user_id,
-        "fingerprint": fingerprint or uuid.uuid4().hex * 2,
+        "expected_version": version,
+        "fingerprint": hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
         "content": content,
+        "mode": "Detailed Guidance",
+        "snapshot": canonical,
+        "canonical_snapshot": canonical,
+        "canonical_request": canonical_request,
+        "context_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     })).one()
 
 
-async def _insert_conversation(connection, schema: str, conversation_id, user_id) -> None:
+async def _insert_conversation(connection, schema: str, conversation_id, user_id, workspace_id=None) -> None:
     await connection.execute(
-        text(f'INSERT INTO "{schema}".conversations (id, user_id) VALUES (:id, :uid)'),
-        {"id": conversation_id, "uid": user_id},
+        text(f'INSERT INTO "{schema}".conversations (id, user_id, workspace_id) VALUES (:id, :uid, :wid)'),
+        {"id": conversation_id, "uid": user_id, "wid": workspace_id},
     )
 
 
@@ -65,10 +105,14 @@ def _assert_active_generation_conflict(error: DBAPIError) -> None:
     assert error.orig.__cause__.message == "ACTIVE_GENERATION_EXISTS"
 
 
-async def _wait_for_lock_waiter(engine, application_name: str, timeout: float = 5.0) -> None:
+async def _wait_for_lock_waiter(engine, application_name: str, timeout: float = 5.0,
+                               task: asyncio.Task | None = None) -> None:
     """Wait until the named test connection is demonstrably blocked on a DB lock."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if task is not None and task.done():
+            result = task.result()  # Propagate the RPC error instead of masking it as a lock timeout.
+            raise AssertionError(f"database RPC completed before acquiring the expected lock: {result!r}")
         async with engine.connect() as monitor:
             row = (await monitor.execute(text("""
                 SELECT wait_event_type, cardinality(pg_blocking_pids(pid))
@@ -77,7 +121,21 @@ async def _wait_for_lock_waiter(engine, application_name: str, timeout: float = 
         if row is not None and row[0] == "Lock" and row[1] > 0:
             return
         await asyncio.sleep(0.02)
+    if task is not None and task.done():
+        result = task.result()
+        raise AssertionError(f"database RPC completed before acquiring the expected lock: {result!r}")
     raise AssertionError(f"database RPC did not block on the generation row lock: {application_name}")
+
+
+@pytest.mark.asyncio
+async def test_lock_wait_helper_surfaces_competing_rpc_errors():
+    async def fail_rpc():
+        raise RuntimeError("underlying RPC failure")
+
+    task = asyncio.create_task(fail_rpc())
+    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="underlying RPC failure"):
+        await _wait_for_lock_waiter(None, "test-rpc", task=task)
 
 
 async def _create_claimed_generation(engine, schema: str, owner: uuid.UUID):
@@ -101,7 +159,8 @@ async def _create_claimed_generation(engine, schema: str, owner: uuid.UUID):
 
 
 async def _start_competing_rpc(engine, application_name: str, sql: str, params: dict,
-                               role: str = "service_role", user_id=None):
+                               role: str = "service_role", user_id=None,
+                               task_registry: set[asyncio.Task] | None = None):
     started = asyncio.Event()
 
     async def run():
@@ -126,9 +185,11 @@ async def _start_competing_rpc(engine, application_name: str, sql: str, params: 
                 raise
 
     task = asyncio.create_task(run())
+    if task_registry is not None:
+        task_registry.add(task)
     await started.wait()
     try:
-        await _wait_for_lock_waiter(engine, application_name)
+        await _wait_for_lock_waiter(engine, application_name, task=task)
     except BaseException:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -155,13 +216,30 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
     other_owner = uuid.uuid4()
     conversation_id = uuid.uuid4()
     other_conversation_id = uuid.uuid4()
+    writer = None
+    writer_tx = None
+    acceptance_task = None
+    competing_tasks: set[asyncio.Task] = set()
 
     try:
         async with engine.begin() as connection:
             await connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
             await connection.exec_driver_sql(f'GRANT USAGE ON SCHEMA "{schema}" TO authenticated, service_role')
             await connection.exec_driver_sql(f'''CREATE TABLE "{schema}".conversations (
+                id uuid PRIMARY KEY, user_id uuid NOT NULL, workspace_id uuid
+            )''')
+            await connection.exec_driver_sql(f'''CREATE TABLE "{schema}".workspaces (
                 id uuid PRIMARY KEY, user_id uuid NOT NULL
+            )''')
+            await connection.exec_driver_sql(f'''CREATE TABLE "{schema}".documents (
+                id uuid PRIMARY KEY, workspace_id uuid NOT NULL, user_id uuid NOT NULL,
+                original_filename text NOT NULL
+            )''')
+            await connection.exec_driver_sql(f'''CREATE TABLE "{schema}".document_chunks (
+                id uuid PRIMARY KEY, document_id uuid NOT NULL, workspace_id uuid NOT NULL,
+                user_id uuid NOT NULL, content text NOT NULL,
+                page_number_start integer NOT NULL, page_number_end integer NOT NULL,
+                token_count integer NOT NULL DEFAULT 0
             )''')
             await connection.exec_driver_sql(f'''CREATE TABLE "{schema}".messages (
                 id uuid PRIMARY KEY, conversation_id uuid NOT NULL
@@ -193,6 +271,11 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
             await connection.exec_driver_sql(f'GRANT SELECT ON "{schema}".messages TO authenticated')
             await connection.exec_driver_sql(f'GRANT INSERT, DELETE ON "{schema}".messages TO authenticated')
             await connection.exec_driver_sql(f'GRANT SELECT, INSERT ON "{schema}".messages TO service_role')
+            conversation_read_boundary = (await connection.execute(text('''
+                SELECT has_table_privilege('authenticated', :table_name, 'SELECT'),
+                       has_table_privilege('service_role', :table_name, 'SELECT')
+            '''), {"table_name": f'"{schema}".conversations'})).one()
+            assert conversation_read_boundary == (True, False)
             await connection.execute(text(f'''INSERT INTO "{schema}".conversations(id,user_id)
                 VALUES (:c1,:u1),(:c2,:u2)'''), {"c1": conversation_id, "u1": owner,
                                                  "c2": other_conversation_id, "u2": other_owner})
@@ -207,21 +290,648 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
 
         # Run.state is the sole status source; no shadow terminal_status field.
         async with engine.begin() as connection:
+            acceptance_signatures = (await connection.execute(text('''
+                SELECT p.pronargs, ARRAY(
+                    SELECT format_type(arg_type, NULL)
+                      FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS args(arg_type, arg_position)
+                     ORDER BY arg_position
+                )
+                  FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                 WHERE n.nspname=:schema AND p.proname='create_chat_generation_with_snapshot'
+            '''), {"schema": schema})).all()
+            assert acceptance_signatures == [(
+                15,
+                ["uuid", "uuid", "uuid", "bigint", "text", "text", "text",
+                 "uuid", "uuid", "uuid", "smallint", "jsonb", "text", "text", "text"],
+            )]
+
             terminal_status_column = await connection.scalar(text('''SELECT count(*) FROM information_schema.columns
                 WHERE table_schema=:schema AND table_name='chat_generation_runs' AND column_name='terminal_status' '''),
                 {"schema": schema})
             assert terminal_status_column == 0
+            snapshot_access = (await connection.execute(text('''
+                SELECT c.relrowsecurity,
+                       has_table_privilege('authenticated', c.oid, 'SELECT'),
+                       has_table_privilege('anon', c.oid, 'SELECT'),
+                       has_table_privilege('service_role', c.oid, 'SELECT')
+                  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                 WHERE n.nspname=:schema AND c.relname='chat_generation_context_snapshots'
+            '''), {"schema": schema})).one()
+            assert snapshot_access == (True, False, False, False)
+            snapshot_reader_acl = (await connection.execute(text('''
+                SELECT has_function_privilege('service_role', p.oid, 'EXECUTE'),
+                       has_function_privilege('authenticated', p.oid, 'EXECUTE'),
+                       has_function_privilege('anon', p.oid, 'EXECUTE'),
+                       p.prosecdef, p.proconfig
+                  FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                 WHERE n.nspname=:schema AND p.proname='read_chat_generation_context_snapshot'
+            '''), {"schema": schema})).one()
+            assert snapshot_reader_acl[0:4] == (True, False, False, True)
+            assert any("search_path=pg_catalog, public, pg_temp" in item
+                       for item in snapshot_reader_acl[4])
+            worker_claim_paths = (await connection.execute(text('''
+                SELECT p.proconfig
+                  FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                 WHERE n.nspname=:schema AND p.proname='claim_chat_generation_worker'
+                 ORDER BY p.pronargs
+            '''), {"schema": schema})).scalars().all()
+            assert len(worker_claim_paths) == 2
+            assert all(any("search_path=pg_catalog, public, pg_temp" in setting
+                           for setting in path) for path in worker_claim_paths)
+
+        # Every message write path advances the monotonic conversation version.
+        version_conversation = uuid.uuid4()
+        version_message = uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, version_conversation, owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            assert await connection.scalar(text(
+                f'SELECT conversation_version FROM "{schema}".conversations WHERE id=:id'
+            ), {"id": version_conversation}) == 0
+            await connection.execute(text(f'''INSERT INTO "{schema}".messages(
+                id,conversation_id,role,content) VALUES (:mid,:cid,'user','version one')'''),
+                {"mid": version_message, "cid": version_conversation})
+        async with engine.begin() as connection:
+            inspection_context = (await connection.execute(text('''
+                SELECT current_user = session_user,
+                       has_table_privilege(current_user, :table_name, 'SELECT')
+            '''), {"table_name": f'"{schema}".conversations'})).one()
+            assert inspection_context == (True, True)
+            assert await connection.scalar(text(
+                f'SELECT conversation_version FROM "{schema}".conversations WHERE id=:id'
+            ), {"id": version_conversation}) == 1
+        async with engine.begin() as connection:
+            await connection.execute(text(f'''UPDATE "{schema}".messages
+                SET content='version two' WHERE id=:id'''), {"id": version_message})
+        async with engine.begin() as connection:
+            assert await connection.scalar(text(
+                f'SELECT conversation_version FROM "{schema}".conversations WHERE id=:id'
+            ), {"id": version_conversation}) == 2
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            await connection.execute(text(f'DELETE FROM "{schema}".messages WHERE id=:id'),
+                                     {"id": version_message})
+        async with engine.begin() as connection:
+            assert await connection.scalar(text(
+                f'SELECT conversation_version FROM "{schema}".conversations WHERE id=:id'
+            ), {"id": version_conversation}) == 3
+
+        # Moving a message bumps the old and new conversation versions.
+        move_source, move_target, move_message = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, move_source, owner)
+            await _insert_conversation(connection, schema, move_target, owner)
+            await connection.execute(text(f'''INSERT INTO "{schema}".messages(
+                id,conversation_id,role,content) VALUES (:mid,:cid,'user','move me')'''),
+                {"mid": move_message, "cid": move_source})
+        async with engine.begin() as connection:
+            await connection.execute(text(f'''UPDATE "{schema}".messages
+                SET conversation_id=:target WHERE id=:mid'''),
+                {"target": move_target, "mid": move_message})
+        async with engine.begin() as connection:
+            versions = (await connection.execute(text(f'''SELECT id,conversation_version
+                FROM "{schema}".conversations WHERE id IN (:source,:target) ORDER BY id'''),
+                {"source": move_source, "target": move_target})).all()
+            version_by_id = {row.id: row.conversation_version for row in versions}
+            assert version_by_id == {move_source: 2, move_target: 1}
+
+        # A message transaction that owns the conversation row first makes the
+        # competing acceptance block, then fail stale after that writer commits.
+        version_race_conversation, race_message = uuid.uuid4(), uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, version_race_conversation, owner)
+        writer = await engine.connect()
+        writer_tx = await writer.begin()
+        await _as_role(writer, "authenticated", owner)
+        await writer.execute(text(f'''INSERT INTO "{schema}".messages(
+            id,conversation_id,role,content) VALUES (:mid,:cid,'user','racing write')'''),
+            {"mid": race_message, "cid": version_race_conversation})
+        accepted_started = asyncio.Event()
+        application_name = f"snapshot_accept_race_{uuid.uuid4().hex}"
+
+        async def accept_during_write():
+            async with engine.connect() as connection:
+                transaction = await connection.begin()
+                try:
+                    await _as_role(connection, "authenticated", owner)
+                    await connection.execute(text("SELECT set_config('application_name', :name, true)"),
+                                             {"name": application_name})
+                    accepted_started.set()
+                    result = await _create_generation(connection, schema,
+                        generation_id=uuid.uuid4(), conversation_id=version_race_conversation,
+                        user_id=owner, content="racing generation")
+                    await transaction.commit()
+                    return result
+                except BaseException:
+                    await transaction.rollback()
+                    raise
+
+        acceptance_task = asyncio.create_task(accept_during_write())
+        await accepted_started.wait()
+        await _wait_for_lock_waiter(engine, application_name, task=acceptance_task)
+        await writer_tx.commit()
+        await writer.close()
+        with pytest.raises(DBAPIError) as stale_race:
+            await acceptance_task
+        assert stale_race.value.orig.sqlstate == "40001"
+        async with engine.begin() as connection:
+            assert await connection.scalar(text(f'''SELECT conversation_version
+                FROM "{schema}".conversations WHERE id=:id'''),
+                {"id": version_race_conversation}) == 1
+            assert await connection.scalar(text(f'''SELECT count(*) FROM "{schema}".chat_generation_runs
+                WHERE conversation_id=:id'''), {"id": version_race_conversation}) == 0
+            assert await connection.scalar(text(f'''SELECT count(*) FROM "{schema}".messages
+                WHERE conversation_id=:id'''), {"id": version_race_conversation}) == 1
+
+        # Authenticated acceptance cannot substitute another workspace or
+        # document, nor attach evidence whose chunk is not the stored source.
+        secured_workspace, other_workspace = uuid.uuid4(), uuid.uuid4()
+        owned_document, foreign_document = uuid.uuid4(), uuid.uuid4()
+        evidence_chunk = uuid.uuid4()
+        workspace_conversation = uuid.uuid4()
+        async with engine.begin() as connection:
+            await connection.execute(text(f'''INSERT INTO "{schema}".workspaces(id,user_id)
+                VALUES (:w1,:owner),(:w2,:other)'''), {
+                "w1": secured_workspace, "w2": other_workspace, "owner": owner, "other": other_owner,
+            })
+            await connection.execute(text(f'''INSERT INTO "{schema}".documents(
+                id,workspace_id,user_id,original_filename) VALUES
+                (:owned,:workspace,:owner,'owned.pdf'),(:foreign,:workspace,:other,'foreign.pdf')'''), {
+                "owned": owned_document, "foreign": foreign_document,
+                "workspace": secured_workspace, "owner": owner, "other": other_owner,
+            })
+            await connection.execute(text(f'''INSERT INTO "{schema}".document_chunks(
+                id,document_id,workspace_id,user_id,content,page_number_start,page_number_end,token_count)
+                VALUES (:id,:doc,:workspace,:owner,'Stored evidence',4,4,2)'''), {
+                "id": evidence_chunk, "doc": owned_document,
+                "workspace": secured_workspace, "owner": owner,
+            })
+            await _insert_conversation(connection, schema, workspace_conversation, owner, secured_workspace)
+
+        def acceptance_payload(doc_id, *, chunk_id=None, evidence=False, workspace_id=secured_workspace,
+                               content="secure snapshot request", system_instruction=None,
+                               snapshot_overrides=None):
+            snapshot = _generation_snapshot(content)
+            snapshot["workspace_id"] = str(workspace_id) if workspace_id else None
+            snapshot["selected_document_ids"] = [str(doc_id)] if doc_id else []
+            if system_instruction is not None:
+                snapshot["system_instruction"] = system_instruction
+            if evidence:
+                snapshot["evidence"] = [{
+                    "source_index": 1, "document_id": str(doc_id), "document_name": "owned.pdf",
+                    "chunk_id": str(chunk_id), "page_start": 4, "page_end": 4,
+                    "content": "Stored evidence",
+                }]
+                snapshot["citation_sources"] = [{
+                    "source_index": 1, "document_id": str(doc_id), "document_name": "owned.pdf",
+                    "chunk_id": str(chunk_id), "page_start": 4, "page_end": 4,
+                }]
+            if snapshot_overrides:
+                snapshot.update(snapshot_overrides)
+            canonical_snapshot = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            identity = {
+                "content": content, "mode": "Detailed Guidance",
+                "workspace_id": str(workspace_id) if workspace_id else None,
+                "document_id": str(doc_id) if doc_id else None, "active_document_id": None,
+            }
+            canonical_request = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            return content, canonical_snapshot, canonical_request
+
+        async def attempt_protected_accept(connection, *, conversation, workspace, doc_id, chunk_id=None,
+                                           evidence=False, corrupt_hash=False, corrupt_fingerprint=False,
+                                           content="secure snapshot request", system_instruction=None,
+                                           snapshot_overrides=None, generation_id=None):
+            content, canonical_snapshot, canonical_request = acceptance_payload(
+                doc_id, chunk_id=chunk_id, evidence=evidence, workspace_id=workspace,
+                content=content, system_instruction=system_instruction,
+                snapshot_overrides=snapshot_overrides,
+            )
+            version = await connection.scalar(text(f'''SELECT conversation_version FROM
+                "{schema}".conversations WHERE id=:id'''), {"id": conversation})
+            fingerprint = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+            digest = hashlib.sha256(canonical_snapshot.encode("utf-8")).hexdigest()
+            if corrupt_hash:
+                digest = "0" * 64 if digest != "0" * 64 else "1" * 64
+            if corrupt_fingerprint:
+                fingerprint = "0" * 64 if fingerprint != "0" * 64 else "1" * 64
+            return await connection.execute(text(f'''SELECT * FROM "{schema}".create_chat_generation_with_snapshot(
+                :gid,:cid,:uid,:version,:fingerprint,:content,'Detailed Guidance',:workspace,:doc,NULL,1::smallint,
+                CAST(:snapshot AS jsonb),:digest,:canonical_snapshot,:canonical_request)'''), {
+                "gid": generation_id or uuid.uuid4(), "cid": conversation, "uid": owner, "version": version,
+                "fingerprint": fingerprint, "content": content, "workspace": workspace, "doc": doc_id,
+                "snapshot": canonical_snapshot, "digest": digest,
+                "canonical_snapshot": canonical_snapshot, "canonical_request": canonical_request,
+            })
+
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            with pytest.raises(DBAPIError) as wrong_workspace:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(connection, conversation=workspace_conversation,
+                        workspace=other_workspace, doc_id=owned_document)
+            assert wrong_workspace.value.orig.sqlstate == "42501"
+            with pytest.raises(DBAPIError) as foreign_doc:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(connection, conversation=workspace_conversation,
+                        workspace=secured_workspace, doc_id=foreign_document)
+            assert foreign_doc.value.orig.sqlstate == "42501"
+            with pytest.raises(DBAPIError) as foreign_chunk:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(connection, conversation=workspace_conversation,
+                        workspace=secured_workspace, doc_id=owned_document,
+                        chunk_id=uuid.uuid4(), evidence=True)
+            assert foreign_chunk.value.orig.sqlstate == "42501"
+            with pytest.raises(DBAPIError) as forged_citation_metadata:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(connection, conversation=workspace_conversation,
+                        workspace=secured_workspace, doc_id=owned_document,
+                        chunk_id=evidence_chunk, evidence=True,
+                        snapshot_overrides={"citation_sources": [{
+                            "source_index": 1, "document_id": str(owned_document),
+                            "document_name": "owned.pdf", "chunk_id": str(evidence_chunk),
+                            "page_start": 999, "page_end": 4,
+                        }]})
+            assert forged_citation_metadata.value.orig.sqlstate == "22023"
+            with pytest.raises(DBAPIError) as wrong_context_hash:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(connection, conversation=workspace_conversation,
+                        workspace=secured_workspace, doc_id=owned_document, corrupt_hash=True)
+            assert wrong_context_hash.value.orig.sqlstate == "22023"
+            with pytest.raises(DBAPIError) as wrong_request_hash:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(connection, conversation=workspace_conversation,
+                        workspace=secured_workspace, doc_id=owned_document, corrupt_fingerprint=True)
+            assert wrong_request_hash.value.orig.sqlstate == "22023"
+
+        # A stale context version rejects acceptance before any generation rows
+        # or user message are written.
+        stale_generation = uuid.uuid4()
+        stale_content = "stale context request"
+        stale_snapshot = _generation_snapshot(stale_content)
+        stale_canonical = json.dumps(stale_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        stale_request = {
+            "content": stale_content, "mode": "Detailed Guidance", "workspace_id": None,
+            "document_id": None, "active_document_id": None,
+        }
+        stale_canonical_request = json.dumps(stale_request, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        stale_fingerprint = hashlib.sha256(stale_canonical_request.encode("utf-8")).hexdigest()
+        stale_hash = hashlib.sha256(stale_canonical.encode("utf-8")).hexdigest()
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            with pytest.raises(DBAPIError) as stale_context:
+                async with connection.begin_nested():
+                    await connection.execute(text(f'''SELECT * FROM "{schema}".create_chat_generation_with_snapshot(
+                        :gid,:cid,:uid,0,:fingerprint,:content,'Detailed Guidance',NULL,NULL,NULL,1::smallint,
+                        CAST(:snapshot AS jsonb),:hash,:canonical_snapshot,:canonical_request)'''), {
+                        "gid": stale_generation, "cid": version_conversation, "uid": owner,
+                        "fingerprint": stale_fingerprint, "content": stale_content,
+                        "snapshot": stale_canonical, "hash": stale_hash,
+                        "canonical_snapshot": stale_canonical,
+                        "canonical_request": stale_canonical_request,
+                    })
+            assert stale_context.value.orig.sqlstate == "40001"
+        async with engine.begin() as connection:
+            await _as_role(connection, "service_role")
+            assert await connection.scalar(text(f'''SELECT count(*) FROM "{schema}".chat_generation_runs
+                WHERE generation_id=:id'''), {"id": stale_generation}) == 0
+            assert await connection.scalar(text(f'''SELECT count(*) FROM "{schema}".messages
+                WHERE conversation_id=:cid AND content=:content'''),
+                {"cid": version_conversation, "content": stale_content}) == 0
+
+        # The canonical byte count is calculated by the table trigger before
+        # CHECK constraints run. Oversized acceptance must roll back every
+        # earlier write made by the atomic RPC.
+        oversized_conversation = uuid.uuid4()
+        oversized_generation = uuid.uuid4()
+        oversized_content = "oversized canonical request"
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, oversized_conversation, owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            with pytest.raises(DBAPIError) as oversized_snapshot:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(
+                        connection, conversation=oversized_conversation, workspace=None, doc_id=None,
+                        content=oversized_content, system_instruction="x" * 3_500_000,
+                        snapshot_overrides={"routing_decisions": {
+                            "canonical_byte_count": 1, "jsonb_rendered_byte_count": 1,
+                        }},
+                        generation_id=oversized_generation,
+                    )
+            assert oversized_snapshot.value.orig.sqlstate == "23514"
+        async with engine.begin() as connection:
+            rolled_back = (await connection.execute(text(f'''SELECT
+                (SELECT count(*) FROM "{schema}".chat_generation_runs WHERE generation_id=:id),
+                (SELECT count(*) FROM "{schema}".messages WHERE conversation_id=:cid),
+                (SELECT count(*) FROM "{schema}".chat_generation_private_checkpoints WHERE generation_id=:id),
+                (SELECT count(*) FROM "{schema}".chat_generation_context_snapshots WHERE generation_id=:id),
+                (SELECT conversation_version FROM "{schema}".conversations WHERE id=:cid)'''), {
+                "id": oversized_generation, "cid": oversized_conversation,
+            })).one()
+            assert rolled_back == (0, 0, 0, 0, 0)
+
+        # This payload is compact enough for the canonical cap but expands
+        # beyond 4 MiB when PostgreSQL renders JSONB with separator spaces.
+        # Forged count-like fields in the payload cannot bypass the RPC's
+        # database-side JSONB size check.
+        jsonb_conversation = uuid.uuid4()
+        jsonb_generation = uuid.uuid4()
+        jsonb_content = "oversized JSONB request"
+        jsonb_size_probe = [""] * 1_100_000
+        jsonb_snapshot_overrides = {
+            "routing_decisions": {
+                "jsonb_size_probe": jsonb_size_probe,
+                "canonical_byte_count": 1,
+                "jsonb_rendered_byte_count": 1,
+            },
+        }
+        _, jsonb_canonical_snapshot, _ = acceptance_payload(
+            None, workspace_id=None, content=jsonb_content,
+            snapshot_overrides=jsonb_snapshot_overrides,
+        )
+        assert len(jsonb_canonical_snapshot.encode("utf-8")) <= 3_500_000
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, jsonb_conversation, owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            rendered_jsonb_bytes = await connection.scalar(text(
+                "SELECT octet_length(CAST(:payload AS jsonb)::text)"
+            ), {"payload": jsonb_canonical_snapshot})
+            assert rendered_jsonb_bytes > 4_194_304
+            with pytest.raises(DBAPIError) as oversized_jsonb:
+                async with connection.begin_nested():
+                    await attempt_protected_accept(
+                        connection, conversation=jsonb_conversation, workspace=None, doc_id=None,
+                        content=jsonb_content, snapshot_overrides=jsonb_snapshot_overrides,
+                        generation_id=jsonb_generation,
+                    )
+            assert oversized_jsonb.value.orig.sqlstate == "22001"
+        async with engine.begin() as connection:
+            rolled_back = (await connection.execute(text(f'''SELECT
+                (SELECT count(*) FROM "{schema}".chat_generation_runs WHERE generation_id=:id),
+                (SELECT count(*) FROM "{schema}".messages WHERE conversation_id=:cid),
+                (SELECT count(*) FROM "{schema}".chat_generation_private_checkpoints WHERE generation_id=:id),
+                (SELECT count(*) FROM "{schema}".chat_generation_context_snapshots WHERE generation_id=:id),
+                (SELECT conversation_version FROM "{schema}".conversations WHERE id=:cid)'''), {
+                "id": jsonb_generation, "cid": jsonb_conversation,
+            })).one()
+            assert rolled_back == (0, 0, 0, 0, 0)
+
+        # Force a failure at the final snapshot insert and prove the RPC rolls
+        # back its earlier user message, run, and checkpoint writes.
+        rollback_conversation = uuid.uuid4()
+        rollback_generation = uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, rollback_conversation, owner)
+            await connection.exec_driver_sql(f'''CREATE FUNCTION "{schema}".reject_snapshot_insert()
+                RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                    RAISE EXCEPTION 'forced snapshot insert failure' USING ERRCODE='P0001';
+                END $$''')
+            await connection.exec_driver_sql(f'''CREATE TRIGGER reject_snapshot_insert_trg
+                BEFORE INSERT ON "{schema}".chat_generation_context_snapshots
+                FOR EACH ROW EXECUTE FUNCTION "{schema}".reject_snapshot_insert()''')
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            with pytest.raises(DBAPIError) as forced_failure:
+                async with connection.begin_nested():
+                    await _create_generation(connection, schema, generation_id=rollback_generation,
+                                             conversation_id=rollback_conversation, user_id=owner)
+            assert forced_failure.value.orig.sqlstate == "P0001"
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(f'''DROP TRIGGER reject_snapshot_insert_trg
+                ON "{schema}".chat_generation_context_snapshots''')
+            await connection.exec_driver_sql(f'DROP FUNCTION "{schema}".reject_snapshot_insert()')
+            rolled_back = (await connection.execute(text(f'''SELECT
+                (SELECT count(*) FROM "{schema}".chat_generation_runs WHERE generation_id=:id),
+                (SELECT count(*) FROM "{schema}".messages WHERE conversation_id=:cid),
+                (SELECT count(*) FROM "{schema}".chat_generation_private_checkpoints WHERE generation_id=:id),
+                (SELECT count(*) FROM "{schema}".chat_generation_context_snapshots WHERE generation_id=:id),
+                (SELECT conversation_version FROM "{schema}".conversations WHERE id=:cid)'''), {
+                "id": rollback_generation, "cid": rollback_conversation,
+            })).one()
+            assert rolled_back == (0, 0, 0, 0, 0)
+
+        # Legacy C1 creation remains present as a deliberate fail-closed API.
+        legacy_generation = uuid.uuid4()
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            with pytest.raises(DBAPIError) as legacy_rejected:
+                async with connection.begin_nested():
+                    await connection.execute(text(f'''SELECT * FROM "{schema}".create_chat_generation(
+                        :gid,:cid,:uid,:fingerprint,'legacy request','Detailed Guidance',NULL,NULL,NULL)'''), {
+                        "gid": legacy_generation, "cid": version_conversation, "uid": owner,
+                        "fingerprint": uuid.uuid4().hex * 2,
+                    })
+            assert legacy_rejected.value.orig.sqlstate == "0A000"
+        async with engine.begin() as connection:
+            await _as_role(connection, "service_role")
+            assert await connection.scalar(text(f'''SELECT count(*) FROM "{schema}".chat_generation_runs
+                WHERE generation_id=:id'''), {"id": legacy_generation}) == 0
+
+        # A run inserted through any legacy/direct path without a snapshot is
+        # never eligible for dispatch.
+        no_snapshot_conversation = uuid.uuid4()
+        no_snapshot_generation = uuid.uuid4()
+        no_snapshot_message = uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, no_snapshot_conversation, owner)
+            await connection.execute(text(f'''INSERT INTO "{schema}".messages(
+                id,conversation_id,role,content) VALUES (:mid,:cid,'user','no snapshot')'''), {
+                "mid": no_snapshot_message, "cid": no_snapshot_conversation,
+            })
+            await connection.execute(text(f'''INSERT INTO "{schema}".chat_generation_runs(
+                generation_id,conversation_id,user_id,user_message_id,request_fingerprint,chat_mode)
+                VALUES (:gid,:cid,:uid,:mid,:fingerprint,'Detailed Guidance')'''), {
+                "gid": no_snapshot_generation, "cid": no_snapshot_conversation, "uid": owner,
+                "mid": no_snapshot_message, "fingerprint": uuid.uuid4().hex * 2,
+            })
+        async with engine.begin() as connection:
+            await _as_role(connection, "service_role")
+            assert await connection.scalar(text(
+                f'SELECT "{schema}".claim_chat_generation_dispatch(:id,30)'
+            ), {"id": no_snapshot_generation}) is None
+        manual_dispatch_token = uuid.uuid4()
+        async with engine.begin() as connection:
+            await connection.execute(text(f'''UPDATE "{schema}".chat_generation_runs
+                SET state='dispatching', dispatch_token=:token,
+                    dispatch_lease_expires_at=clock_timestamp()+interval '60 seconds'
+                WHERE generation_id=:id'''), {"token": manual_dispatch_token, "id": no_snapshot_generation})
+        async with engine.begin() as connection:
+            await _as_role(connection, "service_role")
+            assert (await connection.execute(text(f'''SELECT * FROM
+                "{schema}".claim_chat_generation_worker(:id,:dispatch,20)'''), {
+                "id": no_snapshot_generation, "dispatch": manual_dispatch_token,
+            })).first() is None
+            no_snapshot_state = (await connection.execute(text(f'''SELECT state,worker_token,worker_epoch
+                FROM "{schema}".chat_generation_runs WHERE generation_id=:id'''),
+                {"id": no_snapshot_generation})).one()
+            assert no_snapshot_state == ("dispatching", None, 0)
+
+        # Supplied values never control either size constraint: the BEFORE
+        # trigger overwrites them with byte lengths derived from the payload.
+        caller_count_snapshot = _generation_snapshot("caller supplied counts")
+        caller_count_canonical = json.dumps(
+            caller_count_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+        forged_oversized_snapshot = _generation_snapshot("forged oversized counts")
+        forged_oversized_snapshot["routing_decisions"] = jsonb_snapshot_overrides["routing_decisions"]
+        forged_oversized_canonical = json.dumps(
+            forged_oversized_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+        assert len(forged_oversized_canonical.encode("utf-8")) <= 3_500_000
+        async with engine.begin() as connection:
+            rendered_jsonb_bytes = await connection.scalar(text(
+                "SELECT octet_length(CAST(:payload AS jsonb)::text)"
+            ), {"payload": forged_oversized_canonical})
+            assert rendered_jsonb_bytes > 4_194_304
+            with pytest.raises(DBAPIError) as forged_counts:
+                async with connection.begin_nested():
+                    await connection.execute(text(f'''INSERT INTO "{schema}".chat_generation_context_snapshots(
+                        generation_id,snapshot_version,snapshot_payload,canonical_snapshot,context_hash,
+                        canonical_byte_count,jsonb_rendered_byte_count)
+                        VALUES (:id,1,CAST(:snapshot AS jsonb),:canonical,:hash,1,1)'''), {
+                        "id": no_snapshot_generation,
+                        "snapshot": forged_oversized_canonical,
+                        "canonical": forged_oversized_canonical,
+                        "hash": hashlib.sha256(forged_oversized_canonical.encode("utf-8")).hexdigest(),
+                    })
+            assert forged_counts.value.orig.sqlstate == "23514"
+            assert await connection.scalar(text(f'''SELECT count(*)
+                FROM "{schema}".chat_generation_context_snapshots WHERE generation_id=:id'''), {
+                "id": no_snapshot_generation,
+            }) == 0
+            await connection.execute(text(f'''INSERT INTO "{schema}".chat_generation_context_snapshots(
+                generation_id,snapshot_version,snapshot_payload,canonical_snapshot,context_hash,
+                canonical_byte_count,jsonb_rendered_byte_count)
+                VALUES (:id,1,CAST(:snapshot AS jsonb),:canonical,:hash,1,1)'''), {
+                "id": no_snapshot_generation,
+                "snapshot": caller_count_canonical,
+                "canonical": caller_count_canonical,
+                "hash": hashlib.sha256(caller_count_canonical.encode("utf-8")).hexdigest(),
+            })
+            generated_counts = (await connection.execute(text(f'''SELECT
+                canonical_byte_count,
+                octet_length(convert_to(canonical_snapshot,'UTF8')),
+                jsonb_rendered_byte_count,
+                octet_length(snapshot_payload::text)
+                FROM "{schema}".chat_generation_context_snapshots WHERE generation_id=:id'''), {
+                "id": no_snapshot_generation,
+            })).one()
+            assert generated_counts[0:2] == (
+                len(caller_count_canonical.encode("utf-8")),
+                len(caller_count_canonical.encode("utf-8")),
+            )
+            assert generated_counts[2] == generated_counts[3]
+            assert generated_counts[0] != 1 and generated_counts[2] != 1
+
+        # Owner access to the run does not imply snapshot table access. The
+        # service-only reader requires a live worker identity and verifies an
+        # unavailable/mismatched identity returns no data.
+        read_generation = uuid.uuid4()
+        read_conversation = uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, read_conversation, owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            await _create_generation(connection, schema, generation_id=read_generation,
+                                     conversation_id=read_conversation, user_id=owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            with pytest.raises(DBAPIError):
+                async with connection.begin_nested():
+                    await connection.execute(text(f'''SELECT snapshot_payload
+                        FROM "{schema}".chat_generation_context_snapshots WHERE generation_id=:id'''),
+                        {"id": read_generation})
+            with pytest.raises(DBAPIError):
+                async with connection.begin_nested():
+                    await connection.execute(text(f'''SELECT * FROM
+                        "{schema}".read_chat_generation_context_snapshot(:id,NULL,NULL)'''),
+                        {"id": read_generation})
+        async with engine.begin() as connection:
+            with pytest.raises(DBAPIError) as immutable:
+                async with connection.begin_nested():
+                    await connection.execute(text(f'''UPDATE "{schema}".chat_generation_context_snapshots
+                        SET context_hash=:hash WHERE generation_id=:id'''), {
+                        "id": read_generation, "hash": "0" * 64,
+                    })
+            assert immutable.value.orig.sqlstate == "55000"
+        async with engine.begin() as connection:
+            await _as_role(connection, "service_role")
+            dispatch = await connection.scalar(text(
+                f'SELECT "{schema}".claim_chat_generation_dispatch(:id,30)'
+            ), {"id": read_generation})
+            claim = (await connection.execute(text(
+                f'SELECT * FROM "{schema}".claim_chat_generation_worker(:id,:dispatch,20)'
+            ), {"id": read_generation, "dispatch": dispatch})).one()
+            snapshot_row = (await connection.execute(text(f'''SELECT * FROM
+                "{schema}".read_chat_generation_context_snapshot(:id,:token,:epoch)'''), {
+                "id": read_generation, "token": claim.worker_token, "epoch": claim.worker_epoch,
+            })).one()
+            assert snapshot_row.snapshot_payload["original_request"] == "question"
+            assert snapshot_row.context_hash
+            assert snapshot_row.canonical_byte_count == len(snapshot_row.canonical_snapshot.encode("utf-8"))
+            rendered_snapshot_bytes = await connection.scalar(text(
+                "SELECT octet_length(CAST(:canonical AS jsonb)::text)"
+            ), {"canonical": snapshot_row.canonical_snapshot})
+            assert snapshot_row.jsonb_rendered_byte_count == rendered_snapshot_bytes
+            assert hashlib.sha256(snapshot_row.canonical_snapshot.encode("utf-8")).hexdigest() == snapshot_row.context_hash
+            assert (await connection.execute(text(f'''SELECT * FROM
+                "{schema}".read_chat_generation_context_snapshot(:id,:token,:epoch)'''), {
+                "id": read_generation, "token": uuid.uuid4(), "epoch": claim.worker_epoch,
+            })).first() is None
+            assert (await connection.execute(text(f'''SELECT * FROM
+                "{schema}".read_chat_generation_context_snapshot(:id,:token,:epoch)'''), {
+                "id": read_generation, "token": claim.worker_token, "epoch": claim.worker_epoch + 1,
+            })).first() is None
+            read_message = await connection.scalar(text(f'''SELECT "{schema}".finalize_chat_generation_worker(
+                :id,:token,:epoch,'completed','test','done','[]'::jsonb,NULL)'''), {
+                "id": read_generation, "token": claim.worker_token, "epoch": claim.worker_epoch,
+            })
+            assert read_message is not None
+
+        async with engine.begin() as connection:
+            assert await connection.scalar(text(f'''SELECT count(*) FROM
+                "{schema}".chat_generation_context_snapshots WHERE generation_id=:id'''),
+                {"id": read_generation}) == 0
+
+        # Deleting a conversation cascades through the run to its private
+        # snapshot, including when the generation never reaches finalization.
+        cascade_conversation = uuid.uuid4()
+        cascade_generation = uuid.uuid4()
+        async with engine.begin() as connection:
+            await _insert_conversation(connection, schema, cascade_conversation, owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            await _create_generation(connection, schema, generation_id=cascade_generation,
+                                     conversation_id=cascade_conversation, user_id=owner)
+        async with engine.begin() as connection:
+            await _as_role(connection, "authenticated", owner)
+            await connection.execute(text(f'DELETE FROM "{schema}".conversations WHERE id=:id'),
+                                     {"id": cascade_conversation})
+        async with engine.begin() as connection:
+            assert await connection.scalar(text(f'''SELECT count(*) FROM
+                "{schema}".chat_generation_context_snapshots WHERE generation_id=:id'''),
+                {"id": cascade_generation}) == 0
+            assert await connection.scalar(text(f'''SELECT count(*) FROM
+                "{schema}".chat_generation_runs WHERE generation_id=:id'''),
+                {"id": cascade_generation}) == 0
+            assert await connection.scalar(text(f'''SELECT count(*) FROM
+                "{schema}".messages WHERE conversation_id=:id'''),
+                {"id": cascade_conversation}) == 0
+            assert await connection.scalar(text(f'''SELECT count(*) FROM
+                "{schema}".conversations WHERE id=:id'''),
+                {"id": cascade_conversation}) == 0
 
         # Same-ID retries return the existing durable run and user message;
         # different payload fingerprints are rejected without a duplicate row.
         generation_id = uuid.uuid4()
-        fingerprint = uuid.uuid4().hex * 2
         async with engine.begin() as connection:
             await _as_role(connection, "authenticated", owner)
             first = await _create_generation(connection, schema, generation_id=generation_id,
-                conversation_id=conversation_id, user_id=owner, fingerprint=fingerprint)
+                conversation_id=conversation_id, user_id=owner)
             again = await _create_generation(connection, schema, generation_id=generation_id,
-                conversation_id=conversation_id, user_id=owner, fingerprint=fingerprint)
+                conversation_id=conversation_id, user_id=owner)
             assert first.generation_id == again.generation_id == generation_id
             assert first.state == again.state == "queued"
             assert first.user_message_id == again.user_message_id
@@ -229,8 +939,7 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
             with pytest.raises(DBAPIError) as reused_id:
                 async with connection.begin_nested():
                     await _create_generation(connection, schema, generation_id=generation_id,
-                        conversation_id=conversation_id, user_id=owner,
-                        fingerprint=uuid.uuid4().hex * 2, content="different request")
+                        conversation_id=conversation_id, user_id=owner, content="different request")
             assert reused_id.value.orig.sqlstate == "23505"
             assert reused_id.value.orig.__cause__.message == (
                 "generation_id was already used for a different request"
@@ -248,7 +957,6 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
 
         # Concurrent same-ID starts serialize on the idempotency key.
         same_id = uuid.uuid4()
-        same_fp = uuid.uuid4().hex * 2
         same_id_conversation = uuid.uuid4()
         async with engine.begin() as connection:
             await _insert_conversation(connection, schema, same_id_conversation, owner)
@@ -257,7 +965,7 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
             async with engine.begin() as connection:
                 await _as_role(connection, "authenticated", owner)
                 return await _create_generation(connection, schema, generation_id=same_id,
-                    conversation_id=same_id_conversation, user_id=owner, fingerprint=same_fp)
+                    conversation_id=same_id_conversation, user_id=owner)
 
         same_results = await asyncio.gather(same_id_start(), same_id_start())
         assert len({row.user_message_id for row in same_results}) == 1
@@ -901,7 +1609,7 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
                     f"cg_{operation}_winner_{uuid.uuid4().hex[:8]}",
                     f'SELECT "{schema}".recover_stale_chat_generation(:id,:token,:epoch)',
                     {"id": generation_id, "token": claim.worker_token,
-                     "epoch": claim.worker_epoch})
+                     "epoch": claim.worker_epoch}, task_registry=competing_tasks)
                 await winner_tx.commit()
                 assert await blocked_recovery is None
             if operation != "finalize":
@@ -944,7 +1652,7 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
                     f"cg_recovery_winner_{operation}_{uuid.uuid4().hex[:8]}",
                     competing_sql,
                     {"id": generation_id, "token": claim.worker_token,
-                     "epoch": claim.worker_epoch})
+                     "epoch": claim.worker_epoch}, task_registry=competing_tasks)
                 await winner_tx.commit()
                 rejected = await blocked_worker
                 if operation == "finalize":
@@ -977,7 +1685,8 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
             blocked_cancel = await _start_competing_rpc(engine,
                 f"cg_finalize_before_cancel_{uuid.uuid4().hex[:8]}",
                 f'SELECT * FROM "{schema}".request_chat_generation_cancel(:id)',
-                {"id": finalize_first_id}, role="authenticated", user_id=owner)
+                {"id": finalize_first_id}, role="authenticated", user_id=owner,
+                task_registry=competing_tasks)
             await winner_tx.commit()
             cancellation_result = await blocked_cancel
             assert cancellation_result == ("completed", canonical_id)
@@ -1010,7 +1719,7 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
                 f'''SELECT "{schema}".finalize_chat_generation_worker(
                     :id,:token,:epoch,'completed','normal_finish','unsafe full response','[]'::jsonb,NULL)''',
                 {"id": cancel_first_id, "token": cancel_first_claim.worker_token,
-                 "epoch": cancel_first_claim.worker_epoch})
+                 "epoch": cancel_first_claim.worker_epoch}, task_registry=competing_tasks)
             await winner_tx.commit()
             interrupted_id = await blocked_finalize
             assert interrupted_id is not None
@@ -1200,8 +1909,29 @@ async def test_chat_generation_migration_lifecycle_rls_fencing_and_cleanup():
             assert await connection.scalar(text(f'SELECT count(*) FROM "{schema}".messages WHERE generation_id=:id'), {"id": generation_id}) == 0
 
     finally:
-        async with engine.begin() as connection:
-            await connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-            assert await connection.scalar(text("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=:schema)"),
-                                           {"schema": schema}) is False
-        await engine.dispose()
+        try:
+            pending_tasks = set(competing_tasks)
+            if acceptance_task is not None:
+                pending_tasks.add(acceptance_task)
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+        finally:
+            try:
+                if writer_tx is not None and writer_tx.is_active:
+                    await writer_tx.rollback()
+            finally:
+                try:
+                    if writer is not None:
+                        await writer.close()
+                finally:
+                    try:
+                        async with engine.begin() as connection:
+                            await connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                            assert await connection.scalar(text(
+                                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=:schema)"
+                            ), {"schema": schema}) is False
+                    finally:
+                        await engine.dispose()

@@ -2,6 +2,7 @@
 import logging
 import json
 import uuid
+from importlib.metadata import PackageNotFoundError, version
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Mapping, Sequence
@@ -41,12 +42,44 @@ class _SummarySegment:
     source_indices: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class SummaryExecutionPlan:
+    """Deterministic source partition plus the runtime reduction recipe."""
+
+    system_instruction: str
+    input_budget_tokens: int
+    map_output_tokens: int
+    final_output_tokens: int
+    map_groups: tuple[tuple[DocumentChunk, ...], ...]
+    map_source_indices: tuple[tuple[int, ...], ...]
+    map_input_token_estimates: tuple[int, ...]
+    estimated_reduce_calls: int | None
+    estimated_total_calls: int | None
+    estimated_sequential_timeout_seconds: float | None
+    model_name: str
+    thinking_level: str | None
+
+
 class DocumentSummaryService:
     """Summarize a document using all chunks in order and bounded model inputs."""
 
     # The configured provider context includes both input and output. Limit all
     # prompt input to 75% of it, reserving the remainder for generation.
     _INPUT_BUDGET_FRACTION = 0.75
+    PLAN_VERSION = 1
+    PROMPT_TEMPLATE_VERSION = "whole-document-summary-v1"
+    REDUCTION_STRATEGY_VERSION = "greedy-hierarchical-output-driven-v1"
+
+    @staticmethod
+    def tokenizer_version() -> str:
+        counter = StructureAwareChunker()
+        if counter._encoder is None:
+            return "character-estimate-four-bytes-per-token-v1"
+        try:
+            package_version = version("tiktoken")
+        except PackageNotFoundError:
+            package_version = "unknown"
+        return f"cl100k_base:tiktoken-{package_version}"
 
     @classmethod
     async def summarize_document(
@@ -78,20 +111,19 @@ class DocumentSummaryService:
             for index, chunk in enumerate(chunks, start=1)
         ]
         source_by_chunk = {source.chunk_id: source for source in sources}
-        system_instruction = cls._system_instruction(query)
-        input_budget = max(1, int(settings.DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET * cls._INPUT_BUDGET_FRACTION))
-        chunk_groups = await run_in_threadpool(
-            cls._pack_chunks, chunks, query, document, source_by_chunk,
-            system_instruction, input_budget,
+        plan = await run_in_threadpool(
+            cls.build_execution_plan, chunks, document, query, provider, source_by_chunk,
+            include_reduction_estimate=False,
         )
-        map_output_tokens = min(settings.DOCUMENT_SUMMARY_MAP_OUTPUT_TOKENS, settings.LLM_MAX_OUTPUT_TOKENS)
+        system_instruction = plan.system_instruction
+        input_budget = plan.input_budget_tokens
         map_calls = 0
         reduce_calls = 0
 
-        if len(chunk_groups) == 1:
-            prompt = cls._document_prompt(query, document, chunk_groups[0], 1, source_by_chunk, final=True)
+        if len(plan.map_groups) == 1:
+            prompt = cls._document_prompt(query, document, plan.map_groups[0], 1, source_by_chunk, final=True)
             raw_content = await cls._generate(
-                provider, prompt, system_instruction, settings.LLM_MAX_OUTPUT_TOKENS,
+                provider, prompt, system_instruction, plan.final_output_tokens,
                 document_id=document.id, mode="direct", stage_name="direct",
                 group_index=1, group_count=1,
             )
@@ -101,19 +133,17 @@ class DocumentSummaryService:
                 map_call_count=0, reduce_call_count=0,
             )
 
-        source_index_by_chunk = {source.chunk_id: source.source_index for source in sources}
         segments: list[_SummarySegment] = []
-        for group_index, group in enumerate(chunk_groups, start=1):
+        for group_index, group in enumerate(plan.map_groups, start=1):
             prompt = cls._document_prompt(query, document, group, group_index, source_by_chunk, final=False)
             result = await cls._generate(
-                provider, prompt, system_instruction, map_output_tokens,
+                provider, prompt, system_instruction, plan.map_output_tokens,
                 document_id=document.id, mode="map", stage_name="map",
-                group_index=group_index, group_count=len(chunk_groups),
+                group_index=group_index, group_count=len(plan.map_groups),
             )
-            source_indices = tuple(source_index_by_chunk[chunk.id] for chunk in group)
             segments.append(_SummarySegment(
                 content=result,
-                source_indices=source_indices,
+                source_indices=plan.map_source_indices[group_index - 1],
             ))
             map_calls += 1
 
@@ -134,7 +164,7 @@ class DocumentSummaryService:
             for group_index, group in enumerate(segment_groups, start=1):
                 prompt = cls._reduce_prompt(query, document, group, final=False)
                 result = await cls._generate(
-                    provider, prompt, system_instruction, map_output_tokens,
+                    provider, prompt, system_instruction, plan.map_output_tokens,
                     document_id=document.id, mode="reduce", stage_name="reduce_intermediate",
                     group_index=group_index, group_count=len(segment_groups),
                     reduction_level=reduction_level,
@@ -161,6 +191,129 @@ class DocumentSummaryService:
             chunk_count=len(chunks),
             map_call_count=map_calls, reduce_call_count=reduce_calls,
         )
+
+    @classmethod
+    def build_execution_plan(
+        cls,
+        chunks: Sequence[DocumentChunk],
+        document: Document,
+        query: str,
+        provider: BaseLLMProvider,
+        source_by_chunk: Mapping[uuid.UUID, SourceEvidence] | None = None,
+        *,
+        include_reduction_estimate: bool = True,
+    ) -> SummaryExecutionPlan:
+        """Plan map membership with the exact accounting used by live summary.
+
+        Recursive reduction membership depends on generated map notes. The plan
+        therefore stores its deterministic strategy and estimates calls using
+        maximum-sized note placeholders; the worker will pack actual notes with
+        the same shared helper after each generation stage.
+        """
+        if not chunks:
+            raise DocumentSummaryError("The selected document has no indexed content to summarize.")
+        ordered = sorted(chunks, key=lambda item: item.chunk_index)
+        if source_by_chunk is None:
+            source_by_chunk = {
+                chunk.id: SourceEvidence(
+                    source_index=index, document_id=document.id,
+                    document_name=document.original_filename, chunk_id=chunk.id,
+                    page_start=chunk.page_number_start, page_end=chunk.page_number_end,
+                    content=chunk.content.strip(),
+                )
+                for index, chunk in enumerate(ordered, start=1)
+            }
+        system_instruction = cls._system_instruction(query)
+        input_budget = max(1, int(settings.DOCUMENT_SUMMARY_INPUT_TOKEN_BUDGET * cls._INPUT_BUDGET_FRACTION))
+        groups = cls._pack_chunks(ordered, query, document, source_by_chunk, system_instruction, input_budget)
+        index_by_chunk = {chunk.id: source_by_chunk[chunk.id].source_index for chunk in ordered}
+        group_indices = tuple(tuple(index_by_chunk[chunk.id] for chunk in group) for group in groups)
+        input_estimates = ()
+        if include_reduction_estimate:
+            input_estimates = tuple(
+                cls._document_prompt_token_count(
+                    cls._document_prompt(query, document, group, index, source_by_chunk, final=False),
+                    system_instruction, group,
+                )
+                for index, group in enumerate(groups, start=1)
+            )
+        map_output_tokens = min(settings.DOCUMENT_SUMMARY_MAP_OUTPUT_TOKENS, settings.LLM_MAX_OUTPUT_TOKENS)
+        if len(groups) == 1:
+            if include_reduction_estimate:
+                input_estimates = (cls._document_prompt_token_count(
+                    cls._document_prompt(query, document, groups[0], 1, source_by_chunk, final=True),
+                    system_instruction, groups[0],
+                ),)
+            reduce_calls = 0
+            total_calls = 1
+        elif include_reduction_estimate:
+            reduce_calls = cls._estimate_reduction_calls(
+                query, document, system_instruction, input_budget,
+                group_indices, map_output_tokens,
+            )
+            total_calls = len(groups) + reduce_calls if reduce_calls is not None else None
+        else:
+            reduce_calls = total_calls = None
+        timeout_seconds = (
+            total_calls * settings.LLM_STREAMING_TIMEOUT_SECONDS
+            if total_calls is not None else None
+        )
+        return SummaryExecutionPlan(
+            system_instruction=system_instruction,
+            input_budget_tokens=input_budget,
+            map_output_tokens=map_output_tokens,
+            final_output_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
+            map_groups=tuple(tuple(group) for group in groups),
+            map_source_indices=group_indices,
+            map_input_token_estimates=input_estimates,
+            estimated_reduce_calls=reduce_calls,
+            estimated_total_calls=total_calls,
+            estimated_sequential_timeout_seconds=timeout_seconds,
+            model_name=str(getattr(provider, "model_name", type(provider).__name__)),
+            thinking_level=getattr(provider, "thinking_level", None),
+        )
+
+    @classmethod
+    def _estimate_reduction_calls(
+        cls, query: str, document: Document, system_instruction: str, input_budget: int,
+        source_groups: Sequence[Sequence[int]], max_output_tokens: int,
+    ) -> int | None:
+        placeholder = cls._token_sized_placeholder(max_output_tokens)
+        segments = [
+            _SummarySegment(content=placeholder, source_indices=tuple(indices))
+            for indices in source_groups
+        ]
+        calls = 0
+        while cls._prompt_token_count(cls._reduce_prompt(query, document, segments, final=True), system_instruction) > input_budget:
+            try:
+                groups = cls._pack_segments(segments, query, document, system_instruction, input_budget)
+            except DocumentSummaryError:
+                return None
+            if len(groups) >= len(segments):
+                # Actual model notes may be shorter; report the estimate as
+                # unavailable rather than rejecting an otherwise valid request.
+                return None
+            calls += len(groups)
+            segments = [
+                _SummarySegment(
+                    content=placeholder,
+                    source_indices=tuple(sorted({i for segment in group for i in segment.source_indices})),
+                )
+                for group in groups
+            ]
+        return calls + 1  # final call
+
+    @staticmethod
+    def _token_sized_placeholder(token_count: int) -> str:
+        counter = StructureAwareChunker()
+        if counter._encoder is not None:
+            token_id = counter._encoder.encode(" x")[0]
+            piece = counter._encoder.decode([token_id])
+            placeholder = piece * token_count
+            while counter.count_tokens(placeholder) < token_count:
+                placeholder += piece
+            return placeholder
+        return "x123" * token_count
 
     @staticmethod
     def _validate_complete_chunks(
@@ -193,12 +346,36 @@ class DocumentSummaryService:
         prompt: str, system_instruction: str, chunks: Sequence[DocumentChunk],
     ) -> int:
         """Honor persisted chunk counts when they are more conservative than recounting."""
-        counter = StructureAwareChunker()
-        actual = DocumentSummaryService._prompt_token_count(prompt, system_instruction)
-        return actual + sum(
-            max(0, chunk.token_count - counter.count_tokens(chunk.content))
-            for chunk in chunks
+        return DocumentSummaryService._adjusted_prompt_token_count(
+            prompt, system_instruction,
+            [(chunk.content, chunk.token_count) for chunk in chunks],
         )
+
+    @staticmethod
+    def _adjusted_prompt_token_count(
+        prompt: str, system_instruction: str,
+        persisted_content_counts: Sequence[tuple[str, int]],
+    ) -> int:
+        """Shared live/snapshot input accounting, including persisted chunk counts."""
+        adjustments = [
+            DocumentSummaryService._persisted_token_adjustment(content, persisted_count)
+            for content, persisted_count in persisted_content_counts
+        ]
+        return DocumentSummaryService._prompt_token_count_with_adjustments(
+            prompt, system_instruction, adjustments,
+        )
+
+    @staticmethod
+    def _persisted_token_adjustment(content: str, persisted_count: int) -> int:
+        counter = StructureAwareChunker()
+        return max(0, persisted_count - counter.count_tokens(content))
+
+    @staticmethod
+    def _prompt_token_count_with_adjustments(
+        prompt: str, system_instruction: str, adjustments: Sequence[int],
+    ) -> int:
+        actual = DocumentSummaryService._prompt_token_count(prompt, system_instruction)
+        return actual + sum(adjustments)
 
     @classmethod
     def _pack_chunks(
@@ -275,10 +452,41 @@ class DocumentSummaryService:
         cls, query: str, document: Document, group: Sequence[DocumentChunk],
         group_index: int, source_by_chunk: Mapping[uuid.UUID, SourceEvidence], *, final: bool,
     ) -> str:
+        return cls._document_prompt_from_sources(
+            query, document.original_filename,
+            [source_by_chunk[chunk.id] for chunk in group], group_index, final=final,
+        )
+
+    @classmethod
+    def reconstruct_document_prompt(
+        cls, query: str, document_name: str, source_items: Sequence[Mapping[str, object]],
+        source_indices: Sequence[int], group_index: int, *, final: bool,
+    ) -> str:
+        """Reconstruct a prompt from immutable snapshot source records and references."""
+        by_index = {int(item["source_index"]): item for item in source_items}
+        try:
+            selected = [by_index[index] for index in source_indices]
+        except KeyError as exc:
+            raise DocumentSummaryError("Summary plan references a missing source chunk.") from exc
+        sources = [SourceEvidence(
+            source_index=int(item["source_index"]),
+            document_id=uuid.UUID(str(item["document_id"])),
+            document_name=str(item["document_name"]),
+            chunk_id=uuid.UUID(str(item["chunk_id"])),
+            page_start=int(item["page_start"]),
+            page_end=int(item["page_end"]),
+            content=str(item["content"]),
+        ) for item in selected]
+        return cls._document_prompt_from_sources(query, document_name, sources, group_index, final=final)
+
+    @classmethod
+    def _document_prompt_from_sources(
+        cls, query: str, document_name: str, sources: Sequence[SourceEvidence],
+        group_index: int, *, final: bool,
+    ) -> str:
         sections = []
-        safe_document_name = sanitize_prompt_section_content(document.original_filename, "DOCUMENT_EVIDENCE")
-        for chunk in group:
-            source = source_by_chunk[chunk.id]
+        safe_document_name = sanitize_prompt_section_content(document_name, "DOCUMENT_EVIDENCE")
+        for source in sources:
             sections.append(
                 f"[Source {source.source_index}]\nDocument: {safe_document_name}\n"
                 f"Pages: {source.page_start}-{source.page_end}\nChunk ID: {source.chunk_id}\n"
